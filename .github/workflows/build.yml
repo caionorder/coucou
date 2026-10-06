@@ -27,11 +27,17 @@ jobs:
       - name: Test chat parsing
         run: bash scripts/test-chat-parsing.sh
 
+      - name: Test Hermes chat
+        run: bash scripts/test-hermes-chat.sh
+
       - name: Test plan gauge
         run: bash scripts/test-plan-gauge.sh
 
       - name: Test ask question
         run: bash scripts/test-ask-question.sh
+
+      - name: Test cmux routing
+        run: bash scripts/test-cmux-routing.sh
 
       - name: Diff engine tests
         run: bash scripts/test-diff-engine.sh
@@ -44,6 +50,12 @@ jobs:
 
       - name: Wardrobe tests
         run: bash scripts/test-wardrobe.sh
+
+      - name: Step language tests
+        run: bash scripts/test-step-language.sh
+
+      - name: Localization tests
+        run: bash scripts/test-localization.sh
 
       - name: Build
         run: |

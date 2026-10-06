@@ -8,8 +8,23 @@ final class AppState: ObservableObject {
     static let shared = AppState()
 
     // Island state
-    @Published var mode: IslandMode = .hidden
-    @Published var view: IslandView = .overview
+    @Published var mode: IslandMode = .hidden {
+        didSet {
+            #if !APPSTORE
+            if mode != .expanded { clearCmuxPrompt() }
+            #endif
+            clearHermesBadgeIfChatShown()
+        }
+    }
+    @Published var view: IslandView = .overview {
+        didSet {
+            #if !APPSTORE
+            // Every entry to the prompt view that is not the cmux one shows the normal chat.
+            if view == .prompt && !cmuxOpeningPrompt { clearCmuxPrompt() }
+            #endif
+            clearHermesBadgeIfChatShown()
+        }
+    }
 
     // Tasks
     @Published var tasks: [AgentTask] = []
@@ -90,7 +105,18 @@ final class AppState: ObservableObject {
 
     // In-chat provider + model — picked via the model selector in the prompt view
     @Published var chatProvider: ChatProvider = .anthropic {
-        didSet { UserDefaults.standard.set(chatProvider.rawValue, forKey: "chatProvider") }
+        didSet {
+            UserDefaults.standard.set(chatProvider.rawValue, forKey: "chatProvider")
+            // The conversation never crosses to or from a Hermes agent (other switches keep it).
+            if (oldValue == .hermes) != (chatProvider == .hermes) { clearChatConversation() }
+        }
+    }
+
+    private func clearChatConversation() {
+        chatHistory = []
+        ClaudeService.shared.clearConversation()
+        // Cancelled turns end by themselves and release their own count in `hermesTurnsRunning`.
+        for i in tasks.indices where HermesPills.isTaskId(tasks[i].id) { tasks[i].pillBadge = nil }
     }
     @Published var googleChatModel: String = ChatProvider.google.defaultModel {
         didSet { UserDefaults.standard.set(googleChatModel, forKey: "googleChatModel") }
@@ -110,6 +136,112 @@ final class AppState: ObservableObject {
     @Published var lmstudioServerURL: String = "" {
         didSet { UserDefaults.standard.set(lmstudioServerURL, forKey: "lmstudioServerURL") }
     }
+    // Hermes agents: the list holds no secret (keys live in the Keychain item "hermes-agent-keys")
+    @Published var hermesAgents: [HermesAgent] = [] {
+        didSet { UserDefaults.standard.set(HermesChat.encodeAgents(hermesAgents), forKey: "hermesAgents") }
+    }
+    @Published var hermesChatAgent: String = "" {
+        didSet { UserDefaults.standard.set(hermesChatAgent, forKey: "hermesChatAgent") }
+    }
+    /// The agent picked in the chat (by name), else the first configured one.
+    var activeHermesAgent: HermesAgent? {
+        hermesAgents.first(where: { $0.name == hermesChatAgent }) ?? hermesAgents.first
+    }
+
+    /// Picks the Hermes agent used by the chat. Each agent is a separate conversation partner, so the
+    /// conversation is cleared when the active agent changes.
+    func selectHermesAgent(_ name: String) {
+        let previous = activeHermesAgent?.name
+        hermesChatAgent = name
+        guard name != previous else { return }
+        clearChatConversation()
+    }
+
+    /// Stores the agent and its key bound to its URL and profile (Keychain only), then selects it.
+    func addHermesAgent(_ agent: HermesAgent, key: String) {
+        var keys = HermesChat.decodeKeys(KeychainStore.shared.get("hermes-agent-keys") ?? "")
+        keys[agent.name] = HermesChat.KeyRecord(key: key, baseURL: agent.baseURL, profile: agent.profile)
+        KeychainStore.shared.set("hermes-agent-keys", value: HermesChat.encodeKeys(keys))
+        let previous = activeHermesAgent
+        hermesAgents.removeAll { $0.name == agent.name }
+        hermesAgents.append(agent)
+        fetchedProviderModels[.hermes] = nil
+        providerModelFetchError[.hermes] = nil
+        hermesChatAgent = agent.name
+        // Only a Hermes conversation is tied to the active agent.
+        if chatProvider == .hermes, previous != agent { clearChatConversation() }
+        syncHermesPills()
+    }
+
+    /// True when the key stored for `agent` is bound to its current URL and profile.
+    func isHermesAgentBound(_ agent: HermesAgent) -> Bool {
+        if case .success = HermesChat.boundKey(for: agent, in: HermesChat.decodeKeys(KeychainStore.shared.get("hermes-agent-keys") ?? "")) { return true }
+        return false
+    }
+
+    // MARK: Hermes sign in sessions (Keychain item "hermes-agent-sessions", one record per agent name)
+    // Reads happen here; every write goes through `HermesSessions.shared`, the single owner of the item.
+
+    private func hermesSessions() -> [String: HermesSignIn.SessionRecord] {
+        HermesSignIn.decodeSessions(KeychainStore.shared.get("hermes-agent-sessions") ?? "")
+    }
+
+    /// "Signed in as <label>" text for a sign in agent, or nil when it has no usable session
+    /// (no record, a record for another address, or an expired one that cannot be refreshed).
+    func hermesSessionLabel(_ agent: HermesAgent) -> String? {
+        guard case .success(let r) = HermesSignIn.boundSession(for: agent, in: hermesSessions()),
+              HermesSignIn.tokenAction(r, now: Date().timeIntervalSince1970) != .signInAgain else { return nil }
+        return r.label.isEmpty ? r.userID : r.label
+    }
+
+    /// Keeps a session obtained by "Sign in again", only while the agent still exists with the same address and
+    /// kind; otherwise the result is dropped (false). The check and the store call happen with no suspension in
+    /// between, and `removeHermesAgent` removes the record again after the row, so no record outlives its agent.
+    func storeHermesSession(_ record: HermesSignIn.SessionRecord, for agent: HermesAgent) async -> Bool {
+        guard hermesAgents.contains(where: { $0.name == agent.name && $0.baseURL == agent.baseURL && $0.connection == .signIn }) else { return false }
+        await HermesSessions.shared.store(record, name: agent.name)
+        if activeHermesAgent?.name == agent.name, chatProvider == .hermes { clearChatConversation() }
+        return true
+    }
+
+    /// Drops the session of an agent, keeps the row.
+    func signOutHermesAgent(named name: String) async {
+        await HermesSessions.shared.remove(name: name)
+        if activeHermesAgent?.name == name, chatProvider == .hermes { clearChatConversation() }
+    }
+
+    /// Adds a signed-in agent and stores its session (Keychain only), then selects it.
+    func addHermesSignedInAgent(_ agent: HermesAgent, record: HermesSignIn.SessionRecord) async {
+        var signedIn = agent
+        signedIn.connection = .signIn
+        await HermesSessions.shared.store(record, name: signedIn.name)
+        let previous = activeHermesAgent
+        hermesAgents.removeAll { $0.name == signedIn.name }
+        hermesAgents.append(signedIn)
+        fetchedProviderModels[.hermes] = nil
+        providerModelFetchError[.hermes] = nil
+        hermesChatAgent = signedIn.name
+        if chatProvider == .hermes, previous != signedIn { clearChatConversation() }
+        syncHermesPills()
+    }
+
+    func removeHermesAgent(named name: String) async {
+        let wasActive = activeHermesAgent?.name == name
+        var keys = HermesChat.decodeKeys(KeychainStore.shared.get("hermes-agent-keys") ?? "")
+        keys[name] = nil
+        if keys.isEmpty { KeychainStore.shared.remove("hermes-agent-keys") }
+        else { KeychainStore.shared.set("hermes-agent-keys", value: HermesChat.encodeKeys(keys)) }
+        await HermesSessions.shared.remove(name: name)
+        hermesAgents.removeAll { $0.name == name }
+        fetchedProviderModels[.hermes] = nil
+        providerModelFetchError[.hermes] = nil
+        if hermesChatAgent == name { hermesChatAgent = hermesAgents.first?.name ?? "" }
+        if wasActive, chatProvider == .hermes { clearChatConversation() }
+        if hermesAgents.isEmpty, chatProvider == .hermes { chatProvider = .anthropic }
+        syncHermesPills()
+        // A "Sign in again" stored while the first removal ran: the row is gone now, so the record goes too.
+        await HermesSessions.shared.remove(name: name)
+    }
 
     // The always-on workspace pill (default: VS Code). Persisted.
     @Published var mainPillId: String = PillCatalog.defaultMainPillId {
@@ -126,14 +258,27 @@ final class AppState: ObservableObject {
     func fetchModelsIfNeeded(for provider: ChatProvider) {
         guard !loadingProviderModels.contains(provider),
               fetchedProviderModels[provider] == nil else { return }
+        // Hermes: the picker lists the configured agents (local list, no network call)
+        if provider == .hermes {
+            if hermesAgents.isEmpty {
+                providerModelFetchError[.hermes] = String(localized: "Connect a Hermes agent in Settings → Chat first.")
+            } else {
+                fetchedProviderModels[.hermes] = hermesAgents.map { (id: $0.name, label: $0.name) }
+                providerModelFetchError.removeValue(forKey: .hermes)
+                if !hermesAgents.contains(where: { $0.name == hermesChatAgent }) {
+                    selectHermesAgent(hermesAgents[0].name)
+                }
+            }
+            return
+        }
         // Local providers: fetch from server URL (no API key needed)
         if provider.isLocal {
             let baseURL = provider == .ollama ? ollamaServerURL : lmstudioServerURL
             let normalised = LocalChat.normaliseURL(baseURL)
             guard !normalised.isEmpty else {
                 providerModelFetchError[provider] = provider == .ollama
-                    ? "Connect Ollama in Settings → Chat first."
-                    : "Connect LM Studio in Settings → Chat first."
+                    ? String(localized: "Connect Ollama in Settings → Chat first.")
+                    : String(localized: "Connect LM Studio in Settings → Chat first.")
                 return
             }
             loadingProviderModels.insert(provider)
@@ -144,8 +289,8 @@ final class AppState: ObservableObject {
                 switch result {
                 case .success(let models) where models.isEmpty:
                     providerModelFetchError[provider] = provider == .ollama
-                        ? "No models yet. Download one in Ollama first."
-                        : "No models yet. Download one in LM Studio first."
+                        ? String(localized: "No models yet. Download one in Ollama first.")
+                        : String(localized: "No models yet. Download one in LM Studio first.")
                 case .success(let models):
                     fetchedProviderModels[provider] = models
                     let current = provider == .ollama ? ollamaChatModel : lmstudioChatModel
@@ -155,14 +300,14 @@ final class AppState: ObservableObject {
                         else                   { lmstudioChatModel = first }
                     }
                 case .failure:
-                    providerModelFetchError[provider] = "Cannot reach \(normalised). Is the server running?"
+                    providerModelFetchError[provider] = String(localized: "Cannot reach \(normalised). Is the server running?")
                 }
             }
             return
         }
         // Remote providers: require API key
         guard let apiKey = KeychainStore.shared.get(provider.keychainKey), !apiKey.isEmpty else {
-            providerModelFetchError[provider] = "No API key — add it in Settings."
+            providerModelFetchError[provider] = String(localized: "No API key — add it in Settings.")
             return
         }
         loadingProviderModels.insert(provider)
@@ -173,11 +318,11 @@ final class AppState: ObservableObject {
             case .anthropic: models = await ClaudeService.fetchModels(apiKey: apiKey)
             case .google:    models = await ClaudeService.fetchGoogleModels(apiKey: apiKey)
             case .openai:    models = await ClaudeService.fetchOpenAIModels(apiKey: apiKey)
-            case .ollama, .lmstudio: models = []  // handled above
+            case .ollama, .lmstudio, .hermes: models = []  // handled above
             }
             loadingProviderModels.remove(provider)
             if models.isEmpty {
-                providerModelFetchError[provider] = "Failed to load models. Check your API key."
+                providerModelFetchError[provider] = String(localized: "Failed to load models. Check your API key.")
             } else {
                 fetchedProviderModels[provider] = models
                 switch provider {
@@ -193,7 +338,7 @@ final class AppState: ObservableObject {
                     if !models.contains(where: { $0.id == openAIChatModel }) {
                         openAIChatModel = models.first(where: { $0.id.contains("mini") })?.id ?? models.first!.id
                     }
-                case .ollama, .lmstudio: break
+                case .ollama, .lmstudio, .hermes: break
                 }
             }
         }
@@ -207,6 +352,7 @@ final class AppState: ObservableObject {
         case .openai:    return openAIChatModel
         case .ollama:    return ollamaChatModel
         case .lmstudio:  return lmstudioChatModel
+        case .hermes:    return activeHermesAgent?.name ?? "Hermes"
         }
     }
 
@@ -324,6 +470,126 @@ final class AppState: ObservableObject {
     // Chat conversation history
     @Published var chatHistory: [ChatMessage] = []
 
+    #if !APPSTORE
+    // cmux as the main workspace: the reply / new chat prompt, per session transcripts, settings.
+    @Published var cmuxPrompt: CmuxPromptMode? = nil {
+        didSet { if cmuxPrompt == nil { cmuxDraft = nil } }
+    }
+    /// True only while `IslandWindowController.openCmuxPrompt` switches to the prompt view.
+    var cmuxOpeningPrompt = false
+    @Published var cmuxTranscripts: [String: [ChatMessage]] = [:]
+    @Published var cmuxNotice: String? = nil {
+        didSet { if !settingCmuxFailure { cmuxNoticeFailure = nil; cmuxNoticeOffersCmux = false } }
+    }
+    /// The notice is the "started in cmux" one of a command line launcher: it offers the Open cmux action.
+    @Published private(set) var cmuxNoticeOffersCmux = false
+    func showCmuxStarted(_ text: String) {
+        cmuxNotice = text
+        cmuxNoticeOffersCmux = true
+    }
+    /// Which cmux failure the notice shows, when it is one. The prompt view tells them apart by this case,
+    /// never by comparing the translated text.
+    @Published private(set) var cmuxNoticeFailure: CmuxControl.Failure? = nil
+    private var settingCmuxFailure = false
+    func showCmuxFailure(_ failure: CmuxControl.Failure) {
+        settingCmuxFailure = true
+        cmuxNotice = failure.message
+        cmuxNoticeFailure = failure
+        cmuxNoticeOffersCmux = false
+        settingCmuxFailure = false
+    }
+    @Published var cmuxBusy = false
+    @Published var cmuxDraft: CmuxDraft? = nil
+    @Published var cmuxRecentFolders: [String] = UserDefaults.standard.stringArray(forKey: "cmuxRecentFolders") ?? [] {
+        didSet { UserDefaults.standard.set(cmuxRecentFolders, forKey: "cmuxRecentFolders") }
+    }
+    @Published var cmuxDefaultFolder: String = UserDefaults.standard.string(forKey: "cmuxDefaultFolder") ?? "" {
+        didSet { UserDefaults.standard.set(cmuxDefaultFolder, forKey: "cmuxDefaultFolder") }
+    }
+    /// Launch command per launcher, by `CmuxLauncher.Id` raw value. Loaded once, with the migration of the
+    /// old single command (see `CmuxLauncher.resolvedCommand`). Nothing is written at load: a value is
+    /// stored only when the user edits it (`setCmuxCommand`).
+    @Published var cmuxLaunchCommands: [String: String] = {
+        let defaults = UserDefaults.standard
+        var out: [String: String] = [:]
+        for l in CmuxLauncher.all {
+            let value = l.resolvedCommand(stored: defaults.string(forKey: l.defaultsKey),
+                                          legacy: defaults.string(forKey: CmuxLauncher.legacyDefaultsKey))
+            out[l.id.rawValue] = value
+        }
+        return out
+    }()
+
+    /// A valid command typed by the user: kept in memory and stored under the launcher's own key.
+    func setCmuxCommand(_ value: String, for launcher: CmuxLauncher) {
+        guard CmuxRouting.isValidLaunchCommand(value) else { return }
+        cmuxLaunchCommands[launcher.id.rawValue] = value
+        UserDefaults.standard.set(value, forKey: launcher.defaultsKey)
+    }
+
+    func cmuxCommand(for launcher: CmuxLauncher) -> String {
+        cmuxLaunchCommands[launcher.id.rawValue] ?? launcher.defaultCommand
+    }
+
+    /// Closes the cmux prompt (reply / new chat) and its notice and draft.
+    func clearCmuxPrompt() {
+        if cmuxPrompt != nil { cmuxPrompt = nil }
+        if cmuxNotice != nil { cmuxNotice = nil }
+    }
+    #endif
+
+    /// Messages shown in the prompt view, for its height: the cmux transcript or new chat when one is
+    /// open, else the normal chat. Equal to `chatHistory.count` whenever cmux is not involved.
+    var promptMessageCount: Int {
+        #if !APPSTORE
+        switch cmuxPrompt {
+        case .reply(let id)?: return cmuxTranscripts[id]?.count ?? 0
+        case .newChat?:       return 1
+        case nil:             break
+        }
+        #endif
+        return chatHistory.count
+    }
+
+    // MARK: Chat height (the user can stretch the chat card; see ChatHeight)
+
+    /// Height the user chose for the chat; nil = never stretched. Persisted, raw (clamped when read).
+    @Published private(set) var chatStretchedHeight: CGFloat? = ChatHeight.storedValue(
+        from: UserDefaults.standard.double(forKey: ChatHeight.defaultsKey))
+    /// Tallest the chat may be on the screen the island is on; the window controller keeps it current.
+    @Published var chatMaxHeight: CGFloat = ChatHeight.defaultCap
+    /// Height of the island panel (320 until the chat has been stretched); the window controller keeps it current.
+    @Published var panelHeight: CGFloat = ChatHeight.basePanelHeight
+    /// True while the grip is being dragged: the island follows the pointer without animation and stays open.
+    @Published var chatResizing = false
+    /// Set when the pointer reaches the grip: the panel grows before the mouse goes down, not inside the drag.
+    @Published var chatRoomRequested = false
+
+    /// Height of the chat card for the current messages and the user's stretch.
+    var chatPromptHeight: CGFloat {
+        ChatHeight.resolve(messageCount: promptMessageCount, stored: chatStretchedHeight, maximum: chatMaxHeight)
+    }
+    var chatCanStretch: Bool {
+        ChatHeight.canStretch(messageCount: promptMessageCount, maximum: chatMaxHeight)
+    }
+    var chatIsStretched: Bool {
+        ChatHeight.isStretched(messageCount: promptMessageCount, stored: chatStretchedHeight, maximum: chatMaxHeight)
+    }
+
+    /// Sets the stretch; `persist: false` while dragging (written once when the drag ends).
+    func setChatStretch(_ height: CGFloat?, persist: Bool = true) {
+        chatStretchedHeight = height
+        guard persist else { return }
+        if let height { UserDefaults.standard.set(Double(height), forKey: ChatHeight.defaultsKey) }
+        else { UserDefaults.standard.removeObject(forKey: ChatHeight.defaultsKey) }
+    }
+
+    /// Double click on the grip, or the header button.
+    func toggleChatStretch() {
+        setChatStretch(ChatHeight.toggled(messageCount: promptMessageCount,
+                                          stored: chatStretchedHeight, maximum: chatMaxHeight))
+    }
+
     // Pending approval request from Claude Code hook
     @Published var pendingApproval: ApprovalInfo? = nil
 
@@ -415,6 +681,8 @@ final class AppState: ObservableObject {
         if let v = ud.string(forKey: "lmstudioChatModel"), !v.isEmpty { lmstudioChatModel = v }
         if let v = ud.string(forKey: "ollamaServerURL"), !v.isEmpty { ollamaServerURL = v }
         if let v = ud.string(forKey: "lmstudioServerURL"), !v.isEmpty { lmstudioServerURL = v }
+        if let v = ud.string(forKey: "hermesAgents"), !v.isEmpty { hermesAgents = HermesChat.decodeAgents(v) }
+        if let v = ud.string(forKey: "hermesChatAgent"), !v.isEmpty { hermesChatAgent = v }
         // Migrate old 60s default → 15s
         if let v = ud.object(forKey: "autoCloseInterval") as? Double {
             autoCloseInterval = (v == 60) ? 15 : v
@@ -570,8 +838,142 @@ final class AppState: ObservableObject {
             }
         }
         sortTasksByCatalog()
+        syncHermesPills()
         if focusId == nil { focusId = mainPillId }
         syncMode()
+    }
+
+    // MARK: Hermes agent pills (one per connected agent, not in the catalog, not sessions)
+
+    /// Creates the pill of each connected agent, drops the pill of a removed one and puts them right
+    /// after the main pill. Pills are never touched by hook events: their ids match no hook agent.
+    func syncHermesPills() {
+        let plan = HermesPills.reconcile(existingIds: tasks.map { $0.id }, agents: hermesAgents.map { $0.name })
+        for id in plan.remove {
+            tasks.removeAll { $0.id == id }
+            if focusId == id { focusId = mainPillId }
+        }
+        var taken = Set(tasks.filter { HermesPills.isTaskId($0.id) }.map { $0.color })
+        for entry in plan.add {
+            let look = PillLook.appearance(key: String(entry.id.dropFirst(HermesPills.taskPrefix.count)), takenColors: taken)
+            taken.insert(look.color)
+            var task = AgentTask(id: entry.id, name: entry.name, color: look.color, state: .idle, steps: [], source: .agent)
+            if look.eye != "pill" { task.miniEye = EyeShape(rawValue: look.eye) }
+            tasks.append(task)
+        }
+        let ids = HermesPills.taskIds(for: hermesAgents.map { $0.name })
+        for agent in hermesAgents {
+            guard let id = ids[agent.name], let i = tasks.firstIndex(where: { $0.id == id }) else { continue }
+            let line = HermesPills.subtitle(profile: agent.profile, baseURL: agent.baseURL)
+            if tasks[i].subtitle != line { tasks[i].subtitle = line }
+        }
+        placeHermesPills()
+        syncMode()
+        syncView()
+    }
+
+    /// Keeps the Hermes pills (in connection order) right after the main pill, ahead of cmux sessions.
+    func placeHermesPills() {
+        let ids = HermesPills.taskIds(for: hermesAgents.map { $0.name })
+        let hermes = hermesAgents.compactMap { a in ids[a.name].flatMap { id in tasks.first { $0.id == id } } }
+        guard !hermes.isEmpty else { return }
+        var rest = tasks.filter { !HermesPills.isTaskId($0.id) }
+        let at = (rest.firstIndex { $0.id == mainPillId }).map { $0 + 1 } ?? 0
+        rest.insert(contentsOf: hermes, at: at)
+        if rest.map({ $0.id }) != tasks.map({ $0.id }) { tasks = rest }
+    }
+
+    /// Running chat turns per agent name. The pill stays thinking until the last of them ends.
+    private(set) var hermesTurnsRunning: [String: Int] = [:]
+
+    /// A turn starts (`true`) or ends (`false`) for an agent: the pill is thinking while any turn runs.
+    func setHermesPillBusy(agentName: String, _ busy: Bool) {
+        let count = max(0, (hermesTurnsRunning[agentName] ?? 0) + (busy ? 1 : -1))
+        hermesTurnsRunning[agentName] = count == 0 ? nil : count
+        guard let id = HermesPills.taskIds(for: hermesAgents.map { $0.name })[agentName],
+              let i = tasks.firstIndex(where: { $0.id == id }) else { return }
+        let target: BotState = count > 0 ? .thinking : .idle
+        if tasks[i].state != target { tasks[i].state = target }
+    }
+
+    /// Task id of the pill of the active Hermes agent, when the Hermes chat is the selected one.
+    var activeHermesPillId: String? {
+        guard chatProvider == .hermes, let agent = activeHermesAgent else { return nil }
+        return HermesPills.taskIds(for: hermesAgents.map { $0.name })[agent.name]
+    }
+
+    /// The pill of the active agent carries an answer the user has not seen yet.
+    var hermesHasUnseenAnswer: Bool {
+        guard let id = activeHermesPillId else { return false }
+        return tasks.first { $0.id == id }?.pillBadge == .finished
+    }
+
+    /// A chat turn of the active agent is running.
+    var hermesTurnRunning: Bool {
+        guard chatProvider == .hermes, let agent = activeHermesAgent else { return false }
+        return (hermesTurnsRunning[agent.name] ?? 0) > 0
+    }
+
+    /// An approval or question card is on screen, or cmux cards wait for their turn.
+    var alertCardPending: Bool {
+        if pendingApproval != nil || pendingQuestion != nil { return true }
+        #if !APPSTORE
+        if HookServer.shared.hasQueuedCmuxCards { return true }
+        #endif
+        return false
+    }
+
+    /// The island should open on the Hermes chat rather than the overview.
+    var opensOnHermesChat: Bool {
+        HermesAnnounce.opensOnChat(hermesChatActive: activeHermesPillId != nil, unseenAnswer: hermesHasUnseenAnswer,
+                                   turnRunning: hermesTurnRunning, alertPending: alertCardPending)
+    }
+
+    /// The cmux prompt occupies the prompt slot, or is being opened (the view changes before `cmuxPrompt` is set).
+    private var cmuxPromptIsOpenOrOpening: Bool {
+        #if !APPSTORE
+        return cmuxPrompt != nil || cmuxOpeningPrompt
+        #else
+        return false
+        #endif
+    }
+
+    /// Set when an announced answer takes the screen: it is not the user's own opening of the chat, so it must not
+    /// take keyboard focus, and the delayed collapses of earlier alerts must not close it right away.
+    private(set) var hermesAnnounceAt: Date = .distantPast
+    /// The panel must not become key for an announced answer (keystrokes meant for another app).
+    var hermesAnnounceBlocksKey: Bool { Date().timeIntervalSince(hermesAnnounceAt) < 1 }
+    /// A pending collapse from an earlier alert (approval note 3 s, finished pin 5.2 s) must leave an announced answer open.
+    var hermesAnnounceHoldsIsland: Bool { Date().timeIntervalSince(hermesAnnounceAt) < 8 }
+
+    /// The badge of the answer goes away once the chat with that agent is on screen.
+    private func clearHermesBadgeIfChatShown() {
+        guard let id = activeHermesPillId,
+              let i = tasks.firstIndex(where: { $0.id == id }), tasks[i].pillBadge != nil else { return }
+        guard HermesAnnounce.chatIsShown(expanded: mode == .expanded, viewIsChat: view == .prompt,
+                                         cmuxPromptOpen: cmuxPromptIsOpenOrOpening) else { return }
+        tasks[i].pillBadge = nil
+    }
+
+    /// A finished turn: tells the user when the chat is not on screen. Sound and badge always, the island
+    /// comes back to `target` (the chat, or the error note) unless an approval or question card holds the screen.
+    @discardableResult
+    func announceHermesTurn(agentName: String, failed: Bool, view target: IslandView) -> HermesAnnounce.Outcome {
+        let outcome = HermesAnnounce.decide(expanded: mode == .expanded, viewIsChat: view == .prompt,
+                                            cmuxPromptOpen: cmuxPromptIsOpenOrOpening, alertPending: alertCardPending)
+        guard outcome != .none else { return outcome }
+        SoundEngine.shared.play(failed ? "error" : "finish")
+        let pillId = HermesPills.taskIds(for: hermesAgents.map { $0.name })[agentName]
+        // An error that takes the screen is read on the spot: no badge left behind.
+        if let pillId, let i = tasks.firstIndex(where: { $0.id == pillId }), !(failed && outcome == .expand) {
+            tasks[i].pillBadge = failed ? .error : .finished
+        }
+        guard outcome == .expand else { return outcome }
+        if let pillId, tasks.contains(where: { $0.id == pillId }) { focusId = pillId }
+        hermesAnnounceAt = Date()
+        if mode == .expanded { view = target }
+        else { NotificationCenter.default.post(name: .hermesAnnounceExpand, object: target) }
+        return outcome
     }
 
     /// Toggle a catalog pill on/off.
@@ -656,10 +1058,11 @@ struct VercelDeployment: Identifiable {
     let branch: String?
 
     var isSuccess: Bool { state == "READY" }
-    var statusLabel: String { isSuccess ? "Ready" : (state == "CANCELED" ? "Canceled" : "Error") }
+    var statusLabel: String { isSuccess ? String(localized: "Ready") : (state == "CANCELED" ? String(localized: "Canceled") : String(localized: "Error")) }
+    var isJustNow: Bool { Date().timeIntervalSince(createdAt) < 60 }
     var timeAgo: String {
         let diff = Date().timeIntervalSince(createdAt)
-        if diff < 60    { return "just now" }
+        if diff < 60    { return String(localized: "just now") }
         if diff < 3600  { return "\(Int(diff/60))m" }
         if diff < 86400 { return "\(Int(diff/3600))h" }
         return "\(Int(diff/86400))d"
@@ -681,7 +1084,7 @@ struct ResendEmail: Identifiable {
     }
     var timeAgo: String {
         let diff = Date().timeIntervalSince(createdAt)
-        if diff < 60    { return "just now" }
+        if diff < 60    { return String(localized: "just now") }
         if diff < 3600  { return "\(Int(diff/60))m" }
         if diff < 86400 { return "\(Int(diff/3600))h" }
         return "\(Int(diff/86400))d"
@@ -710,7 +1113,7 @@ struct StripePayment: Identifiable, Equatable {
     var isSuccess: Bool { status == "succeeded" }
     var timeAgo: String {
         let diff = Date().timeIntervalSince(createdAt)
-        if diff < 60    { return "just now" }
+        if diff < 60    { return String(localized: "just now") }
         if diff < 3600  { return "\(Int(diff/60))m" }
         if diff < 86400 { return "\(Int(diff/3600))h" }
         return "\(Int(diff/86400))d"
@@ -757,7 +1160,7 @@ struct NotionPage: Identifiable {
 
     var timeAgo: String {
         let diff = Date().timeIntervalSince(lastEditedAt)
-        if diff < 60 { return "now" }
+        if diff < 60 { return String(localized: "now") }
         if diff < 3600 { return "\(Int(diff/60))m" }
         if diff < 86400 { return "\(Int(diff/3600))h" }
         return "\(Int(diff/86400))d"
@@ -772,4 +1175,14 @@ struct ChatMessage: Identifiable, Equatable {
     let id = UUID()
     let role: ChatRole
     var content: String   // var for streaming updates
+}
+
+/// The one sign in session store of the app, over the Keychain item "hermes-agent-sessions".
+extension HermesSessions {
+    static let shared = HermesSessions(storage: HermesSessionStorage(
+        load: { KeychainStore.shared.get("hermes-agent-sessions") ?? "" },
+        save: { value in
+            if value.isEmpty { KeychainStore.shared.remove("hermes-agent-sessions") }
+            else { KeychainStore.shared.set("hermes-agent-sessions", value: value) }
+        }))
 }

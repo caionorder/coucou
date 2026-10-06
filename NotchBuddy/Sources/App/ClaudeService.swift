@@ -71,6 +71,8 @@ final class KeychainStore: @unchecked Sendable {
         "stripe-api-key",
         "calcom-api-key",
         "notion-api-key",
+        "hermes-agent-keys",
+        "hermes-agent-sessions",
     ]
 
     private init() {
@@ -186,8 +188,42 @@ final class ClaudeService {
     // Multi-turn conversation messages (for API)
     private var conversationMessages: [[String: Any]] = []
 
+    /// Bumped on every clear: a request that started before a clear must not touch the new conversation.
+    private var conversationGeneration = 0
+    /// Hermes turns in flight, by id. A second message may start while the first still runs.
+    private struct HermesTurn {
+        var task: Task<String, Error>?
+        var hasText = false
+    }
+    private var hermesTurns: [UUID: HermesTurn] = [:]
+    /// Stored server session of the current conversation with a signed-in Hermes agent (nil = none yet).
+    private var hermesServerSession: String?
+
     func clearConversation() {
         conversationMessages = []
+        hermesServerSession = nil
+        conversationGeneration += 1
+        for turn in hermesTurns.values { turn.task?.cancel() }
+        hermesTurns = [:]
+    }
+
+    /// The typing dots show while a running turn has not produced text yet. Every override this code sets (dots, or
+    /// the error left by a failed sibling turn) is dropped by the rule in `HermesAnnounce.typingOverride`.
+    private func refreshHermesTyping(_ state: AppState) {
+        let current: HermesAnnounce.Override
+        switch state.stateOverride {
+        case nil: current = .none
+        case .some(.thinking): current = .thinking
+        case .some(.error): current = .error
+        default: current = .other
+        }
+        let next = HermesAnnounce.typingOverride(current: current, anyTurnWaiting: hermesTurns.values.contains { !$0.hasText })
+        guard next != current else { return }
+        switch next {
+        case .none: state.stateOverride = nil
+        case .thinking: state.stateOverride = .thinking
+        case .error, .other: break
+        }
     }
 
     /// Resolved once: NSFullUserName() is a system call, and the name cannot change under us
@@ -217,12 +253,13 @@ final class ClaudeService {
     // MARK: - Chat (multi-turn, natural text + web search)
 
     func chat(query: String, context: PromptContext?, state: AppState) async {
+        if state.chatProvider == .hermes { await chatHermes(query: query, context: context, state: state); return }
         guard state.chatProvider == .anthropic else {
             await chatOpenAICompatible(query: query, context: context, state: state)
             return
         }
         guard let key = apiKey, !key.isEmpty else {
-            await showError("API key missing. Open settings.", state: state)
+            await showError(String(localized: "API key missing. Open settings."), state: state)
             return
         }
 
@@ -259,7 +296,7 @@ final class ClaudeService {
             let data = try await callAPI(body: body, key: key, beta: "web-search-2025-03-05")
             await handleChatResult(data, state: state)
         } catch {
-            conversationMessages.removeLast()
+            if !conversationMessages.isEmpty { conversationMessages.removeLast() }
             await showError(error.localizedDescription, state: state)
         }
     }
@@ -279,14 +316,14 @@ final class ClaudeService {
             switch provider {
             case .google:  baseURL = "https://generativelanguage.googleapis.com/v1beta/openai"
             case .openai:  baseURL = "https://api.openai.com/v1"
-            case .anthropic, .ollama, .lmstudio: baseURL = ""
+            case .anthropic, .ollama, .lmstudio, .hermes: baseURL = ""
             }
         }
 
         guard !baseURL.isEmpty else {
             if provider.isLocal {
                 let name = provider == .ollama ? "Ollama" : "LM Studio"
-                await showError("Connect \(name) in Settings → Chat first.", state: state)
+                await showError(String(localized: "Connect \(name) in Settings → Chat first."), state: state)
             }
             return
         }
@@ -298,7 +335,7 @@ final class ClaudeService {
             authHeader = "Bearer ollama"
         } else {
             guard let key = KeychainStore.shared.get(provider.keychainKey), !key.isEmpty else {
-                await showError("\(provider.displayName) API key missing. Configure it in Settings.", state: state)
+                await showError(String(localized: "\(provider.displayName) API key missing. Configure it in Settings."), state: state)
                 return
             }
             authHeader = "Bearer \(key)"
@@ -315,31 +352,7 @@ final class ClaudeService {
             }
             msgs.append(simplified)
         }
-        var userText = query
-        if conversationMessages.isEmpty, let ctx = context {
-            switch ctx {
-            case .window(let app, let title, let url):
-                var prefix = "Context — App: \(app), Window: \(title)"
-                if let u = url { prefix += ", URL: \(u)" }
-                userText = prefix + "\n\n" + query
-            case .file(let name, let fileURL):
-                if provider.isLocal, let fileURL = fileURL {
-                    let ext = fileURL.pathExtension.lowercased()
-                    let binaryExts = ["pdf", "jpg", "jpeg", "png", "gif", "webp"]
-                    if !binaryExts.contains(ext),
-                       let text = try? String(contentsOf: fileURL, encoding: .utf8), !text.isEmpty {
-                        let truncated = text.count > 24_000
-                            ? String(text.prefix(24_000)) + "\n[truncated]"
-                            : text
-                        userText = "File: \(name)\n\n\(truncated)\n\n" + query
-                    } else {
-                        userText = "File: \(name)\n\n" + query
-                    }
-                } else {
-                    userText = "File: \(name)\n\n" + query
-                }
-            }
-        }
+        let userText = openAIUserText(query: query, context: context, inlineFiles: provider.isLocal)
         msgs.append(["role": "user", "content": userText])
         conversationMessages.append(["role": "user", "content": userText])
 
@@ -392,23 +405,23 @@ final class ClaudeService {
                 state.view = .prompt
                 NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
             } catch let e as LocalChatError {
-                conversationMessages.removeLast()
+                if !conversationMessages.isEmpty { conversationMessages.removeLast() }
                 state.chatHistory.removeAll { $0.id == msgId }
                 state.stateOverride = nil
                 let msg: String
                 switch e {
                 case .serverUnreachable:
                     msg = provider == .ollama
-                        ? "Ollama isn't running. Open it, then ask again."
-                        : "Start the local server in LM Studio, then ask again."
+                        ? String(localized: "Ollama isn't running. Open it, then ask again.")
+                        : String(localized: "Start the local server in LM Studio, then ask again.")
                 case .modelNotFound(let m):
-                    msg = "\(m) isn't installed. Pick another model above the chat box."
+                    msg = String(localized: "\(m) isn't installed. Pick another model above the chat box.")
                 case .serverError(let s):
                     msg = s
                 }
                 await showError(msg, state: state)
             } catch {
-                conversationMessages.removeLast()
+                if !conversationMessages.isEmpty { conversationMessages.removeLast() }
                 state.chatHistory.removeAll { $0.id == msgId }
                 state.stateOverride = nil
                 await showError(error.localizedDescription, state: state)
@@ -428,7 +441,7 @@ final class ClaudeService {
                       let choices = json["choices"] as? [[String: Any]],
                       let message = choices.first?["message"] as? [String: Any],
                       let content = message["content"] as? String else {
-                    throw NSError(domain: "ChatAPI", code: 0, userInfo: [NSLocalizedDescriptionKey: "Unexpected response format"])
+                    throw NSError(domain: "ChatAPI", code: 0, userInfo: [NSLocalizedDescriptionKey: String(localized: "Unexpected response format")])
                 }
                 let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
                 conversationMessages.append(["role": "assistant", "content": trimmed])
@@ -437,17 +450,177 @@ final class ClaudeService {
                 state.view = .prompt
                 NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
             } catch {
-                conversationMessages.removeLast()
+                if !conversationMessages.isEmpty { conversationMessages.removeLast() }
                 await showError(error.localizedDescription, state: state)
             }
         }
+    }
+
+    /// User text for the first turn of an OpenAI-style chat: window/file context prepended to the query.
+    /// `inlineFiles` inlines text files (up to 24 000 chars); otherwise only the file name is sent.
+    private func openAIUserText(query: String, context: PromptContext?, inlineFiles: Bool) -> String {
+        var userText = query
+        if conversationMessages.isEmpty, let ctx = context {
+            switch ctx {
+            case .window(let app, let title, let url):
+                var prefix = "Context — App: \(app), Window: \(title)"
+                if let u = url { prefix += ", URL: \(u)" }
+                userText = prefix + "\n\n" + query
+            case .file(let name, let fileURL):
+                if inlineFiles, let fileURL = fileURL {
+                    let ext = fileURL.pathExtension.lowercased()
+                    let binaryExts = ["pdf", "jpg", "jpeg", "png", "gif", "webp"]
+                    if !binaryExts.contains(ext),
+                       let text = try? String(contentsOf: fileURL, encoding: .utf8), !text.isEmpty {
+                        let truncated = text.count > 24_000
+                            ? String(text.prefix(24_000)) + "\n[truncated]"
+                            : text
+                        userText = "File: \(name)\n\n\(truncated)\n\n" + query
+                    } else {
+                        userText = "File: \(name)\n\n" + query
+                    }
+                } else {
+                    userText = "File: \(name)\n\n" + query
+                }
+            }
+        }
+        return userText
+    }
+
+    // MARK: - Hermes agents (stateless, streamed, no Mochi system prompt)
+
+    func chatHermes(query: String, context: PromptContext?, state: AppState) async {
+        guard let agent = state.activeHermesAgent else {
+            await showError(String(localized: "Connect a Hermes agent in Settings → Chat first."), state: state)
+            return
+        }
+        let signIn = agent.connection == .signIn
+        var key = ""
+        if signIn {
+            // No session for this agent (or for this address): nothing is sent.
+            if case .failure(let e) = HermesSignIn.boundSession(for: agent, in: HermesSignIn.decodeSessions(KeychainStore.shared.get("hermes-agent-sessions") ?? "")) {
+                await showError(e.userMessage, state: state)
+                return
+            }
+        } else {
+            switch HermesChat.boundKey(for: agent, in: HermesChat.decodeKeys(KeychainStore.shared.get("hermes-agent-keys") ?? "")) {
+            case .success(let k): key = k
+            case .failure(let e):
+                // The key is never sent: the stored agent does not match what the key was connected to.
+                await showError(e.userMessage, state: state)
+                return
+            }
+        }
+
+        // No system message: Hermes layers it over the agent's own prompt.
+        var msgs: [[String: Any]] = []
+        for m in conversationMessages {
+            var simplified = m
+            if let content = m["content"] as? [[String: Any]],
+               let textBlock = content.first(where: { ($0["type"] as? String) == "text" }),
+               let text = textBlock["text"] as? String {
+                simplified["content"] = text
+            }
+            msgs.append(simplified)
+        }
+        let userText = openAIUserText(query: query, context: context, inlineFiles: true)
+        msgs.append(["role": "user", "content": userText])
+        conversationMessages.append(["role": "user", "content": userText])
+
+        let placeholder = ChatMessage(role: .assistant, content: "")
+        let msgId = placeholder.id
+        state.chatHistory.append(placeholder)
+        let turnId = UUID()
+        hermesTurns[turnId] = HermesTurn(task: nil, hasText: false)
+        refreshHermesTyping(state)
+        state.setHermesPillBusy(agentName: agent.name, true)
+        defer { state.setHermesPillBusy(agentName: agent.name, false) }
+        let startedAt = Date()
+        appendAppLog("nb.log", "hermes turn started signIn=\(signIn)")
+        let body: [String: Any] = ["model": agent.modelName, "messages": msgs, "stream": true]
+        let encodedBody = signIn ? Data() : ((try? JSONSerialization.data(withJSONObject: body)) ?? Data())
+        let generation = conversationGeneration
+        let storedSession = hermesServerSession
+        let task = Task { [state, msgId] () async throws -> String in
+            let onToken: @MainActor (String) -> Void = { visible in
+                if !visible.isEmpty, self.hermesTurns[turnId]?.hasText == false {
+                    self.hermesTurns[turnId]?.hasText = true   // hide typing dots once no turn waits for text
+                    appendAppLog("nb.log", "hermes turn first text after=\(Self.seconds(since: startedAt))s")
+                    self.refreshHermesTyping(state)
+                }
+                if let idx = state.chatHistory.firstIndex(where: { $0.id == msgId }) {
+                    state.chatHistory[idx].content = visible
+                }
+            }
+            if signIn {
+                // The server keeps the history: only the new text is sent, the session is resumed by id.
+                return try await HermesSignInNet.streamTurn(
+                    agent: agent, sessions: HermesSessions.shared, storedSession: storedSession, text: userText,
+                    onSession: { id in
+                        if generation == self.conversationGeneration { self.hermesServerSession = id.isEmpty ? nil : id }
+                    },
+                    onToken: onToken)
+            }
+            return try await HermesChat.streamChat(agent: agent, key: key, encodedBody: encodedBody, onToken: onToken)
+        }
+        hermesTurns[turnId]?.task = task
+        do {
+            let final = try await task.value
+            hermesTurns[turnId] = nil
+            guard generation == conversationGeneration else {
+                appendAppLog("nb.log", "hermes turn discarded (conversation cleared) after=\(Self.seconds(since: startedAt))s")
+                refreshHermesTyping(state)
+                return
+            }
+            conversationMessages.append(["role": "assistant", "content": final])
+            if let idx = state.chatHistory.firstIndex(where: { $0.id == msgId }) {
+                state.chatHistory[idx].content = final
+            }
+            refreshHermesTyping(state)
+            appendAppLog("nb.log", "hermes turn finished duration=\(Self.seconds(since: startedAt))s chars=\(final.count)")
+            // Chat on screen: nothing changes. Otherwise sound, badge and back to the chat.
+            state.announceHermesTurn(agentName: agent.name, failed: false, view: .prompt)
+            NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
+        } catch {
+            hermesTurns[turnId] = nil
+            guard generation == conversationGeneration else {
+                // Cleared meanwhile: leave the new conversation alone, only stop the typing dots
+                // when no newer Hermes request is still waiting for its first text.
+                appendAppLog("nb.log", "hermes turn discarded (conversation cleared) after=\(Self.seconds(since: startedAt))s")
+                refreshHermesTyping(state)
+                return
+            }
+            // Remove this turn's own message: a sibling turn may have added its own after it.
+            if let own = conversationMessages.lastIndex(where: { ($0["role"] as? String) == "user" && ($0["content"] as? String) == userText }) {
+                conversationMessages.remove(at: own)
+            }
+            state.chatHistory.removeAll { $0.id == msgId }
+            refreshHermesTyping(state)
+            let msg = (error as? HermesChatError)?.userMessage ?? String(localized: "Hermes request failed.")
+            appendAppLog("nb.log", "hermes turn failed after=\(Self.seconds(since: startedAt))s error=\(Self.errorCaseName(error))")
+            let outcome = state.announceHermesTurn(agentName: agent.name, failed: true, view: .note)
+            // A card on screen keeps the screen: the error is only signalled by the sound and the pill badge.
+            if outcome == .badgeOnly {
+                // The text waits in the chat for when it is next shown.
+                state.chatHistory.append(ChatMessage(role: .assistant, content: msg))
+            } else { await showError(msg, state: state) }
+        }
+    }
+
+    private static func seconds(since start: Date) -> String { String(format: "%.1f", Date().timeIntervalSince(start)) }
+
+    /// Case name of an error, never its associated values (they may carry a host or a server text).
+    private static func errorCaseName(_ error: Error) -> String {
+        if error is CancellationError { return "cancelled" }
+        if error is HermesChatError { return String(String(describing: error).prefix { $0 != "(" }) }
+        return "other"
     }
 
     // MARK: - Structured search (M8 — window attach + web search)
 
     func search(query: String, context: PromptContext?, state: AppState) async {
         guard let key = apiKey, !key.isEmpty else {
-            await showError("Anthropic API key missing. Open settings to configure it.", state: state)
+            await showError(String(localized: "Anthropic API key missing. Open settings to configure it."), state: state)
             return
         }
 
@@ -518,12 +691,12 @@ final class ClaudeService {
                     let id = AppState.shared.claudeModel
                     throw NSError(domain: "Claude", code: 0,
                         userInfo: [NSLocalizedDescriptionKey:
-                            "Model not found: \(id). Pick another one in Settings."])
+                            String(localized: "Model not found: \(id). Pick another one in Settings.")])
                 }
                 throw NSError(domain: "Claude", code: 0,
                     userInfo: [NSLocalizedDescriptionKey: errMsg])
             }
-            let msg = String(data: data, encoding: .utf8) ?? "unknown error"
+            let msg = String(data: data, encoding: .utf8) ?? String(localized: "unknown error")
             throw NSError(domain: "Claude", code: 0, userInfo: [NSLocalizedDescriptionKey: msg])
         }
         return data
@@ -534,7 +707,7 @@ final class ClaudeService {
     private func handleChatResult(_ data: Data, state: AppState) async {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let content = json["content"] as? [[String: Any]] else {
-            await showError("Unexpected API response.", state: state)
+            await showError(String(localized: "Unexpected API response."), state: state)
             return
         }
 
@@ -543,7 +716,7 @@ final class ClaudeService {
 
         guard let textBlock = content.first(where: { $0["type"] as? String == "text" }),
               let text = textBlock["text"] as? String, !text.isEmpty else {
-            await showError("No response text.", state: state)
+            await showError(String(localized: "No response text."), state: state)
             return
         }
 
@@ -563,7 +736,7 @@ final class ClaudeService {
               let content = json["content"] as? [[String: Any]],
               let textBlock = content.first(where: { $0["type"] as? String == "text" }),
               let text = textBlock["text"] as? String else {
-            await showError("Unexpected API response.", state: state)
+            await showError(String(localized: "Unexpected API response."), state: state)
             return
         }
 
@@ -578,7 +751,7 @@ final class ClaudeService {
         // Try to parse as our JSON format
         if let resultData = cleanText.data(using: .utf8),
            let parsed = try? JSONSerialization.jsonObject(with: resultData) as? [String: Any] {
-            let title  = parsed["title"] as? String ?? "Result"
+            let title  = parsed["title"] as? String ?? String(localized: "Result")
             let note   = parsed["note"] as? String
             var items: [ResultItem] = []
             if let rawItems = parsed["items"] as? [[String: Any]] {
@@ -595,7 +768,7 @@ final class ClaudeService {
             // Fallback: show raw text in 3-line chunks
             let lines = cleanText.components(separatedBy: "\n").filter { !$0.isEmpty }.prefix(3)
             state.searchResult = SearchResult(
-                title: "Claude's response",
+                title: String(localized: "Claude's response"),
                 items: lines.map { ResultItem(label: $0, detail: "", url: nil) },
                 note: nil
             )

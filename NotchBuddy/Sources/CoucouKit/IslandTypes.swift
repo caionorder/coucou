@@ -60,6 +60,7 @@ struct AgentTask: Identifiable, Equatable {
     var pillBadge: PillBadge? = nil  // alert badge shown on pill when not focused
     var sessionCwd: String?  = nil  // last known working directory (Claude Code sessions)
     var finalLine: String?   = nil  // last assistant message shown as static text after Stop
+    var subtitle: String?    = nil  // second line under the name (cmux sessions: folder and git branch)
 }
 
 enum AgentSource: Equatable {
@@ -76,6 +77,7 @@ enum ChatProvider: String, CaseIterable, Codable {
     case openai    = "openai"
     case ollama    = "ollama"
     case lmstudio  = "lmstudio"
+    case hermes    = "hermes"
 
     var displayName: String {
         switch self {
@@ -84,6 +86,7 @@ enum ChatProvider: String, CaseIterable, Codable {
         case .openai:    "OpenAI"
         case .ollama:    "Ollama"
         case .lmstudio:  "LM Studio"
+        case .hermes:    "Hermes"
         }
     }
 
@@ -94,6 +97,7 @@ enum ChatProvider: String, CaseIterable, Codable {
         case .openai:    "#10A37F"
         case .ollama:    "#FACC15"
         case .lmstudio:  "#A3E635"
+        case .hermes:    "#F97316"
         }
     }
 
@@ -104,6 +108,7 @@ enum ChatProvider: String, CaseIterable, Codable {
         case .openai:    "gpt-4o"
         case .ollama:    "llama3.2"
         case .lmstudio:  "local-model"
+        case .hermes:    ""
         }
     }
 
@@ -114,6 +119,7 @@ enum ChatProvider: String, CaseIterable, Codable {
         case .openai:    "openai-api-key"
         case .ollama:    ""
         case .lmstudio:  ""
+        case .hermes:    "hermes-agent-keys"
         }
     }
 
@@ -128,6 +134,7 @@ enum ChatProvider: String, CaseIterable, Codable {
         case .openai:    "ai_openai"
         case .ollama:    "ai_ollama"
         case .lmstudio:  "ai_lmstudio"
+        case .hermes:    "ai_hermes"
         }
     }
 
@@ -138,6 +145,7 @@ enum ChatProvider: String, CaseIterable, Codable {
         case "ai_openai":    self = .openai
         case "ai_ollama":    self = .ollama
         case "ai_lmstudio":  self = .lmstudio
+        case "ai_hermes":    self = .hermes
         default:             return nil
         }
     }

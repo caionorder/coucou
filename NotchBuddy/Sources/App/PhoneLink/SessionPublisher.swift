@@ -186,11 +186,11 @@ struct SessionSnapshot: Equatable {
             let payload = task.state == .question ? question.map(QuestionPayload.init(ask:)) : nil
             result[task.id] = SessionSnapshot(
                 pillId: task.id,
-                name: task.name,
+                name: PhoneText.english(task.name),
                 color: task.color,
                 state: task.state.rawValue,
                 stepIndex: task.stepIndex,
-                steps: task.steps,
+                steps: task.steps.map(PhoneText.english),
                 cwd: task.sessionCwd ?? "",
                 finalLine: task.finalLine ?? "",
                 approvalTool: hasApproval ? (approval?.tool ?? "") : "",

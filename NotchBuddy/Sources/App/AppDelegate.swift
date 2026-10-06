@@ -15,6 +15,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         signal(SIGPIPE, SIG_IGN)
         // Warm up Keychain cache on main thread BEFORE any poller or view touches it
         _ = KeychainStore.shared
+        _ = AppLanguage.launched
         NSApp.setActivationPolicy(.accessory)
         setupMenuBarItem()
         setupIsland()
@@ -34,11 +35,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         button.image?.isTemplate = true
 
         let menu = NSMenu()
-        menu.addItem(withTitle: "Open Coucou", action: #selector(openIsland), keyEquivalent: "")
+        menu.addItem(withTitle: String(localized: "Open Coucou"), action: #selector(openIsland), keyEquivalent: "")
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        menu.addItem(withTitle: String(localized: "Settings…"), action: #selector(openSettings), keyEquivalent: ",")
         menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(withTitle: String(localized: "Quit"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
 
         statusItem?.menu = menu
     }
@@ -48,6 +49,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func openIsland() {
         islandController?.expand(to: .overview)
     }
+
+    /// Identifies the Settings window (its title is translated, so it cannot be compared).
+    static let settingsWindowID = NSUserInterfaceItemIdentifier("coucou.settings")
 
     private var settingsWindow: NSWindow?
 
@@ -69,7 +73,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 720, height: 560),
                            styleMask: [.titled, .closable, .miniaturizable, .resizable],
                            backing: .buffered, defer: false)
-        win.title = "Settings — Coucou"
+        win.title = String(localized: "Settings — Coucou")
+        win.identifier = Self.settingsWindowID
         let host = NSHostingView(rootView: SettingsView())
         host.sizingOptions = [.minSize]
         win.contentView = host

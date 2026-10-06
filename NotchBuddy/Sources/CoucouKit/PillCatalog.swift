@@ -10,10 +10,10 @@ enum PillCategory: String, CaseIterable {
 
     var title: String {
         switch self {
-        case .workspace: return "Where you code"
-        case .agent:     return "Agents"
-        case .ai:        return "AI for the chat"
-        case .service:   return "Services"
+        case .workspace: return String(localized: "Where you code")
+        case .agent:     return String(localized: "Agents")
+        case .ai:        return String(localized: "AI for the chat")
+        case .service:   return String(localized: "Services")
         }
     }
 }
@@ -37,7 +37,7 @@ struct PillDefinition {
         case "integration_claude": return "Claude Code"
         case "agent_cursor":       return "Cursor"
         case "agent_codex":        return "Codex"
-        default:                   return "Agent"
+        default:                   return String(localized: "Agent")
         }
     }
 }
@@ -49,44 +49,48 @@ enum PillCatalog {
     static let all: [PillDefinition] = [
         // ── Where you code ───────────────────────────────────────────────────
         .init(id: "integration_claude",  name: "VS Code",     color: "#F5F6F8",
-              category: .workspace, subtitle: "Integration",  source: .claudeCode),
+              category: .workspace, subtitle: String(localized: "Integration"),  source: .claudeCode),
         .init(id: "agent_cursor",        name: "Cursor",      color: "#C0C4CC",
-              category: .workspace, subtitle: "Integration",  source: .agent),
+              category: .workspace, subtitle: String(localized: "Integration"),  source: .agent),
         .init(id: "agent_antigravity",   name: "Antigravity", color: "#E879F9",
-              category: .workspace, subtitle: "Integration",  source: .agent,  githubOnly: true),
+              category: .workspace, subtitle: String(localized: "Integration"),  source: .agent,  githubOnly: true),
         .init(id: "agent_codex",         name: "Codex",       color: "#2DD4BF",
-              category: .workspace, subtitle: "Integration",  source: .agent,  githubOnly: true),
+              category: .workspace, subtitle: String(localized: "Integration"),  source: .agent,  githubOnly: true),
+        .init(id: "integration_cmux",    name: "cmux",        color: "#7DD3FC",
+              category: .workspace, subtitle: String(localized: "Integration"),  source: .claudeCode, githubOnly: true),
         // ── Agents ───────────────────────────────────────────────────────────
         .init(id: "agent_gemini",        name: "Gemini CLI",  color: "#8AB4F8",
-              category: .agent,     subtitle: "Agent",        source: .agent,  githubOnly: true),
+              category: .agent,     subtitle: String(localized: "Agent"),        source: .agent,  githubOnly: true),
         // ── AI for the chat ──────────────────────────────────────────────────
         .init(id: "ai_anthropic",        name: "Anthropic",   color: ChatProvider.anthropic.accentHex,
-              category: .ai,        subtitle: "Chat",         source: .n8n),
+              category: .ai,        subtitle: String(localized: "Chat"),         source: .n8n),
         .init(id: "ai_google",           name: "Google AI",   color: ChatProvider.google.accentHex,
-              category: .ai,        subtitle: "Chat",         source: .n8n),
+              category: .ai,        subtitle: String(localized: "Chat"),         source: .n8n),
         .init(id: "ai_openai",           name: "OpenAI",      color: ChatProvider.openai.accentHex,
-              category: .ai,        subtitle: "Chat",         source: .n8n),
+              category: .ai,        subtitle: String(localized: "Chat"),         source: .n8n),
         .init(id: "ai_ollama",           name: "Ollama",      color: ChatProvider.ollama.accentHex,
-              category: .ai,        subtitle: "Chat",         source: .n8n),
+              category: .ai,        subtitle: String(localized: "Chat"),         source: .n8n),
         .init(id: "ai_lmstudio",         name: "LM Studio",   color: ChatProvider.lmstudio.accentHex,
-              category: .ai,        subtitle: "Chat",         source: .n8n),
+              category: .ai,        subtitle: String(localized: "Chat"),         source: .n8n),
+        .init(id: "ai_hermes",           name: "Hermes",      color: ChatProvider.hermes.accentHex,
+              category: .ai,        subtitle: String(localized: "Chat"),         source: .n8n),
         // ── Services ─────────────────────────────────────────────────────────
         .init(id: "integration_resend",  name: "Resend",      color: "#22C55E",
-              category: .service,   subtitle: "Integration",  source: .n8n),
+              category: .service,   subtitle: String(localized: "Integration"),  source: .n8n),
         .init(id: "integration_n8n",     name: "n8n",         color: "#F29B38",
-              category: .service,   subtitle: "Integration",  source: .n8n),
+              category: .service,   subtitle: String(localized: "Integration"),  source: .n8n),
         .init(id: "integration_vercel",  name: "Vercel",      color: "#7C5CFF",
-              category: .service,   subtitle: "Integration",  source: .n8n),
+              category: .service,   subtitle: String(localized: "Integration"),  source: .n8n),
         .init(id: "integration_github",  name: "GitHub",      color: "#F4505E",
-              category: .service,   subtitle: "Integration",  source: .n8n),
+              category: .service,   subtitle: String(localized: "Integration"),  source: .n8n),
         .init(id: "integration_notion",  name: "Notion",      color: "#8C8C8C",
-              category: .service,   subtitle: "Integration",  source: .n8n),
+              category: .service,   subtitle: String(localized: "Integration"),  source: .n8n),
         .init(id: "integration_calcom",  name: "Cal.com",     color: "#C9956A",
-              category: .service,   subtitle: "Integration",  source: .n8n),
+              category: .service,   subtitle: String(localized: "Integration"),  source: .n8n),
         .init(id: "integration_stripe",  name: "Stripe",      color: "#0570DE",
-              category: .service,   subtitle: "Integration",  source: .n8n),
+              category: .service,   subtitle: String(localized: "Integration"),  source: .n8n),
         .init(id: "integration_music",   name: "Apple Music", color: "#FA2D48",
-              category: .service,   subtitle: "Integration",  source: .n8n, githubOnly: true),
+              category: .service,   subtitle: String(localized: "Integration"),  source: .n8n, githubOnly: true),
     ]
 
     /// Pills available in the current build target.

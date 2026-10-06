@@ -46,6 +46,36 @@ final class HookServer: @unchecked Sendable {
     private var focusBeforeQuestion: String? = nil    // saved focus to restore after question
     private var activeSessionId: String? = nil        // current Claude Code session
     private var focusBeforeApproval: String? = nil    // saved focus to restore after approval
+    // Bumped each time a card takes an fd, so a stale timer never dismisses a later card
+    // that happens to reuse the same fd number.
+    private var cardGeneration = 0
+
+    #if !APPSTORE
+    // cmux: per-surface registry (holds the capability token, memory only) and the queue of waiting cards.
+    private var cmuxRegistry = CmuxRegistry()
+    /// Set by upsertCmuxTask: true when the last upsert created the task (not a /clear or a later event).
+    private var cmuxLastUpsertCreated = false
+    private var cmuxLaunchGeneration = 0
+    /// Per task: a permission / question dialog Coucou gave back to the terminal and that may still be
+    /// open there. Typing Enter then would answer it. Cleared only by the event that resolves it.
+    private var cmuxOpenDialogs: [String: CmuxRouting.DialogMark] = [:]
+    /// Tab title of each cmux session and the last time its title / branch were refreshed. Memory only.
+    private var cmuxTitles: [String: String] = [:]
+    private var cmuxMetaAt: [String: TimeInterval] = [:]
+    private var cmuxRefusedLogged: Set<String> = []
+    private var cmuxQueue = CmuxCardQueue()
+    private struct CmuxHeld {
+        var fd: Int32
+        var source: any DispatchSourceRead
+        var taskId: String
+        var payload: [String: Any]
+        var parsed: AskQuestion?
+    }
+    private var cmuxHeld: [Int: CmuxHeld] = [:]          // side data of queued cards, keyed by card id
+    private var cmuxShownPayload: [String: Any]? = nil   // payload of the cmux card currently on screen
+    private var cmuxShownArrival: TimeInterval = 0
+    private var cmuxPromotedAt: TimeInterval? = nil      // set when the card on screen came out of the queue
+    #endif
 
     private init() {}
 
@@ -60,7 +90,14 @@ final class HookServer: @unchecked Sendable {
     /// Cancels the approval fd source (which closes the fd via its cancel handler), shows a
     /// 3-second note, clears approval state, then collapses the island.
     @MainActor
-    private func dismissApprovalCard(note: String) {
+    private func dismissApprovalCard(note: String, resolved: Bool = false) {
+        #if !APPSTORE
+        cmuxShownPayload = nil
+        // Not resolved by an event (timeout, the hook went away): the dialog may still be open in cmux.
+        if !resolved, let p = AppState.shared.pendingApproval {
+            markCmuxDialogOpen(p.pillId, tool: p.tool, inputKey: p.inputKey)
+        }
+        #endif
         // cancelApprovalFDSource() triggers the cancel handler which closes the fd.
         // Never close the fd here directly — Apple requires it to happen in the cancel handler.
         cancelApprovalFDSource()
@@ -78,9 +115,14 @@ final class HookServer: @unchecked Sendable {
                 withAnimation(.spring(response: 0.5, dampingFraction: 0.72)) { state.focusId = prev }
             }
         }
+        #if !APPSTORE
+        if presentNextCmuxCard() { return }
+        #endif
         state.noteMessage = note
         state.view = .note
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            // A Hermes answer announced meanwhile keeps the island open.
+            if AppState.shared.hermesAnnounceHoldsIsland { return }
             NotificationCenter.default.post(name: .islandCollapse, object: nil)
         }
     }
@@ -94,7 +136,11 @@ final class HookServer: @unchecked Sendable {
     }
 
     @MainActor
-    private func dismissQuestionCard(note: String) {
+    private func dismissQuestionCard(note: String, leftOpen: Bool = false) {
+        #if !APPSTORE
+        cmuxShownPayload = nil
+        if leftOpen { markCmuxDialogOpen(questionPillId, tool: "AskUserQuestion", inputKey: nil) }
+        #endif
         cancelQuestionFDSource()
         pendingQuestionFD = -1
         let state = AppState.shared
@@ -109,6 +155,9 @@ final class HookServer: @unchecked Sendable {
                 withAnimation(.spring(response: 0.5, dampingFraction: 0.72)) { state.focusId = prev }
             }
         }
+        #if !APPSTORE
+        if presentNextCmuxCard() { return }
+        #endif
         if !note.isEmpty {
             state.noteMessage = note
             state.view = .note
@@ -123,6 +172,9 @@ final class HookServer: @unchecked Sendable {
     /// Called by QuestionView. Sends answers JSON and cleans up.
     @MainActor
     func sendQuestionAnswers(_ answers: [String: Any]) {
+        #if !APPSTORE
+        if cmuxInputLocked() { return }
+        #endif
         let fd = pendingQuestionFD
         pendingQuestionFD = -1
         let source = questionFDSource
@@ -144,6 +196,10 @@ final class HookServer: @unchecked Sendable {
     @MainActor
     func releaseQuestionFD() {
         guard pendingQuestionFD >= 0 else { return }
+        #if !APPSTORE
+        cmuxShownPayload = nil
+        markCmuxDialogOpen(questionPillId, tool: "AskUserQuestion", inputKey: nil)
+        #endif
         let fd = pendingQuestionFD
         pendingQuestionFD = -1
         let source = questionFDSource
@@ -153,11 +209,18 @@ final class HookServer: @unchecked Sendable {
             self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
             DispatchQueue.main.async { source?.cancel() }
         }
+        #if !APPSTORE
+        // Runs from onDisappear: promote the next queued cmux card on the next turn.
+        DispatchQueue.main.async { _ = self.presentNextCmuxCard() }
+        #endif
     }
 
     /// Called by QuestionView "Reply in terminal" button.
     @MainActor
     func sendQuestionAsk() {
+        #if !APPSTORE
+        if cmuxInputLocked() { return }
+        #endif
         let fd = pendingQuestionFD
         pendingQuestionFD = -1
         let source = questionFDSource
@@ -170,7 +233,7 @@ final class HookServer: @unchecked Sendable {
         } else {
             source?.cancel()
         }
-        dismissQuestionCard(note: "")
+        dismissQuestionCard(note: "", leftOpen: true)
     }
 
     /// Returns the tool_input serialized as sorted-keys JSON, "" if absent or empty.
@@ -191,6 +254,13 @@ final class HookServer: @unchecked Sendable {
         try? FileManager.default.setAttributes([.posixPermissions: 0o700 as NSNumber], ofItemAtPath: dir.path)
         #if !APPSTORE
         installHookScript()
+        // cmux quit: its capability tokens are dead, drop them (tasks stay, the next event brings new ones).
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification, object: nil, queue: .main) { [weak self] note in
+            let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            guard app?.bundleIdentifier == CmuxRouting.bundleId else { return }
+            MainActor.assumeIsolated { self?.cmuxRegistry.clearCredentials() }
+        }
         #endif
         Thread.detachNewThread { self.serverThread() }
     }
@@ -273,11 +343,19 @@ final class HookServer: @unchecked Sendable {
         }
 
         guard !raw.isEmpty,
-              let payload = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else {
+              let rawPayload = try? JSONSerialization.jsonObject(with: raw) as? [String: Any] else {
             sendLine(fd: fd, text: #"{"ok":true}"#)
             close(fd)
             return
         }
+        #if !APPSTORE
+        // The cmux capability is a credential: strip it before any other code sees the payload.
+        var scrubbed = rawPayload
+        let cmuxToken = (scrubbed.removeValue(forKey: "cmux_socket_capability") as? String) ?? ""
+        let payload = scrubbed
+        #else
+        let payload = rawPayload
+        #endif
 
         let coucouKind = payload["coucou_kind"] as? String ?? ""
 
@@ -293,7 +371,12 @@ final class HookServer: @unchecked Sendable {
         if coucouKind == "ask_user_question" {
             let toolInput = payload["tool_input"] as? [String: Any] ?? [:]
             if let parsed = AskQuestion.parse(toolInput: toolInput) {
-                Task { @MainActor in self.processQuestionRequest(fd: fd, parsed: parsed, payload: payload) }
+                Task { @MainActor in
+                    #if !APPSTORE
+                    self.noteCmuxContext(payload: payload, token: cmuxToken)
+                    #endif
+                    self.processQuestionRequest(fd: fd, parsed: parsed, payload: payload)
+                }
             } else {
                 // Malformed payload — fall back: send ask so Claude Code re-asks in terminal
                 sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
@@ -306,9 +389,19 @@ final class HookServer: @unchecked Sendable {
 
         if eventName == "PermissionRequest" {
             // Hold fd open — Claude Code waits for our decision (up to 120s)
-            Task { @MainActor in self.processPermissionRequest(fd: fd, payload: payload) }
+            Task { @MainActor in
+                #if !APPSTORE
+                self.noteCmuxContext(payload: payload, token: cmuxToken)
+                #endif
+                self.processPermissionRequest(fd: fd, payload: payload)
+            }
         } else {
-            Task { @MainActor in self.processEvent(name: eventName, payload: payload) }
+            Task { @MainActor in
+                #if !APPSTORE
+                self.noteCmuxContext(payload: payload, token: cmuxToken)
+                #endif
+                self.processEvent(name: eventName, payload: payload)
+            }
             sendLine(fd: fd, text: #"{"ok":true}"#)
             close(fd)
         }
@@ -329,7 +422,7 @@ final class HookServer: @unchecked Sendable {
                      ?? "unknown"
         let cwd = payload["cwd"] as? String ?? ""
         let rawName = URL(fileURLWithPath: cwd).lastPathComponent
-        let projectName = aliasProjectName(rawName.isEmpty ? "Session" : rawName)
+        let projectName = aliasProjectName(rawName.isEmpty ? String(localized: "Session") : rawName)
 
         // Determine which pill this event belongs to.
         // coucou_agent must be lowercase, digits and hyphens, ≤ 24 chars.
@@ -345,6 +438,11 @@ final class HookServer: @unchecked Sendable {
         let isVSCodeEditor = !isCursorEditor && (
             termProgram.lowercased().contains("vscode") ||
             bundleId.lowercased().contains("vscode"))
+        #if !APPSTORE
+        let cmuxTaskId = CmuxRouting.taskId(payload: payload)
+        #else
+        let cmuxTaskId: String? = nil
+        #endif
 
         // Routing:
         // • "codex" → agent_codex (GitHub build only: workspace pill, approvals in the notch)
@@ -370,12 +468,34 @@ final class HookServer: @unchecked Sendable {
         } else if isVSCodeEditor {
             agentId = "integration_claude"
             isExternalAgent = false
+        } else if let id = cmuxTaskId {
+            agentId = id
+            isExternalAgent = false
         } else {
             nbLog("Ignored \(name) from \(termProgram.isEmpty ? bundleId : termProgram) (\(projectName))")
             return
         }
 
+        #if !APPSTORE
+        if let routed = cmuxTaskId, routed == agentId {
+            let eventInputKey = Self.approvalInputKey(payload["tool_input"] as? [String: Any] ?? [:])
+            if let mark = cmuxOpenDialogs[routed],
+               CmuxRouting.dialogResolved(mark: mark, event: name, tool: payload["tool_name"] as? String ?? "",
+                                          inputKey: eventInputKey) {
+                cmuxOpenDialogs[routed] = nil
+            }
+            purgeCmuxQueue(event: name, sessionId: sessionId,
+                           tool: payload["tool_name"] as? String ?? "",
+                           inputKey: Self.approvalInputKey(payload["tool_input"] as? [String: Any] ?? [:]))
+        }
+        #endif
+
         let focused = state.focusId == agentId
+        #if !APPSTORE
+        var cardPromoted = false
+        #else
+        let cardPromoted = false
+        #endif
 
         #if PHONE_LINK
         // The iPhone's "last turn" (prompt, actions, diffs, answer).
@@ -387,11 +507,17 @@ final class HookServer: @unchecked Sendable {
         if let pending = state.pendingApproval, agentId == pending.pillId {
             let handledNote: String
             switch pending.pillId {
-            case "agent_cursor": handledNote = "Handled in Cursor."
-            case "agent_codex":  handledNote = "Handled in Codex."
-            default:             handledNote = "Handled in VS Code."
+            case "agent_cursor": handledNote = String(localized: "Handled in Cursor.")
+            case "agent_codex":  handledNote = String(localized: "Handled in Codex.")
+            #if !APPSTORE
+            case let id where CmuxRouting.isCmuxTaskId(id): handledNote = String(localized: "Handled in cmux.")
+            #endif
+            default:             handledNote = String(localized: "Handled in VS Code.")
             }
             var resolved = false
+            #if !APPSTORE
+            let generationBefore = cardGeneration
+            #endif
             switch name {
             case "PostToolUse", "PostToolUseFailure":
                 // Only dismiss when this exact tool call finished — same session, tool and input.
@@ -399,18 +525,22 @@ final class HookServer: @unchecked Sendable {
                 if sessionId == pending.sessionId,
                    (payload["tool_name"] as? String ?? "") == pending.tool,
                    Self.approvalInputKey(payload["tool_input"] as? [String: Any] ?? [:]) == pending.inputKey {
-                    dismissApprovalCard(note: handledNote)
+                    dismissApprovalCard(note: handledNote, resolved: true)
                     resolved = true
                 }
             case "Stop", "StopFailure", "UserPromptSubmit", "SessionEnd", "Interrupt":
                 // Turn ended or session interrupted — the permission is moot.
                 if sessionId == pending.sessionId {
-                    dismissApprovalCard(note: handledNote)
+                    dismissApprovalCard(note: handledNote, resolved: true)
                     resolved = true
                 }
             default: break
             }
             if !resolved { return }
+            #if !APPSTORE
+            // The dismissal promoted a queued card: the resolving event must not take the view from it.
+            cardPromoted = cardGeneration != generationBefore
+            #endif
             // Approval dismissed — fall through so the resolving event updates state normally.
         }
 
@@ -420,6 +550,12 @@ final class HookServer: @unchecked Sendable {
             activeSessionId = sessionId
             if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd) }
             if let idx = state.tasks.firstIndex(where: { $0.id == agentId }) { state.tasks[idx].finalLine = nil }
+            #if !APPSTORE
+            if cmuxTaskId == agentId {
+                refreshCmuxMeta(taskId: agentId, cwd: cwd)
+                handleCmuxSessionStart(agentId: agentId, payload: payload, cwd: cwd)
+            }
+            #endif
             nbLog("SessionStart \(isExternalAgent ? agentId : projectName) (\(sessionId.prefix(8)))")
             if state.isPresent { expandIfNeeded(to: .overview) }
             SoundEngine.shared.play("work")
@@ -431,7 +567,13 @@ final class HookServer: @unchecked Sendable {
             state.updateTask(id: agentId, state: .thinking)
             if let prompt = payload["prompt"] as? String, !prompt.isEmpty {
                 appendStep(id: agentId, step: String(prompt.prefix(60)))
+                #if !APPSTORE
+                if cmuxTaskId == agentId { appendCmuxMessage(agentId, role: .user, text: prompt, limit: 2000) }
+                #endif
             }
+            #if !APPSTORE
+            if cmuxTaskId == agentId { refreshCmuxMeta(taskId: agentId, cwd: cwd) }
+            #endif
             if state.isPresent { expandIfNeeded(to: .overview) }
 
         case "PreToolUse":
@@ -461,7 +603,7 @@ final class HookServer: @unchecked Sendable {
 
         case "PostToolUseFailure":
             state.updateTask(id: agentId, state: .working)
-            appendStep(id: agentId, step: "⚠ failed")
+            appendStep(id: agentId, step: String(localized: "⚠ failed"))
 
         case "Notification":
             let message = payload["message"] as? String ?? ""
@@ -479,6 +621,12 @@ final class HookServer: @unchecked Sendable {
             let rawFinal = (payload["last_assistant_message"] as? String)
                 ?? (payload["message"] as? String) ?? ""
             let finalText = DiffEngine.toOneLine(rawFinal)
+            #if !APPSTORE
+            if cmuxTaskId == agentId {
+                appendCmuxMessage(agentId, role: .assistant, text: rawFinal, limit: 4000)
+                refreshCmuxMeta(taskId: agentId, cwd: cwd)
+            }
+            #endif
             if !finalText.isEmpty {
                 appendStep(id: agentId, step: finalText)
                 if let idx = state.tasks.firstIndex(where: { $0.id == agentId }) {
@@ -486,12 +634,25 @@ final class HookServer: @unchecked Sendable {
                 }
             }
             SoundEngine.shared.play("finish")
-            if focused {
+            #if !APPSTORE
+            // The reply view of this session shows the answer in place: no view switch, the draft stays.
+            let answerInPlace = CmuxRouting.answerStaysInReply(prompt: state.cmuxPrompt, taskId: agentId,
+                                                               viewIsPrompt: state.view == .prompt)
+            #else
+            let answerInPlace = false
+            #endif
+            if answerInPlace {
+                // nothing to switch
+            } else if focused && !cardPromoted {
                 expandIfNeeded(to: .finished)
             } else {
                 setPillBadge(id: agentId, badge: .finished)
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 5.2) {
+                #if !APPSTORE
+                // A cmux task that has a queued card or owns the card on screen keeps its state and badge.
+                if CmuxRouting.isCmuxTaskId(agentId), self.cmuxTaskHoldsCard(agentId) { return }
+                #endif
                 if isExternalAgent {
                     AppState.shared.removeTask(id: agentId)
                 } else {
@@ -503,7 +664,15 @@ final class HookServer: @unchecked Sendable {
         case "StopFailure":
             state.updateTask(id: agentId, state: .error)
             SoundEngine.shared.play("error")
-            if focused {
+            #if !APPSTORE
+            let errorInPlace = CmuxRouting.answerStaysInReply(prompt: state.cmuxPrompt, taskId: agentId,
+                                                              viewIsPrompt: state.view == .prompt)
+            #else
+            let errorInPlace = false
+            #endif
+            if errorInPlace {
+                // the reply view stays open
+            } else if focused && !cardPromoted {
                 expandIfNeeded(to: .error)
             } else {
                 setPillBadge(id: agentId, badge: .error)
@@ -519,13 +688,19 @@ final class HookServer: @unchecked Sendable {
             activeSessionId = nil
             if let idx = state.tasks.firstIndex(where: { $0.id == agentId }) { state.tasks[idx].finalLine = nil }
             state.clearSessionDiffs(for: agentId)
+            #if !APPSTORE
+            let cmuxWasFocused = state.focusId == agentId
+            #endif
             state.removeTask(id: agentId)
+            #if !APPSTORE
+            if cmuxTaskId == agentId { forgetCmuxTask(agentId, wasFocused: cmuxWasFocused) }
+            #endif
 
         case "SubagentStart":
-            appendStep(id: agentId, step: "+ subagent")
+            appendStep(id: agentId, step: String(localized: "+ subagent"))
 
         case "SubagentStop":
-            appendStep(id: agentId, step: "• subagent done")
+            appendStep(id: agentId, step: String(localized: "• subagent done"))
 
         default:
             break
@@ -606,14 +781,14 @@ final class HookServer: @unchecked Sendable {
     // MARK: - Permission request (blocking — Claude Code waits for decision)
 
     @MainActor
-    private func processPermissionRequest(fd: Int32, payload: [String: Any]) {
+    private func processPermissionRequest(fd: Int32, payload: [String: Any], arrivedAt: TimeInterval? = nil) {
         let state = AppState.shared
         let sessionId = payload["session_id"] as? String
                      ?? payload["conversation_id"] as? String
                      ?? "unknown"
         let cwd       = payload["cwd"]        as? String ?? ""
         let rawName   = URL(fileURLWithPath: cwd).lastPathComponent
-        let projectName = aliasProjectName(rawName.isEmpty ? "Session" : rawName)
+        let projectName = aliasProjectName(rawName.isEmpty ? String(localized: "Session") : rawName)
 
         let rawAgent = payload["coucou_agent"] as? String ?? ""
         let termProgram = payload["term_program"] as? String ?? ""
@@ -631,6 +806,12 @@ final class HookServer: @unchecked Sendable {
         #else
         let isCodexRequest = false
         #endif
+        #if !APPSTORE
+        let cmuxTaskId: String? = (isCodexRequest || isCursorEditor || isVSCodeEditor)
+            ? nil : CmuxRouting.taskId(payload: payload)
+        #else
+        let cmuxTaskId: String? = nil
+        #endif
         if !isCodexRequest && Self.validateAgent(rawAgent) != nil {
             Task.detached { [weak self] in
                 self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
@@ -645,10 +826,12 @@ final class HookServer: @unchecked Sendable {
             pillId = "agent_codex"
         } else if isCursorEditor {
             pillId = "agent_cursor"
+        } else if let id = cmuxTaskId {
+            pillId = id
         } else {
             pillId = "integration_claude"
         }
-        guard isCodexRequest || isCursorEditor || isVSCodeEditor else {
+        guard isCodexRequest || isCursorEditor || isVSCodeEditor || cmuxTaskId != nil else {
             Task.detached { [weak self] in
                 self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
                 close(fd)
@@ -674,12 +857,41 @@ final class HookServer: @unchecked Sendable {
 
         let command = toolInput["command"] as? String ?? tool
 
+        #if !APPSTORE
+        if cmuxTaskId != nil {
+            if pendingApprovalFD >= 0 || pendingQuestionFD >= 0 {
+                // A card is on screen: wait in line, the fd stays open and silent.
+                guard cmuxQueue.canAccept(taskId: pillId) else {
+                    // Queue full: answer like a terminal Coucou does not support. The dialog is open there.
+                    markCmuxDialogOpen(pillId, tool: tool, inputKey: inputKey)
+                    Task.detached { [weak self] in
+                        self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
+                        close(fd)
+                    }
+                    return
+                }
+                enqueueCmuxCard(kind: .approval, fd: fd, payload: payload, parsed: nil, taskId: pillId,
+                                sessionId: sessionId, tool: tool, inputKey: inputKey, arrivedAt: arrivedAt)
+                return
+            }
+        } else {
+            // A legacy request must not answer "ask" to a cmux card: send it back to the queue.
+            requeueCmuxCardIfShowing()
+        }
+        cmuxShownPayload = cmuxTaskId != nil ? payload : nil
+        cmuxShownArrival = arrivedAt ?? Date().timeIntervalSinceReferenceDate
+        cmuxPromotedAt = nil   // presentNextCmuxCard sets it again when this card came out of the queue
+        #endif
+
         if pendingApprovalFD >= 0 {
             // Displace the previous request: write "ask" then cancel its source.
             // The cancel handler closes the old fd — never close it directly.
             let old = pendingApprovalFD
             let oldSource = approvalFDSource
             approvalFDSource = nil
+            #if !APPSTORE
+            if let p = state.pendingApproval { markCmuxDialogOpen(p.pillId, tool: p.tool, inputKey: p.inputKey) }
+            #endif
             Task.detached { [weak self] in
                 // "ask" → nb-hook outputs nothing → Claude Code re-asks
                 self?.sendLine(fd: old, text: #"{"permissionDecision":"ask"}"#)
@@ -687,6 +899,8 @@ final class HookServer: @unchecked Sendable {
             }
         }
         pendingApprovalFD = fd
+        cardGeneration += 1
+        let gen = cardGeneration
         activeSessionId = sessionId
 
         upsertWorkspaceTask(id: pillId, projectName: projectName, cwd: cwd)
@@ -710,11 +924,26 @@ final class HookServer: @unchecked Sendable {
             guard let self, self.pendingApprovalFD == fd else { return }
             let note: String
             switch capturedPillId {
-            case "agent_cursor": note = "Handled in Cursor."
-            case "agent_codex":  note = "Handled in Codex."
-            default:             note = "Handled in VS Code."
+            case "agent_cursor": note = String(localized: "Handled in Cursor.")
+            case "agent_codex":  note = String(localized: "Handled in Codex.")
+            #if !APPSTORE
+            case let id where CmuxRouting.isCmuxTaskId(id):
+                // A card promoted late was closed by the hook's own timeout: nobody handled it.
+                note = CmuxRouting.isLateCard(arrivedAt: self.cmuxShownArrival,
+                                              now: Date().timeIntervalSinceReferenceDate)
+                    ? String(localized: "Still waiting in cmux.") : String(localized: "Handled in cmux.")
+            #endif
+            default:             note = String(localized: "Handled in VS Code.")
             }
-            self.dismissApprovalCard(note: note)
+            // A cmux card that reads EOF while still young was answered in the terminal: no dialog is left.
+            var answeredInTerminal = false
+            #if !APPSTORE
+            if CmuxRouting.isCmuxTaskId(capturedPillId) {
+                answeredInTerminal = !CmuxRouting.eofLeavesDialogOpen(
+                    arrivedAt: self.cmuxShownArrival, now: Date().timeIntervalSinceReferenceDate)
+            }
+            #endif
+            self.dismissApprovalCard(note: note, resolved: answeredInTerminal)
         }
         source.setCancelHandler { close(fd) }
         source.resume()
@@ -724,12 +953,15 @@ final class HookServer: @unchecked Sendable {
         // nb-hook reads EOF from the cancel handler's close and exits; Claude Code / Codex re-asks.
         let captured = fd
         DispatchQueue.main.asyncAfter(deadline: .now() + 115) { [weak self] in
-            guard let self, self.pendingApprovalFD == captured else { return }
+            guard let self, self.pendingApprovalFD == captured, self.cardGeneration == gen else { return }
             let note: String
             switch capturedPillId {
-            case "agent_cursor": note = "Still waiting in Cursor."
-            case "agent_codex":  note = "Still waiting in Codex."
-            default:             note = "Still waiting in VS Code."
+            case "agent_cursor": note = String(localized: "Still waiting in Cursor.")
+            case "agent_codex":  note = String(localized: "Still waiting in Codex.")
+            #if !APPSTORE
+            case let id where CmuxRouting.isCmuxTaskId(id): note = String(localized: "Still waiting in cmux.")
+            #endif
+            default:             note = String(localized: "Still waiting in VS Code.")
             }
             self.dismissApprovalCard(note: note)
         }
@@ -738,6 +970,10 @@ final class HookServer: @unchecked Sendable {
     /// Called by ApprovalView buttons. Writes the decision to the waiting nb-hook and cleans up.
     @MainActor
     func sendApprovalDecision(_ decision: String) {
+        #if !APPSTORE
+        if cmuxInputLocked() { return }
+        cmuxShownPayload = nil
+        #endif
         let fd = pendingApprovalFD
         pendingApprovalFD = -1
         // Capture source before nulling — we send the decision first, then cancel the source.
@@ -765,6 +1001,12 @@ final class HookServer: @unchecked Sendable {
 
         let state = AppState.shared
         let pillId = state.pendingApproval?.pillId ?? "integration_claude"
+        #if !APPSTORE
+        // "ask" hands the request back to the terminal: its dialog is open there.
+        if decision == "ask", let p = state.pendingApproval {
+            markCmuxDialogOpen(p.pillId, tool: p.tool, inputKey: p.inputKey)
+        }
+        #endif
         state.pendingApproval = nil
         state.isPinned = false
         state.updateTask(id: pillId, state: .working)
@@ -776,20 +1018,23 @@ final class HookServer: @unchecked Sendable {
                 withAnimation(.spring(response: 0.5, dampingFraction: 0.72)) { state.focusId = prev }
             }
         }
+        #if !APPSTORE
+        if presentNextCmuxCard() { return }
+        #endif
         state.view = state.tasks.isEmpty ? .empty : .overview
     }
 
     // MARK: - Question request
 
     @MainActor
-    private func processQuestionRequest(fd: Int32, parsed: AskQuestion, payload: [String: Any]) {
+    private func processQuestionRequest(fd: Int32, parsed: AskQuestion, payload: [String: Any], arrivedAt: TimeInterval? = nil) {
         let state = AppState.shared
         let sessionId = payload["session_id"] as? String
                      ?? payload["conversation_id"] as? String
                      ?? "unknown"
         let cwd       = payload["cwd"]        as? String ?? ""
         let rawName   = URL(fileURLWithPath: cwd).lastPathComponent
-        let projectName = aliasProjectName(rawName.isEmpty ? "Session" : rawName)
+        let projectName = aliasProjectName(rawName.isEmpty ? String(localized: "Session") : rawName)
 
         let rawAgent    = payload["coucou_agent"] as? String ?? ""
         let termProgram = payload["term_program"]  as? String ?? ""
@@ -803,15 +1048,23 @@ final class HookServer: @unchecked Sendable {
         #else
         let isCodexRequest = false
         #endif
+        #if !APPSTORE
+        let cmuxTaskId: String? = (isCodexRequest || isCursorEditor || isVSCodeEditor || Self.validateAgent(rawAgent) != nil)
+            ? nil : CmuxRouting.taskId(payload: payload)
+        #else
+        let cmuxTaskId: String? = nil
+        #endif
         let pillId: String
         if isCodexRequest {
             pillId = "agent_codex"
         } else if isCursorEditor {
             pillId = "agent_cursor"
+        } else if let id = cmuxTaskId {
+            pillId = id
         } else {
             pillId = "integration_claude"
         }
-        guard isCodexRequest || isCursorEditor || isVSCodeEditor else {
+        guard isCodexRequest || isCursorEditor || isVSCodeEditor || cmuxTaskId != nil else {
             Task.detached { [weak self] in
                 self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
                 close(fd)
@@ -819,17 +1072,47 @@ final class HookServer: @unchecked Sendable {
             return
         }
 
+        #if !APPSTORE
+        if cmuxTaskId != nil {
+            if pendingApprovalFD >= 0 || pendingQuestionFD >= 0 {
+                guard cmuxQueue.canAccept(taskId: pillId) else {
+                    markCmuxDialogOpen(pillId, tool: "AskUserQuestion", inputKey: nil)
+                    Task.detached { [weak self] in
+                        self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
+                        close(fd)
+                    }
+                    return
+                }
+                let toolInput = payload["tool_input"] as? [String: Any] ?? [:]
+                enqueueCmuxCard(kind: .question, fd: fd, payload: payload, parsed: parsed, taskId: pillId,
+                                sessionId: sessionId, tool: "AskUserQuestion",
+                                inputKey: Self.approvalInputKey(toolInput), arrivedAt: arrivedAt)
+                return
+            }
+        } else {
+            requeueCmuxCardIfShowing()
+        }
+        cmuxShownPayload = cmuxTaskId != nil ? payload : nil
+        cmuxShownArrival = arrivedAt ?? Date().timeIntervalSinceReferenceDate
+        cmuxPromotedAt = nil   // presentNextCmuxCard sets it again when this card came out of the queue
+        #endif
+
         // Displace any previous question waiting for an answer.
         if pendingQuestionFD >= 0 {
             let old = pendingQuestionFD
             let oldSrc = questionFDSource
             questionFDSource = nil
+            #if !APPSTORE
+            markCmuxDialogOpen(questionPillId, tool: "AskUserQuestion", inputKey: nil)
+            #endif
             Task.detached { [weak self] in
                 self?.sendLine(fd: old, text: #"{"permissionDecision":"ask"}"#)
                 DispatchQueue.main.async { oldSrc?.cancel() }
             }
         }
         pendingQuestionFD = fd
+        cardGeneration += 1
+        let gen = cardGeneration
         activeSessionId = sessionId
         questionPillId = pillId
 
@@ -846,7 +1129,12 @@ final class HookServer: @unchecked Sendable {
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
         source.setEventHandler { [weak self] in
             guard let self, self.pendingQuestionFD == fd else { return }
-            self.dismissQuestionCard(note: "")
+            var leftOpen = true
+            #if !APPSTORE
+            leftOpen = CmuxRouting.eofLeavesDialogOpen(arrivedAt: self.cmuxShownArrival,
+                                                       now: Date().timeIntervalSinceReferenceDate)
+            #endif
+            self.dismissQuestionCard(note: "", leftOpen: leftOpen)
         }
         source.setCancelHandler { close(fd) }
         source.resume()
@@ -854,7 +1142,7 @@ final class HookServer: @unchecked Sendable {
 
         let captured = fd
         DispatchQueue.main.asyncAfter(deadline: .now() + 120) { [weak self] in
-            guard let self, self.pendingQuestionFD == captured else { return }
+            guard let self, self.pendingQuestionFD == captured, self.cardGeneration == gen else { return }
             // Send "ask" so nb-hook exits cleanly; Claude Code re-asks in terminal.
             let askFD = self.pendingQuestionFD
             self.pendingQuestionFD = -1
@@ -864,7 +1152,7 @@ final class HookServer: @unchecked Sendable {
                 self?.sendLine(fd: askFD, text: #"{"permissionDecision":"ask"}"#)
                 DispatchQueue.main.async { src?.cancel() }
             }
-            self.dismissQuestionCard(note: "")
+            self.dismissQuestionCard(note: "", leftOpen: true)
         }
     }
 
@@ -873,6 +1161,9 @@ final class HookServer: @unchecked Sendable {
     /// If missing (transient), creates it and inserts after the main pill.
     @MainActor
     private func upsertWorkspaceTask(id: String, projectName: String, cwd: String = "") {
+        #if !APPSTORE
+        if CmuxRouting.isCmuxTaskId(id) { upsertCmuxTask(id: id, projectName: projectName, cwd: cwd); return }
+        #endif
         let state = AppState.shared
         if let idx = state.tasks.firstIndex(where: { $0.id == id }) {
             state.tasks[idx].name = projectName
@@ -893,6 +1184,479 @@ final class HookServer: @unchecked Sendable {
         if state.focusId == nil { state.focusId = id }
         state.syncMode()
     }
+
+
+    // MARK: - cmux (GitHub build only)
+
+    #if !APPSTORE
+
+    /// Surface data for the exact jump. Contains the capability: never log or persist it.
+    @MainActor
+    func cmuxSurface(for taskId: String) -> CmuxSurface? { cmuxRegistry.surface(for: taskId) }
+
+    @MainActor
+    func cmuxCredential(for taskId: String?, hasPassword: Bool) -> CmuxCredential {
+        cmuxRegistry.credential(for: taskId, hasPassword: hasPassword)
+    }
+
+    @MainActor
+    func cmuxSendCredential(for taskId: String) -> CmuxCredential { cmuxRegistry.sendCredential(for: taskId) }
+
+    /// True while a dialog Coucou gave back to the terminal may still be open for this task.
+    @MainActor
+    func cmuxDialogMayBeOpen(_ taskId: String) -> Bool { cmuxOpenDialogs[taskId] != nil }
+
+    /// The "Answered" click of the reply view: the user says the request is gone. Explicit action only.
+    @MainActor
+    func clearCmuxDialogMark(_ taskId: String) { cmuxOpenDialogs[taskId] = nil }
+
+    /// The one gate for typing into a session: no card, no dialog that may be open, not in approval/question.
+    @MainActor
+    func cmuxCanSend(_ taskId: String) -> Bool {
+        let task = AppState.shared.tasks.first { $0.id == taskId }
+        return CmuxRouting.canSend(state: task?.state.rawValue ?? "",
+                                   holdsCard: cmuxTaskHoldsCard(taskId),
+                                   dialogMayBeOpen: cmuxOpenDialogs[taskId] != nil)
+    }
+
+    @MainActor
+    private func markCmuxDialogOpen(_ taskId: String, tool: String, inputKey: String?) {
+        guard CmuxRouting.isCmuxTaskId(taskId) else { return }
+        cmuxOpenDialogs[taskId] = CmuxRouting.DialogMark(tool: tool, inputKey: inputKey)
+    }
+
+    @MainActor
+    private func markCmuxDialogOpen(from held: CmuxHeld) {
+        if held.parsed != nil {
+            markCmuxDialogOpen(held.taskId, tool: "AskUserQuestion", inputKey: nil)
+        } else {
+            markCmuxDialogOpen(held.taskId, tool: held.payload["tool_name"] as? String ?? "Tool",
+                               inputKey: Self.approvalInputKey(held.payload["tool_input"] as? [String: Any] ?? [:]))
+        }
+    }
+
+    /// Remembers a "New chat" until the SessionStart of its surface arrives, or 90 s pass.
+    /// Memory only. An expired launch sends nothing; the draft goes back to the field.
+    @MainActor
+    func setCmuxPendingLaunch(_ launch: CmuxPendingLaunch) {
+        cmuxPendingLaunch = launch
+        cmuxLaunchGeneration += 1
+        let generation = cmuxLaunchGeneration
+        let state = AppState.shared
+        state.cmuxNotice = String(localized: "Starting claude…")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self, self.cmuxLaunchGeneration == generation, self.cmuxPendingLaunch != nil else { return }
+            AppState.shared.cmuxNotice = String(localized: "Waiting for claude. It may be asking to trust the folder.")
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + CmuxRouting.launchTimeout) { [weak self] in
+            guard let self, self.cmuxLaunchGeneration == generation, let pending = self.cmuxPendingLaunch else { return }
+            self.cmuxPendingLaunch = nil
+            let state = AppState.shared
+            state.cmuxNotice = String(localized: "claude did not start in time.")
+            state.cmuxDraft = CmuxDraft(mode: .newChat, text: pending.prompt)
+        }
+    }
+
+    @MainActor
+    var cmuxPendingLaunch: CmuxPendingLaunch? = nil
+
+    /// Refreshes the registry from every event of a cmux session (the token may rotate).
+    /// The cmux fields are validated as one unit; when one fails the whole context is dropped.
+    @MainActor
+    private func noteCmuxContext(payload: [String: Any], token: String) {
+        guard let id = CmuxRouting.taskId(payload: payload) else { return }
+        let rawAgent = payload["coucou_agent"] as? String ?? ""
+        guard Self.validateAgent(rawAgent) == nil else { return }
+        let bundleId = (payload["bundle_id"] as? String ?? "").lowercased()
+        let termProgram = (payload["term_program"] as? String ?? "").lowercased()
+        let isCursorEditor = bundleId == "com.todesktop.230313mzl4w4u92"
+        let isVSCodeEditor = !isCursorEditor && (termProgram.contains("vscode") || bundleId.contains("vscode"))
+        guard !isCursorEditor, !isVSCodeEditor else { return }
+
+        let event = payload["coucou_kind"] as? String == "ask_user_question"
+            ? "AskUserQuestion" : (payload["hook_event_name"] as? String ?? "")
+        let taskIsLive = AppState.shared.tasks.contains { $0.id == id }
+        guard CmuxRouting.mayRegister(event: event, taskIsLive: taskIsLive) else { return }
+
+        let surfaceId = payload["cmux_surface_id"] as? String ?? ""
+        let workspaceId = payload["cmux_workspace_id"] as? String ?? ""
+        let socketPath = payload["cmux_socket_path"] as? String ?? ""
+        let valid = CmuxRouting.isValidContext(surfaceId: surfaceId, workspaceId: workspaceId,
+                                               socketPath: socketPath, capability: token)
+        let accepted = cmuxRegistry.note(taskId: id,
+                          surfaceId: valid ? surfaceId : "",
+                          workspaceId: valid ? workspaceId : "",
+                          socketPath: valid ? socketPath : "",
+                          capability: valid ? token : "",
+                          sessionId: payload["session_id"] as? String ?? payload["conversation_id"] as? String ?? "",
+                          now: Date().timeIntervalSinceReferenceDate)
+        if !accepted, cmuxRefusedLogged.insert(id).inserted {
+            // One line per task, no id, path or token.
+            nbLog("cmux: a session reported another socket path, kept the stored one")
+        }
+        pruneStaleCmux()
+    }
+
+    /// cmux cards wait for the card slot.
+    @MainActor
+    var hasQueuedCmuxCards: Bool { !cmuxQueue.cards.isEmpty }
+
+    /// True when the task has a queued card or owns the card on screen.
+    @MainActor
+    private func cmuxTaskHoldsCard(_ taskId: String) -> Bool {
+        if cmuxQueue.hasCards(for: taskId) { return true }
+        if pendingApprovalFD >= 0, AppState.shared.pendingApproval?.pillId == taskId { return true }
+        if pendingQuestionFD >= 0, questionPillId == taskId { return true }
+        return false
+    }
+
+    /// Drops registry entries not seen for 30 minutes, with their task, whatever its state.
+    @MainActor
+    private func pruneStaleCmux() {
+        let state = AppState.shared
+        let protected = CmuxRouting.pruneProtected(
+            holdingCard: Set(cmuxRegistry.surfaces.keys.filter { cmuxTaskHoldsCard($0) }),
+            openReplyTask: openCmuxReplyTask())
+        let busy = Set(state.tasks.filter {
+            CmuxRouting.isCmuxTaskId($0.id) && [.working, .thinking, .searching].contains($0.state)
+        }.map { $0.id })
+        for stale in cmuxRegistry.staleTaskIds(now: Date().timeIntervalSinceReferenceDate, protected: protected, busy: busy) {
+            let wasFocused = state.focusId == stale
+            state.clearSessionDiffs(for: stale)
+            state.removeTask(id: stale)
+            forgetCmuxTask(stale, wasFocused: wasFocused)
+        }
+    }
+
+    /// Reads the tab title and the git branch of a session. Called on task creation and on SessionStart,
+    /// UserPromptSubmit and Stop only, at most once every few seconds per task: no timer, no polling.
+    /// The title is untrusted text, cleaned in `CmuxRouting`. Without a title the folder name stays.
+    @MainActor
+    private func refreshCmuxMeta(taskId: String, cwd: String) {
+        let now = Date().timeIntervalSinceReferenceDate
+        guard CmuxRouting.metaRefreshDue(last: cmuxMetaAt[taskId], now: now) else { return }
+        cmuxMetaAt[taskId] = now
+        let folder = cwd.isEmpty ? (AppState.shared.tasks.first { $0.id == taskId }?.sessionCwd ?? "") : cwd
+        CmuxControl.fetchMeta(surface: cmuxRegistry.surface(for: taskId), cwd: folder) { [weak self] title, branch in
+            guard let self else { return }
+            let state = AppState.shared
+            guard let idx = state.tasks.firstIndex(where: { $0.id == taskId }) else { return }
+            // Written only when changed: every write republishes `tasks`.
+            if let title {
+                self.cmuxTitles[taskId] = title
+                // Two live sessions with the same title get the numeric suffix, like folder names.
+                let existing = state.tasks.filter { CmuxRouting.isCmuxTaskId($0.id) }.map { (id: $0.id, name: $0.name) }
+                let name = CmuxRouting.displayName(base: title, taskId: taskId, existing: existing)
+                if state.tasks[idx].name != name { state.tasks[idx].name = name }
+            }
+            let subtitle = CmuxRouting.folderLine(cwd: folder, branch: branch)
+            if state.tasks[idx].subtitle != subtitle { state.tasks[idx].subtitle = subtitle }
+        }
+    }
+
+    /// Everything tied to a cmux task that is gone (SessionEnd, stale prune, eviction): registry entry,
+    /// queued cards, transcript, the reply view of that session, and where focus goes next.
+    @MainActor
+    private func forgetCmuxTask(_ id: String, wasFocused: Bool) {
+        let state = AppState.shared
+        let candidates = cmuxRegistry.surfaces.values.filter { $0.taskId != id }.map { (id: $0.taskId, lastSeen: $0.lastSeen) }
+        cmuxRegistry.remove(taskId: id)
+        for cardId in cmuxQueue.removeAll(taskId: id) { dropCmuxHeld(cardId, leftOpen: false) }
+        cmuxOpenDialogs[id] = nil
+        cmuxMetaAt[id] = nil
+        cmuxTitles[id] = nil
+        cmuxRefusedLogged.remove(id)
+        state.cmuxTranscripts[id] = nil
+        if state.cmuxPrompt == .reply(taskId: id) {
+            state.cmuxPrompt = nil
+            state.cmuxNotice = nil
+            if state.view == .prompt { state.view = .overview }
+        }
+        if wasFocused, state.mainPillId == CmuxRouting.hubPillId {
+            let live = Set(state.tasks.map { $0.id })
+            let next = CmuxRouting.nextFocus(afterRemoving: id, mainPillId: state.mainPillId,
+                                             candidates: candidates.filter { live.contains($0.id) })
+            state.setFocus(next)
+        }
+    }
+
+    /// The task whose reply view is open (protected from prune and eviction), if any.
+    @MainActor
+    private func openCmuxReplyTask() -> String? {
+        if case .reply(let id)? = AppState.shared.cmuxPrompt { return id }
+        return nil
+    }
+
+    /// Adds a message to the session transcript, keeping the last `maxTranscript`.
+    @MainActor
+    private func appendCmuxMessage(_ taskId: String, role: ChatRole, text: String, limit: Int) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let state = AppState.shared
+        var list = state.cmuxTranscripts[taskId] ?? []
+        list.append(ChatMessage(role: role, content: String(trimmed.prefix(limit))))
+        if list.count > CmuxRouting.maxTranscript { list.removeFirst(list.count - CmuxRouting.maxTranscript) }
+        state.cmuxTranscripts[taskId] = list
+    }
+
+    /// A new chat started by the user: when its surface reports in, type the first prompt.
+    /// The automatic send needs the workspace UUID and the socket path of the launch to match. When the
+    /// workspace could not be resolved, a task in the same folder is only focused and the prompt goes
+    /// to the Reply field as a draft: the user presses Send.
+    @MainActor
+    private func handleCmuxSessionStart(agentId: String, payload: [String: Any], cwd: String) {
+        guard let pending = cmuxPendingLaunch else { return }
+        let workspace = payload["cmux_workspace_id"] as? String ?? ""
+        let socket = payload["cmux_socket_path"] as? String ?? ""
+        let now = Date().timeIntervalSinceReferenceDate
+        let exact = pending.matches(workspaceId: workspace, socketPath: socket,
+                                    isNewTask: cmuxLastUpsertCreated, now: now)
+        let byFolder = !exact && pending.matchesFolder(cwd: cwd, isNewTask: cmuxLastUpsertCreated, now: now)
+        guard exact || byFolder else { return }
+        cmuxPendingLaunch = nil
+        let state = AppState.shared
+        // The same focus rule as any new session: never take the screen from an open card.
+        if CmuxRouting.launchMayTakeFocus(cardOpen: state.pendingApproval != nil || state.pendingQuestion != nil,
+                                          promptIsNewChat: state.cmuxPrompt == .newChat) {
+            state.setFocus(agentId)
+            state.cmuxPrompt = .reply(taskId: agentId)
+        }
+        state.cmuxNotice = nil
+        let prompt = pending.prompt
+        guard exact else {
+            let sessionName = state.tasks.first { $0.id == agentId }?.name ?? ""
+            state.cmuxNotice = CmuxRouting.folderDraftNotice(sessionName: sessionName)
+            state.cmuxDraft = CmuxDraft(mode: .reply(taskId: agentId), text: prompt)
+            return
+        }
+        // Gives the claude TUI time to take input. The one and only deferred send.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            CmuxControl.send(text: prompt, to: agentId) { failure in
+                guard let failure else { return }
+                AppState.shared.showCmuxFailure(failure)
+                if failure != .enterNotSent {
+                    AppState.shared.cmuxDraft = CmuxDraft(mode: .reply(taskId: agentId), text: prompt)
+                }
+            }
+        }
+    }
+
+    /// One task per cmux surface. Generic overview card, no dedicated view.
+    @MainActor
+    private func upsertCmuxTask(id: String, projectName: String, cwd: String) {
+        let state = AppState.shared
+        let existing = state.tasks.filter { CmuxRouting.isCmuxTaskId($0.id) }.map { (id: $0.id, name: $0.name) }
+        // The cmux tab title is the name; the folder based name (suffixed ` 2`, ` 3`) is only the fallback.
+        let name = CmuxRouting.displayName(base: cmuxTitles[id] ?? projectName, taskId: id, existing: existing)
+        cmuxLastUpsertCreated = false
+        if let idx = state.tasks.firstIndex(where: { $0.id == id }) {
+            if state.tasks[idx].name != name { state.tasks[idx].name = name }
+            if !cwd.isEmpty { state.tasks[idx].sessionCwd = cwd }
+            return
+        }
+        cmuxLastUpsertCreated = true
+        var task = AgentTask(id: id, name: name, color: IslandConst.colorForProject(projectName),
+                             state: .idle, steps: [], source: .claudeCode)
+        if !cwd.isEmpty { task.sessionCwd = cwd }
+        task.subtitle = CmuxRouting.folderLine(cwd: cwd, branch: nil)
+        // Distinct, stable look per session: colour and eye from the surface key, colour probed against live ones.
+        let taken = Set(state.tasks.filter { CmuxRouting.isCmuxTaskId($0.id) }.map { $0.color })
+        let look = CmuxRouting.appearance(key: String(id.dropFirst(CmuxRouting.taskPrefix.count)), takenColors: taken)
+        task.color = look.color
+        if look.eye != "pill" { task.miniEye = EyeShape(rawValue: look.eye) }
+        if CmuxRouting.isExistingFolder(cwd) {
+            state.cmuxRecentFolders = CmuxRouting.recentFolders(adding: cwd, to: state.cmuxRecentFolders)
+        }
+        if let mainIdx = state.tasks.firstIndex(where: { $0.id == state.mainPillId }) {
+            state.tasks.insert(task, at: mainIdx + 1)
+        } else {
+            state.tasks.insert(task, at: 0)
+        }
+        state.placeHermesPills()   // Hermes agent pills stay right after the main pill, ahead of sessions
+        if state.focusId == nil { state.focusId = id }
+        let viewAllowsSteal = state.cmuxPrompt == nil
+            && (state.mode != .expanded || state.view == .overview || state.view == .empty)
+        if CmuxRouting.shouldFocusNewSession(mainPillId: state.mainPillId, focusId: state.focusId,
+                                             viewAllowsSteal: viewAllowsSteal) {
+            state.setFocus(id)
+        }
+        state.syncMode()
+        refreshCmuxMeta(taskId: id, cwd: cwd)
+
+        pruneStaleCmux()
+        // Registry entries whose task is gone (late event after SessionEnd) must not count toward the cap.
+        let live = Set(state.tasks.map { $0.id })
+        for stale in cmuxRegistry.surfaces.keys where !live.contains(stale) { cmuxRegistry.remove(taskId: stale) }
+        let idle = CmuxRouting.evictableIdle(
+            Set(state.tasks.filter { CmuxRouting.isCmuxTaskId($0.id) && $0.state == .idle }.map { $0.id }),
+            openReplyTask: openCmuxReplyTask())
+        for evict in cmuxRegistry.evictionCandidates(idle: idle, keep: id) {
+            let wasFocused = state.focusId == evict
+            state.clearSessionDiffs(for: evict)
+            state.removeTask(id: evict)
+            forgetCmuxTask(evict, wasFocused: wasFocused)
+        }
+    }
+
+    // MARK: cmux card queue
+
+    /// Holds the hook's fd open and silent; the card is shown when it reaches the head of the queue.
+    @MainActor
+    private func enqueueCmuxCard(kind: CmuxCardKind, fd: Int32, payload: [String: Any], parsed: AskQuestion?,
+                                 taskId: String, sessionId: String, tool: String, inputKey: String,
+                                 atFront: Bool = false, arrivedAt: TimeInterval? = nil) {
+        let state = AppState.shared
+        let now = Date().timeIntervalSinceReferenceDate
+        let id = cmuxQueue.enqueue(kind: kind, taskId: taskId, sessionId: sessionId, tool: tool,
+                                   inputKey: inputKey, now: now, atFront: atFront, arrivedAt: arrivedAt)
+        // The read source fires when the hook goes away; its cancel handler is the only place the fd is closed.
+        let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+            // EOF on a young card: it was answered in the terminal. Only an old one may still be open.
+            let arrival = self.cmuxQueue.cards.first { $0.id == id }?.arrivedAt
+            let leftOpen = arrival.map {
+                CmuxRouting.eofLeavesDialogOpen(arrivedAt: $0, now: Date().timeIntervalSinceReferenceDate)
+            } ?? true
+            self.dropCmuxHeld(id, leftOpen: leftOpen)
+        }
+        source.setCancelHandler { close(fd) }
+        source.resume()
+        cmuxHeld[id] = CmuxHeld(fd: fd, source: source, taskId: taskId, payload: payload, parsed: parsed)
+
+        let cwd = payload["cwd"] as? String ?? ""
+        let rawName = URL(fileURLWithPath: cwd).lastPathComponent
+        upsertWorkspaceTask(id: taskId, projectName: aliasProjectName(rawName.isEmpty ? String(localized: "Session") : rawName), cwd: cwd)
+        state.updateTask(id: taskId, state: kind == .approval ? .approval : .question)
+        setPillBadge(id: taskId, badge: .approval)
+        nbLog("\(kind == .approval ? "PermissionRequest" : "AskUserQuestion") \(tool) [\(taskId)] queued")
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 115) { [weak self] in self?.dropCmuxHeld(id) }
+    }
+
+    /// Closes a queued card's fd without answering (hook prints nothing, Claude Code asks in the terminal).
+    @MainActor
+    private func dropCmuxHeld(_ id: Int, leftOpen: Bool = true) {
+        guard let held = cmuxHeld.removeValue(forKey: id) else { return }
+        held.source.cancel()
+        if leftOpen { markCmuxDialogOpen(from: held) }
+        cmuxQueue.remove(id: id)
+        releaseCmuxTaskIfSettled(held.taskId)
+    }
+
+    /// Back to `.working` and no badge once the task has no queued card and owns no card on screen.
+    @MainActor
+    private func releaseCmuxTaskIfSettled(_ taskId: String) {
+        let state = AppState.shared
+        guard !cmuxTaskHoldsCard(taskId) else { return }
+        state.updateTask(id: taskId, state: .working)
+        clearPillBadge(id: taskId)
+    }
+
+    /// An event resolved queued requests elsewhere (terminal, cmux Feed): drop them silently.
+    @MainActor
+    private func purgeCmuxQueue(event: String, sessionId: String, tool: String, inputKey: String) {
+        for id in cmuxQueue.resolve(event: event, sessionId: sessionId, tool: tool, inputKey: inputKey) {
+            guard let held = cmuxHeld.removeValue(forKey: id) else { continue }
+            held.source.cancel()
+            releaseCmuxTaskIfSettled(held.taskId)
+        }
+    }
+
+    /// Promotes the next waiting card once the screen is free. Returns true when one was shown.
+    @MainActor
+    private func presentNextCmuxCard() -> Bool {
+        guard pendingApprovalFD < 0, pendingQuestionFD < 0 else { return false }
+        while true {
+            let popped = cmuxQueue.popNext(now: Date().timeIntervalSinceReferenceDate)
+            for id in popped.expired {
+                guard let held = cmuxHeld.removeValue(forKey: id) else { continue }
+                held.source.cancel()
+                markCmuxDialogOpen(from: held)
+                releaseCmuxTaskIfSettled(held.taskId)
+            }
+            guard let card = popped.card else { return false }
+            guard let held = cmuxHeld.removeValue(forKey: card.id) else { continue }
+            // The queue source's cancel handler closes the original fd; the standard card path
+            // installs its own source on a duplicate.
+            let fd2 = dup(held.fd)
+            held.source.cancel()
+            guard fd2 >= 0 else {
+                markCmuxDialogOpen(from: held)
+                releaseCmuxTaskIfSettled(card.taskId)
+                continue
+            }
+            clearPillBadge(id: card.taskId)
+            switch card.kind {
+            case .approval:
+                processPermissionRequest(fd: fd2, payload: held.payload, arrivedAt: card.arrivedAt)
+            case .question:
+                guard let parsed = held.parsed else {
+                    close(fd2)
+                    markCmuxDialogOpen(from: held)
+                    releaseCmuxTaskIfSettled(card.taskId)
+                    continue
+                }
+                processQuestionRequest(fd: fd2, parsed: parsed, payload: held.payload, arrivedAt: card.arrivedAt)
+            }
+            // The card appeared without a click: ignore answers for a moment so a double click
+            // on the previous card cannot land on this one.
+            cmuxPromotedAt = Date().timeIntervalSinceReferenceDate
+            return true
+        }
+    }
+
+    /// A legacy (VS Code / Cursor / Codex) request is about to take the screen: the cmux card on it
+    /// goes back to the head of the queue instead of being answered "ask".
+    @MainActor
+    private func requeueCmuxCardIfShowing() {
+        guard let payload = cmuxShownPayload else { return }
+        let state = AppState.shared
+        let arrival = cmuxShownArrival
+        if pendingApprovalFD >= 0, let info = state.pendingApproval, CmuxRouting.isCmuxTaskId(info.pillId) {
+            let fd2 = dup(pendingApprovalFD)
+            let source = approvalFDSource
+            approvalFDSource = nil
+            pendingApprovalFD = -1
+            source?.cancel()
+            state.pendingApproval = nil
+            if fd2 >= 0 {
+                enqueueCmuxCard(kind: .approval, fd: fd2, payload: payload, parsed: nil, taskId: info.pillId,
+                                sessionId: info.sessionId, tool: info.tool, inputKey: info.inputKey,
+                                atFront: true, arrivedAt: arrival)
+            } else {
+                markCmuxDialogOpen(info.pillId, tool: info.tool, inputKey: info.inputKey)
+                releaseCmuxTaskIfSettled(info.pillId)
+            }
+        } else if pendingQuestionFD >= 0, CmuxRouting.isCmuxTaskId(questionPillId), let parsed = state.pendingQuestion {
+            let fd2 = dup(pendingQuestionFD)
+            let source = questionFDSource
+            questionFDSource = nil
+            // Before the view changes, so QuestionView.onDisappear → releaseQuestionFD is a no-op.
+            pendingQuestionFD = -1
+            source?.cancel()
+            state.pendingQuestion = nil
+            if fd2 >= 0 {
+                let sessionId = payload["session_id"] as? String ?? payload["conversation_id"] as? String ?? "unknown"
+                enqueueCmuxCard(kind: .question, fd: fd2, payload: payload, parsed: parsed, taskId: questionPillId,
+                                sessionId: sessionId, tool: "AskUserQuestion",
+                                inputKey: Self.approvalInputKey(payload["tool_input"] as? [String: Any] ?? [:]),
+                                atFront: true, arrivedAt: arrival)
+            } else {
+                markCmuxDialogOpen(questionPillId, tool: "AskUserQuestion", inputKey: nil)
+                releaseCmuxTaskIfSettled(questionPillId)
+            }
+        }
+        cmuxShownPayload = nil
+    }
+
+    /// True while a card that came out of the queue is too fresh to take a click.
+    @MainActor
+    private func cmuxInputLocked() -> Bool {
+        CmuxRouting.inputLocked(promotedAt: cmuxPromotedAt, now: Date().timeIntervalSinceReferenceDate)
+    }
+
+    #endif
 
     // MARK: - Badge helpers
 
@@ -933,26 +1697,7 @@ final class HookServer: @unchecked Sendable {
     // MARK: - French step labels
 
     private func frenchStep(tool: String, input: [String: Any]) -> String {
-        let labels: [String: String] = [
-            "Bash":        "Exécute",
-            "Read":        "Lit",
-            "Write":       "Écrit",
-            "Edit":        "Modifie",
-            "Glob":        "Cherche",
-            "Grep":        "Recherche",
-            "WebSearch":   "Recherche web",
-            "WebFetch":    "Récupère",
-            "TodoWrite":   "Tâches",
-            "Task":        "Agent",
-            "LS":          "Liste",
-            "MultiEdit":   "Modifie",
-            "NotebookEdit": "Notebook",
-            // Codex tools
-            "apply_patch": "Modifie",
-            "update_plan": "Tâches",
-            "spawn_agent": "Agent",
-        ]
-        var label = labels[tool] ?? tool
+        var label = StepLanguage.label(tool: tool, in: StepLanguage.current)
 
         // Codex MCP tools arrive as mcp__server__tool — show "server · tool"
         if tool.hasPrefix("mcp__") {
@@ -991,19 +1736,9 @@ final class HookServer: @unchecked Sendable {
         return label
     }
 
-    /// Infers a French verb from a shell command's first word.
+    /// Infers a verb (French or Portuguese, see StepLanguage) from a shell command's first word.
     private func bashVerb(_ command: String) -> String {
-        let first = command.split(whereSeparator: { $0.isWhitespace }).first.map(String.init) ?? ""
-        switch first {
-        case "cat", "bat", "head", "tail", "less", "more", "nl": return "Lit"
-        case "rg", "grep", "find", "fd", "ls", "tree", "wc":    return "Cherche"
-        default: break
-        }
-        let testRunners = ["pytest", "vitest", "jest", "npm test", "npm run test",
-                           "cargo test", "go test", "swift test", "make test",
-                           "xcodebuild test", "unittest"]
-        if testRunners.contains(where: { command.contains($0) }) { return "Teste" }
-        return "Exécute"
+        StepLanguage.bashVerb(command, in: StepLanguage.current)
     }
 
     // MARK: - Live diff helpers
@@ -1284,7 +2019,7 @@ final class HookServer: @unchecked Sendable {
             if clCheck.terminationStatus != 0 {
                 throw NSError(domain: "Coucou", code: 1,
                               userInfo: [NSLocalizedDescriptionKey:
-                                  "Command Line Tools are required but not installed. Run: xcode-select --install"])
+                                  String(localized: "Command Line Tools are required but not installed. Run: xcode-select --install")])
             }
 
             if let existing = oldSL,
@@ -1511,7 +2246,7 @@ final class HookServer: @unchecked Sendable {
         let exists = FileManager.default.fileExists(atPath: url.path)
         if !install && !exists {
             throw NSError(domain: "CoucouNoop", code: 0, userInfo: [
-                NSLocalizedDescriptionKey: "No Gemini CLI hooks to remove."
+                NSLocalizedDescriptionKey: String(localized: "No Gemini CLI hooks to remove.")
             ])
         }
         let current = exists ? try Data(contentsOf: url) : Data()
@@ -1527,7 +2262,7 @@ final class HookServer: @unchecked Sendable {
         let current = (try? Data(contentsOf: url)) ?? Data()
         guard sha256Hex(current) == fp else {
             throw NSError(domain: "Coucou", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "~/.gemini/settings.json changed since preview. Refresh and try again."
+                NSLocalizedDescriptionKey: String(localized: "~/.gemini/settings.json changed since preview. Refresh and try again.")
             ])
         }
         try writeJSONFile(data, to: url, suffix: "settings.json")
@@ -1540,7 +2275,7 @@ final class HookServer: @unchecked Sendable {
                                                      label: "~/.gemini/settings.json")
         if let raw = settings["hooks"], !(raw is [String: Any]) {
             throw NSError(domain: "Coucou", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "~/.gemini/settings.json: \"hooks\" has an unexpected type — Coucou has not touched it."
+                NSLocalizedDescriptionKey: String(localized: "~/.gemini/settings.json: \"hooks\" has an unexpected type — Coucou has not touched it.")
             ])
         }
         let base = hookBase()
@@ -1557,7 +2292,7 @@ final class HookServer: @unchecked Sendable {
         for (geminiEvent, normalizedEvent, timeout) in events {
             if let raw = hooks[geminiEvent], !(raw is [[String: Any]]) {
                 throw NSError(domain: "Coucou", code: 2, userInfo: [
-                    NSLocalizedDescriptionKey: "~/.gemini/settings.json: \"hooks\"[\"\(geminiEvent)\"] has an unexpected type — Coucou has not touched it."
+                    NSLocalizedDescriptionKey: String(localized: "~/.gemini/settings.json: \"hooks\"[\"\(geminiEvent)\"] has an unexpected type — Coucou has not touched it.")
                 ])
             }
             var groups = hooks[geminiEvent] as? [[String: Any]] ?? []
@@ -1581,7 +2316,7 @@ final class HookServer: @unchecked Sendable {
                                                      label: "~/.gemini/settings.json")
         if let raw = settings["hooks"], !(raw is [String: Any]) {
             throw NSError(domain: "Coucou", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "~/.gemini/settings.json: \"hooks\" has an unexpected type — Coucou has not touched it."
+                NSLocalizedDescriptionKey: String(localized: "~/.gemini/settings.json: \"hooks\" has an unexpected type — Coucou has not touched it.")
             ])
         }
         if var hooks = settings["hooks"] as? [String: Any] {
@@ -1607,7 +2342,7 @@ final class HookServer: @unchecked Sendable {
         let exists = FileManager.default.fileExists(atPath: url.path)
         if !install && !exists {
             throw NSError(domain: "CoucouNoop", code: 0, userInfo: [
-                NSLocalizedDescriptionKey: "No Antigravity hooks to remove."
+                NSLocalizedDescriptionKey: String(localized: "No Antigravity hooks to remove.")
             ])
         }
         let current = exists ? try Data(contentsOf: url) : Data()
@@ -1623,7 +2358,7 @@ final class HookServer: @unchecked Sendable {
         let current = (try? Data(contentsOf: url)) ?? Data()
         guard sha256Hex(current) == fp else {
             throw NSError(domain: "Coucou", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "~/.gemini/config/hooks.json changed since preview. Refresh and try again."
+                NSLocalizedDescriptionKey: String(localized: "~/.gemini/config/hooks.json changed since preview. Refresh and try again.")
             ])
         }
         try writeJSONFile(data, to: url, suffix: "hooks.json")
@@ -1679,12 +2414,12 @@ final class HookServer: @unchecked Sendable {
         do { data = try Data(contentsOf: url) }
         catch {
             throw NSError(domain: "Coucou", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "\(label) cannot be read — Coucou has not touched it."
+                NSLocalizedDescriptionKey: String(localized: "\(label) cannot be read — Coucou has not touched it.")
             ])
         }
         guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             throw NSError(domain: "Coucou", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "\(label) is not valid JSON — Coucou has not touched it."
+                NSLocalizedDescriptionKey: String(localized: "\(label) is not valid JSON — Coucou has not touched it.")
             ])
         }
         return obj
@@ -1702,7 +2437,7 @@ final class HookServer: @unchecked Sendable {
             do { try fm.copyItem(at: url, to: backupURL) }
             catch {
                 throw NSError(domain: "Coucou", code: 3, userInfo: [
-                    NSLocalizedDescriptionKey: "Could not back up \(url.lastPathComponent): \(error.localizedDescription)"
+                    NSLocalizedDescriptionKey: String(localized: "Could not back up \(url.lastPathComponent): \(error.localizedDescription)")
                 ])
             }
         }
@@ -1762,7 +2497,7 @@ final class HookServer: @unchecked Sendable {
         let exists = FileManager.default.fileExists(atPath: url.path)
         if !install && !exists {
             throw NSError(domain: "CoucouNoop", code: 0, userInfo: [
-                NSLocalizedDescriptionKey: "No Codex hooks to remove."
+                NSLocalizedDescriptionKey: String(localized: "No Codex hooks to remove.")
             ])
         }
         let current = exists ? try Data(contentsOf: url) : Data()
@@ -1778,7 +2513,7 @@ final class HookServer: @unchecked Sendable {
         let current = (try? Data(contentsOf: url)) ?? Data()
         guard sha256Hex(current) == fp else {
             throw NSError(domain: "Coucou", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "~/.codex/hooks.json changed since preview. Refresh and try again."
+                NSLocalizedDescriptionKey: String(localized: "~/.codex/hooks.json changed since preview. Refresh and try again.")
             ])
         }
         try writeJSONFile(data, to: url, suffix: "hooks.json")
@@ -1790,7 +2525,7 @@ final class HookServer: @unchecked Sendable {
         var root = try Self.strictReadJSONObject(at: Self.codexHooksURL, label: "~/.codex/hooks.json")
         if let raw = root["hooks"], !(raw is [String: Any]) {
             throw NSError(domain: "Coucou", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "~/.codex/hooks.json: \"hooks\" has an unexpected type — Coucou has not touched it."
+                NSLocalizedDescriptionKey: String(localized: "~/.codex/hooks.json: \"hooks\" has an unexpected type — Coucou has not touched it.")
             ])
         }
         let base = hookBase()
@@ -1812,7 +2547,7 @@ final class HookServer: @unchecked Sendable {
         for (event, timeout, statusMsg) in events {
             if let raw = hooks[event], !(raw is [[String: Any]]) {
                 throw NSError(domain: "Coucou", code: 2, userInfo: [
-                    NSLocalizedDescriptionKey: "~/.codex/hooks.json: \"hooks\"[\"\(event)\"] has an unexpected type — Coucou has not touched it."
+                    NSLocalizedDescriptionKey: String(localized: "~/.codex/hooks.json: \"hooks\"[\"\(event)\"] has an unexpected type — Coucou has not touched it.")
                 ])
             }
             var groups = hooks[event] as? [[String: Any]] ?? []
@@ -1836,7 +2571,7 @@ final class HookServer: @unchecked Sendable {
         var root = try Self.strictReadJSONObject(at: Self.codexHooksURL, label: "~/.codex/hooks.json")
         if let raw = root["hooks"], !(raw is [String: Any]) {
             throw NSError(domain: "Coucou", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "~/.codex/hooks.json: \"hooks\" has an unexpected type — Coucou has not touched it."
+                NSLocalizedDescriptionKey: String(localized: "~/.codex/hooks.json: \"hooks\" has an unexpected type — Coucou has not touched it.")
             ])
         }
         if var hooks = root["hooks"] as? [String: Any] {
@@ -1864,6 +2599,8 @@ final class HookServer: @unchecked Sendable {
 
 extension Notification.Name {
     static let hookExpand = Notification.Name("notchBuddy.hookExpand")
+    /// A finished Hermes answer opens the collapsed island: like `hookExpand`, then the island closes by itself.
+    static let hermesAnnounceExpand = Notification.Name("notchBuddy.hermesAnnounceExpand")
 }
 
 // MARK: - nb-hook shell wrapper (same for both GitHub and App Store)
@@ -1930,6 +2667,15 @@ def normalize_tool_fields(payload):
             if sid:
                 payload['session_id'] = sid
 
+def add_cmux_context(payload, env):
+    sid = env.get('CMUX_SURFACE_ID', '')
+    if not sid:
+        return
+    payload.setdefault('cmux_surface_id', sid)
+    payload.setdefault('cmux_workspace_id', env.get('CMUX_WORKSPACE_ID', ''))
+    payload.setdefault('cmux_socket_path', env.get('CMUX_SOCKET_PATH', ''))
+    payload.setdefault('cmux_socket_capability', env.get('CMUX_SOCKET_CAPABILITY', ''))
+
 def main():
     raw = b''
     payload = {}
@@ -1991,6 +2737,7 @@ def main():
         payload.setdefault('iterm_session_id', env.get('ITERM_SESSION_ID', ''))
         payload.setdefault('term_session_id', env.get('TERM_SESSION_ID', ''))
         payload.setdefault('bundle_id', env.get('__CFBundleIdentifier', ''))
+        add_cmux_context(payload, env)
         if 'cwd' not in payload or not payload['cwd']:
             paths = payload.get('workspacePaths') or payload.get('workspace_roots', [])
             if isinstance(paths, list) and paths:
@@ -2054,6 +2801,7 @@ def main():
     payload.setdefault('iterm_session_id', env.get('ITERM_SESSION_ID', ''))
     payload.setdefault('term_session_id', env.get('TERM_SESSION_ID', ''))
     payload.setdefault('bundle_id', env.get('__CFBundleIdentifier', ''))
+    add_cmux_context(payload, env)
     if 'cwd' not in payload or not payload['cwd']:
         paths = payload.get('workspacePaths') or payload.get('workspace_roots', [])
         if isinstance(paths, list) and paths:

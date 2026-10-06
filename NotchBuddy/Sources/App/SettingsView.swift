@@ -61,6 +61,22 @@ struct SettingsView: View {
     @State private var lmstudioURL:  String = AppState.shared.lmstudioServerURL
     @State private var connectingOllama:    Bool = false
     @State private var connectingLMStudio:  Bool = false
+    // Hermes agent setup form (the key field is never pre-filled from the Keychain)
+    @State private var hermesURL:     String = ""
+    @State private var hermesProfile: String = ""
+    @State private var hermesName:    String = ""
+    @State private var hermesKey:     String = ""
+    @State private var connectingHermes: Bool = false
+    #if !APPSTORE
+    // Hermes sign in (direct build only)
+    @State private var hermesKind: HermesConnection = .apiKey
+    @State private var signingInHermes: Bool = false
+    @State private var hermesPending: HermesPendingSignIn?
+    @State private var hermesPickedProfile: String = ""
+    @State private var hermesSignInTask: Task<Void, Never>?
+    /// The running sign in belongs to the "Add an agent" form (not to a row's "Sign in again").
+    @State private var hermesSignInFromForm: Bool = false
+    #endif
 
     // Integration keys
     @State private var resendKey: String    = KeychainStore.shared.get("resend-api-key")  ?? ""
@@ -174,9 +190,15 @@ struct SettingsView: View {
                 }
             }
         }
+        .onDisappear { closeHermesSignIn() }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { note in
+            // Closing the window does not remove the hosted view: end a waiting sign in and drop an unconfirmed one here.
+            if (note.object as? NSWindow)?.identifier == AppDelegate.settingsWindowID { closeHermesSignIn() }
+        }
         .onAppear {
             #if !APPSTORE
             state.refreshPlanRelayState()
+            cmuxInstalled = CmuxHub.isInstalled()
             #endif
             guard fetchedModels.isEmpty,
                   let key = KeychainStore.shared.get("anthropic-api-key"), !key.isEmpty else { return }
@@ -202,13 +224,13 @@ struct SettingsView: View {
 
     private var sectionTitle: String {
         switch selectedSection {
-        case "general":      return "General"
-        case "activepills":  return "Active pills"
-        case "agents":       return "Agents"
-        case "chat":         return "Chat"
-        case "integrations": return "Integrations"
-        case "shortcuts":    return "Shortcuts"
-        default:             return "General"
+        case "general":      return String(localized: "General")
+        case "activepills":  return String(localized: "Active pills")
+        case "agents":       return String(localized: "Agents")
+        case "chat":         return String(localized: "Chat")
+        case "integrations": return String(localized: "Integrations")
+        case "shortcuts":    return String(localized: "Shortcuts")
+        default:             return String(localized: "General")
         }
     }
 
@@ -224,6 +246,8 @@ struct SettingsView: View {
     }
 
     // MARK: - General section
+
+    @State private var appLanguage: AppLanguage = AppLanguage.stored
 
     @ViewBuilder private var generalSection: some View {
         GroupBox("Sound") {
@@ -296,6 +320,27 @@ struct SettingsView: View {
                 .padding(6)
         }
 
+        GroupBox("Language") {
+            VStack(alignment: .leading, spacing: 10) {
+                Picker("Language", selection: $appLanguage) {
+                    Text("System").tag(AppLanguage.system)
+                    Text(verbatim: "English").tag(AppLanguage.english)
+                    Text(verbatim: "Português (Brasil)").tag(AppLanguage.portuguese)
+                }
+                .onChange(of: appLanguage) { _, new in AppLanguage.store(new) }
+                if appLanguage != AppLanguage.launched {
+                    HStack(spacing: 8) {
+                        Text("The change applies after restarting Coucou.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                        Button("Restart now") { relaunchCoucou() }
+                            .buttonStyle(.bordered)
+                    }
+                }
+            }
+            .padding(6)
+        }
+
         #if PHONE_LINK
         GroupBox("iPhone") {
             VStack(alignment: .leading, spacing: 6) {
@@ -325,6 +370,17 @@ struct SettingsView: View {
             .padding(6)
         }
         #endif
+    }
+
+    /// Opens a second instance of Coucou, then quits this one once it launched. If the launch fails the
+    /// app stays open and the "applies after restarting" hint stays visible.
+    private func relaunchCoucou() {
+        let config = NSWorkspace.OpenConfiguration()
+        config.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: config) { app, error in
+            guard app != nil, error == nil else { return }
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
     }
 
     // MARK: - Active pills section
@@ -436,7 +492,7 @@ struct SettingsView: View {
         GroupBox("Gemini CLI Hooks") {
             VStack(alignment: .leading, spacing: 10) {
                 Text(geminiHooksInstalled
-                     ? "Hooks installed — restart Gemini CLI to activate"
+                     ? String(localized: "Hooks installed — restart Gemini CLI to activate")
                      : "~/.gemini/settings.json")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundColor(.secondary)
@@ -469,7 +525,7 @@ struct SettingsView: View {
         GroupBox("Antigravity Hooks") {
             VStack(alignment: .leading, spacing: 10) {
                 Text(agyHooksInstalled
-                     ? "Hooks installed — restart Antigravity to activate"
+                     ? String(localized: "Hooks installed — restart Antigravity to activate")
                      : "~/.gemini/config/hooks.json")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundColor(.secondary)
@@ -502,7 +558,7 @@ struct SettingsView: View {
         GroupBox("Codex Hooks") {
             VStack(alignment: .leading, spacing: 10) {
                 Text(codexHooksInstalled
-                     ? "Hooks installed — open Codex and run /hooks or open Hooks in the app's settings to trust them"
+                     ? String(localized: "Hooks installed — open Codex and run /hooks or open Hooks in the app's settings to trust them")
                      : "~/.codex/hooks.json")
                     .font(.system(size: 11, design: .monospaced))
                     .foregroundColor(.secondary)
@@ -593,7 +649,116 @@ struct SettingsView: View {
             .padding(6)
         }
         #endif
+
+        #if !APPSTORE
+        if cmuxInstalled { cmuxSettingsGroup }
+        #endif
     }
+
+    #if !APPSTORE
+    @State private var cmuxInstalled = false
+    @State private var cmuxCommandDrafts: [String: String] = AppState.shared.cmuxLaunchCommands
+    @State private var cmuxPasswordDraft: String = ""
+    @State private var cmuxPasswordSaved: Bool = CmuxControl.hasPassword
+
+    /// Typing edits the draft; a valid draft is also saved as the launcher's command.
+    private func cmuxCommandBinding(_ launcher: CmuxLauncher) -> Binding<String> {
+        Binding(
+            get: { cmuxCommandDrafts[launcher.id.rawValue] ?? "" },
+            set: { new in
+                cmuxCommandDrafts[launcher.id.rawValue] = new
+                state.setCmuxCommand(new, for: launcher)
+            })
+    }
+
+    @ViewBuilder private var cmuxSettingsGroup: some View {
+        GroupBox("cmux") {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Start new chats from the notch, in a new cmux workspace.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+
+                HStack(spacing: 8) {
+                    Text("Default folder")
+                        .font(.system(size: 12))
+                    Text(state.cmuxDefaultFolder.isEmpty ? String(localized: "Not set") : state.cmuxDefaultFolder)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button("Choose…") { chooseCmuxFolder() }
+                        .buttonStyle(.bordered)
+                    if !state.cmuxDefaultFolder.isEmpty {
+                        Button("Clear") { state.cmuxDefaultFolder = "" }
+                            .buttonStyle(.bordered)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Launch command")
+                        .font(.system(size: 12))
+                    ForEach(CmuxLauncher.all) { launcher in
+                        let draft = cmuxCommandDrafts[launcher.id.rawValue] ?? ""
+                        HStack(spacing: 8) {
+                            Text(verbatim: launcher.name)
+                                .font(.system(size: 12))
+                                .frame(width: 52, alignment: .leading)
+                            TextField(launcher.defaultCommand, text: cmuxCommandBinding(launcher))
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 11, design: .monospaced))
+                        }
+                        if !CmuxRouting.isValidLaunchCommand(draft) {
+                            Text("Letters, digits, spaces and _ . / = : - only. Keeping \"\(state.cmuxCommand(for: launcher))\".")
+                                .font(.system(size: 11))
+                                .foregroundColor(.red)
+                        }
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        SecureField("Socket password (optional)", text: $cmuxPasswordDraft)
+                            .textFieldStyle(.roundedBorder)
+                        Button("Save") {
+                            CmuxControl.setPassword(cmuxPasswordDraft)
+                            cmuxPasswordDraft = ""
+                            cmuxPasswordSaved = CmuxControl.hasPassword
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(cmuxPasswordDraft.isEmpty)
+                        if cmuxPasswordSaved {
+                            Button("Remove") {
+                                CmuxControl.setPassword("")
+                                cmuxPasswordSaved = false
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                    Text(cmuxPasswordSaved ? String(localized: "A password is saved in your Keychain.") : String(localized: "No password saved."))
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                    Text("Needed only to start a chat when no cmux session is open. In cmux: Settings › Automation › Socket control mode › Password, set a password, then paste it here. It is stored in your Keychain.")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(6)
+        }
+    }
+
+    private func chooseCmuxFolder() {
+        let panel = NSOpenPanel()
+        panel.prompt = String(localized: "Choose")
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url,
+              CmuxRouting.isValidFolder(url.path) else { return }
+        state.cmuxDefaultFolder = url.path
+    }
+    #endif
 
     // MARK: - Chat section
 
@@ -604,7 +769,7 @@ struct SettingsView: View {
                     .textFieldStyle(.roundedBorder)
                 Button("Save") {
                     KeychainStore.shared.set("anthropic-api-key", value: apiKey)
-                    statusMessage = "✓ Key saved."
+                    statusMessage = String(localized: "✓ Key saved.")
                 }
                 .buttonStyle(.borderedProminent)
 
@@ -651,7 +816,7 @@ struct SettingsView: View {
                     .textFieldStyle(.roundedBorder)
                 Button("Save") {
                     KeychainStore.shared.set("google-api-key", value: googleKey)
-                    statusMessage = "✓ Google key saved."
+                    statusMessage = String(localized: "✓ Google key saved.")
                 }
                 .buttonStyle(.borderedProminent)
 
@@ -665,7 +830,7 @@ struct SettingsView: View {
                     .textFieldStyle(.roundedBorder)
                 Button("Save") {
                     KeychainStore.shared.set("openai-api-key", value: openAIKey)
-                    statusMessage = "✓ OpenAI key saved."
+                    statusMessage = String(localized: "✓ OpenAI key saved.")
                 }
                 .buttonStyle(.borderedProminent)
             }
@@ -691,7 +856,7 @@ struct SettingsView: View {
                 if state.ollamaServerURL.isEmpty {
                     TextField("http://127.0.0.1:11434", text: $ollamaURL)
                         .textFieldStyle(.roundedBorder)
-                    Button(connectingOllama ? "Connecting…" : "Connect") {
+                    Button(connectingOllama ? String(localized: "Connecting…") : String(localized: "Connect")) {
                         Task { await connectLocal(provider: .ollama) }
                     }
                     .buttonStyle(.borderedProminent)
@@ -706,7 +871,7 @@ struct SettingsView: View {
                         state.fetchedProviderModels[.ollama] = nil
                         state.providerModelFetchError[.ollama] = nil
                         if state.chatProvider == .ollama { state.chatProvider = .anthropic }
-                        statusMessage = "Ollama disconnected."
+                        statusMessage = String(localized: "Ollama disconnected.")
                     }
                     .buttonStyle(.bordered)
                 }
@@ -726,7 +891,7 @@ struct SettingsView: View {
                 if state.lmstudioServerURL.isEmpty {
                     TextField("http://127.0.0.1:1234", text: $lmstudioURL)
                         .textFieldStyle(.roundedBorder)
-                    Button(connectingLMStudio ? "Connecting…" : "Connect") {
+                    Button(connectingLMStudio ? String(localized: "Connecting…") : String(localized: "Connect")) {
                         Task { await connectLocal(provider: .lmstudio) }
                     }
                     .buttonStyle(.borderedProminent)
@@ -741,10 +906,139 @@ struct SettingsView: View {
                         state.fetchedProviderModels[.lmstudio] = nil
                         state.providerModelFetchError[.lmstudio] = nil
                         if state.chatProvider == .lmstudio { state.chatProvider = .anthropic }
-                        statusMessage = "LM Studio disconnected."
+                        statusMessage = String(localized: "LM Studio disconnected.")
                     }
                     .buttonStyle(.bordered)
                 }
+            }
+            .padding(.vertical, 4)
+        }
+
+        GroupBox("Hermes agents") {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Talk to your own Hermes agents from the chat. One entry per profile; each key is stored in the Keychain.")
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+
+                ForEach(state.hermesAgents, id: \.name) { agent in
+                    HStack(spacing: 8) {
+                        Circle().fill(Color(hex: "#F97316")).frame(width: 8, height: 8)
+                        Text(agent.name).font(.system(size: 12, weight: .semibold))
+                        if isSignInAgent(agent) {
+                            if let label = state.hermesSessionLabel(agent) {
+                                Text("Signed in as \(label)")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(Color(hex: "#22C55E"))
+                            } else {
+                                Text("Sign in again")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(Color(hex: "#F97316"))
+                            }
+                        } else if state.isHermesAgentBound(agent) {
+                            Text("Connected")
+                                .font(.system(size: 10))
+                                .foregroundColor(Color(hex: "#22C55E"))
+                        } else {
+                            Text("Reconnect needed")
+                                .font(.system(size: 10))
+                                .foregroundColor(Color(hex: "#F97316"))
+                        }
+                    }
+                    Text("\(agent.baseURL) · \(agent.profile.isEmpty ? String(localized: "default") : agent.profile)")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.secondary)
+                    if !isSignInAgent(agent), !state.isHermesAgentBound(agent) {
+                        Text("Its key is not tied to this address. Disconnect it and connect it again.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                    }
+                    if !isSignInAgent(agent), HermesChat.sendsKeyUnencryptedToName(agent.baseURL) {
+                        Text("The key is sent unencrypted on your local network to whoever answers this name. Use https:// or an IP address you trust.")
+                            .font(.system(size: 11))
+                            .foregroundColor(Color(hex: "#F97316"))
+                    }
+                    #if !APPSTORE
+                    if isSignInAgent(agent) {
+                        HStack(spacing: 8) {
+                            Button(signingInHermes ? String(localized: "Waiting for the browser… (click to cancel)") : String(localized: "Sign in again")) {
+                                if signingInHermes { hermesSignInTask?.cancel() }
+                                else { startHermesSignIn(fromForm: false) { await resignInHermes(agent) } }
+                            }
+                            .buttonStyle(.bordered)
+                            Button("Sign out") {
+                                Task {
+                                    await state.signOutHermesAgent(named: agent.name)
+                                    statusMessage = String(localized: "Signed out of \(agent.name).")
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                    #endif
+                    Button("Disconnect") {
+                        Task {
+                            await state.removeHermesAgent(named: agent.name)
+                            statusMessage = String(localized: "\(agent.name) disconnected.")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    Divider()
+                }
+
+                HStack(spacing: 8) {
+                    Circle().fill(Color(hex: "#F97316")).frame(width: 8, height: 8)
+                    Text("Add an agent").font(.system(size: 12, weight: .semibold))
+                }
+                #if !APPSTORE
+                Picker("", selection: $hermesKind) {
+                    Text("API key").tag(HermesConnection.apiKey)
+                    Text("Sign in").tag(HermesConnection.signIn)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .onChange(of: hermesKind) { _, kind in
+                    hermesPending = nil
+                    // The form (and its cancel button) is hidden for API key: end the waiting sign in with it.
+                    if kind != .signIn, hermesSignInFromForm { hermesSignInTask?.cancel() }
+                }
+                #endif
+                TextField("https://hermes.example.com", text: $hermesURL)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: hermesURL) { _, url in
+                        prefillHermesProfile(from: url)
+                        #if !APPSTORE
+                        hermesPending = nil   // a pending sign in belongs to the address it was made for
+                        #endif
+                    }
+                if hermesKindIsAPIKey,
+                   case .success(let typed) = HermesChat.normaliseBaseURL(hermesURL),
+                   HermesChat.sendsKeyUnencryptedToName(typed) {
+                    Text("http:// to a name: the key will be sent unencrypted on your local network.")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color(hex: "#F97316"))
+                }
+                if hermesKindIsAPIKey {
+                    TextField("Profile (empty = default)", text: $hermesProfile)
+                        .textFieldStyle(.roundedBorder)
+                }
+                TextField("Name in the chat (optional)", text: $hermesName)
+                    .textFieldStyle(.roundedBorder)
+                if hermesKindIsAPIKey {
+                    SecureField("API key (API_SERVER_KEY of this profile)", text: $hermesKey)
+                        .textFieldStyle(.roundedBorder)
+                    Button(connectingHermes ? String(localized: "Connecting…") : String(localized: "Connect")) {
+                        Task { await connectHermes() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(connectingHermes
+                              || hermesURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                              || hermesKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+                #if !APPSTORE
+                if hermesKind == .signIn {
+                    hermesSignInForm   // an unconfirmed session is dropped by `closeHermesSignIn`, not by this branch
+                }
+                #endif
             }
             .padding(.vertical, 4)
         }
@@ -866,7 +1160,7 @@ struct SettingsView: View {
             if on { try SMAppService.mainApp.register() }
             else  { try SMAppService.mainApp.unregister() }
         } catch {
-            statusMessage = "❌ Startup: \(error.localizedDescription)"
+            statusMessage = String(localized: "❌ Startup: \(error.localizedDescription)")
             launchAtStartup = !on
         }
     }
@@ -876,7 +1170,7 @@ struct SettingsView: View {
     #if APPSTORE
     private func pickClaudeFolder(prompt: String) -> URL? {
         let panel = NSOpenPanel()
-        panel.message = "Select your .claude folder (press ⇧⌘. to show hidden files)"
+        panel.message = String(localized: "Select your .claude folder (press ⇧⌘. to show hidden files)")
         panel.prompt = prompt
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
@@ -887,37 +1181,37 @@ struct SettingsView: View {
         panel.directoryURL = URL(fileURLWithPath: realHomePath)
         guard panel.runModal() == .OK, let url = panel.url else { return nil }
         guard url.lastPathComponent == ".claude" else {
-            statusMessage = "❌ Select the .claude folder (hidden, in your Home directory)."
+            statusMessage = String(localized: "❌ Select the .claude folder (hidden, in your Home directory).")
             return nil
         }
         return url
     }
 
     private func installHooksAppStore() {
-        guard let claudeURL = pickClaudeFolder(prompt: "Select") else { return }
+        guard let claudeURL = pickClaudeFolder(prompt: String(localized: "Select")) else { return }
         let alert = NSAlert()
-        alert.messageText = "Install Coucou hooks in ~/.claude?"
-        alert.informativeText = "Will write:\n• ~/.claude/coucou/nb-hook\n• ~/.claude/settings.json (backup created first)"
-        alert.addButton(withTitle: "Install")
-        alert.addButton(withTitle: "Cancel")
+        alert.messageText = String(localized: "Install Coucou hooks in ~/.claude?")
+        alert.informativeText = String(localized: "Will write:\n• ~/.claude/coucou/nb-hook\n• ~/.claude/settings.json (backup created first)")
+        alert.addButton(withTitle: String(localized: "Install"))
+        alert.addButton(withTitle: String(localized: "Cancel"))
         alert.alertStyle = .informational
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         do {
             try HookServer.shared.installAndWriteClaudeHooksAppStore(claudeURL: claudeURL)
             hookNeedsUpdate = false
-            statusMessage = "✓ Hooks installed — restart VS Code to activate."
+            statusMessage = String(localized: "✓ Hooks installed — restart VS Code to activate.")
         } catch {
-            statusMessage = "❌ \(error.localizedDescription)"
+            statusMessage = String(localized: "❌ \(error.localizedDescription)")
         }
     }
 
     private func uninstallHooksAppStore() {
-        guard let claudeURL = pickClaudeFolder(prompt: "Select") else { return }
+        guard let claudeURL = pickClaudeFolder(prompt: String(localized: "Select")) else { return }
         do {
             try HookServer.shared.uninstallClaudeHooksAppStore(claudeURL: claudeURL)
-            statusMessage = "✓ Hooks removed."
+            statusMessage = String(localized: "✓ Hooks removed.")
         } catch {
-            statusMessage = "❌ \(error.localizedDescription)"
+            statusMessage = String(localized: "❌ \(error.localizedDescription)")
         }
     }
     #endif
@@ -929,7 +1223,7 @@ struct SettingsView: View {
             : rawURL
         let normalised = LocalChat.normaliseURL(candidate)
         guard normalised.hasPrefix("http://") || normalised.hasPrefix("https://") else {
-            statusMessage = "Only http:// and https:// URLs are supported."
+            statusMessage = String(localized: "Only http:// and https:// URLs are supported.")
             return
         }
         if provider == .ollama { connectingOllama = true } else { connectingLMStudio = true }
@@ -939,7 +1233,7 @@ struct SettingsView: View {
         let name = provider == .ollama ? "Ollama" : "LM Studio"
         switch result {
         case .success(let models) where models.isEmpty:
-            statusMessage = "No models yet — download one in \(name) first."
+            statusMessage = String(localized: "No models yet — download one in \(name) first.")
         case .success(let models):
             if provider == .ollama {
                 state.ollamaServerURL = normalised
@@ -952,9 +1246,209 @@ struct SettingsView: View {
                 state.fetchedProviderModels[.lmstudio] = nil
                 state.providerModelFetchError[.lmstudio] = nil
             }
-            statusMessage = "✓ Connected · \(models.count) model\(models.count == 1 ? "" : "s")"
+            statusMessage = models.count == 1
+                ? String(localized: "✓ Connected · 1 model")
+                : String(localized: "✓ Connected · \(String(models.count)) models")
         case .failure:
-            statusMessage = "Couldn't reach \(name) at \(normalised). Is it running?"
+            statusMessage = String(localized: "Couldn't reach \(name) at \(normalised). Is it running?")
+        }
+    }
+
+    /// The API key form is the only form in the App Store build; the direct build adds "Sign in".
+    /// A sign in agent row exists only in the direct build.
+    private func isSignInAgent(_ agent: HermesAgent) -> Bool {
+        #if APPSTORE
+        return false
+        #else
+        return agent.connection == .signIn
+        #endif
+    }
+
+    /// Settings is going away: end a waiting sign in and drop one that was never confirmed.
+    private func closeHermesSignIn() {
+        #if !APPSTORE
+        hermesSignInTask?.cancel()
+        hermesSignInTask = nil
+        hermesPending = nil
+        #endif
+    }
+
+    private var hermesKindIsAPIKey: Bool {
+        #if APPSTORE
+        return true
+        #else
+        return hermesKind == .apiKey
+        #endif
+    }
+
+    #if !APPSTORE
+    private struct HermesPendingSignIn: Equatable {
+        var record: HermesSignIn.SessionRecord
+        var label: String
+        var profiles: [HermesSignIn.Profile]
+        var baseURL: String
+    }
+
+    /// "Sign in…", then (once signed in) the profile picker and "Add". Nothing is stored before "Add".
+    @ViewBuilder private var hermesSignInForm: some View {
+        if let pending = hermesPending {
+            Text("Signed in as \(pending.label)")
+                .font(.system(size: 12))
+                .foregroundColor(Color(hex: "#22C55E"))
+            if pending.profiles.isEmpty {
+                TextField("Profile (empty = default)", text: $hermesPickedProfile)
+                    .textFieldStyle(.roundedBorder)
+            } else {
+                Picker("Profile", selection: $hermesPickedProfile) {
+                    ForEach(pending.profiles, id: \.name) { p in
+                        Text(p.title).tag(p.name)
+                    }
+                }
+                .font(.system(size: 12))
+            }
+            Button("Add") { addSignedInHermes(pending) }
+                .buttonStyle(.borderedProminent)
+        } else {
+            Text("Opens your browser to sign in with the server. Coucou keeps the session in the Keychain.")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+            Button(signingInHermes ? String(localized: "Waiting for the browser… (click to cancel)") : String(localized: "Sign in…")) {
+                if signingInHermes { hermesSignInTask?.cancel() }
+                else { startHermesSignIn(fromForm: true) { await signInHermes() } }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!signingInHermes && hermesURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+    }
+
+    /// Starts a sign in task. `signingInHermes` is raised before the task exists, so a second click cannot start another.
+    private func startHermesSignIn(fromForm: Bool, _ work: @escaping () async -> Void) {
+        guard !signingInHermes else { return }
+        signingInHermes = true
+        hermesSignInFromForm = fromForm
+        hermesSignInTask = Task {
+            await work()
+            signingInHermes = false
+            hermesSignInFromForm = false
+        }
+    }
+
+    /// The only place a browser opens for a sign in: the click on "Sign in…" or "Sign in again".
+    private func runHermesSignIn(base: String) async -> HermesPendingSignIn? {
+        statusMessage = ""
+        let result = await HermesSignInNet.signIn(baseURL: base) { url in NSWorkspace.shared.open(url) }
+        if Task.isCancelled {
+            statusMessage = String(localized: "Sign in cancelled.")
+            return nil
+        }
+        switch result {
+        case .failure(let e):
+            statusMessage = e.userMessage
+            return nil
+        case .success(var record):
+            let label = await HermesSignInNet.me(baseURL: base, token: record.accessToken) ?? record.userID
+            record.label = label
+            var profiles: [HermesSignIn.Profile] = []
+            if case .success(let p) = await HermesSignInNet.profiles(baseURL: base, token: record.accessToken) { profiles = p }
+            if Task.isCancelled {
+                statusMessage = String(localized: "Sign in cancelled.")
+                return nil
+            }
+            return HermesPendingSignIn(record: record, label: label.isEmpty ? String(localized: "your account") : label, profiles: profiles, baseURL: base)
+        }
+    }
+
+    private func signInHermes() async {
+        let base: String
+        switch HermesChat.normaliseBaseURL(hermesURL) {
+        case .success(let u): base = u
+        case .failure(let e): statusMessage = e.userMessage; return
+        }
+        guard let pending = await runHermesSignIn(base: base) else { return }
+        // The address or the kind was edited while the browser was open: this session belongs to the old address.
+        guard hermesKind == .signIn, case .success(let current) = HermesChat.normaliseBaseURL(hermesURL),
+              current == pending.baseURL else {
+            statusMessage = String(localized: "The address changed while you signed in. Sign in again.")
+            return
+        }
+        hermesPickedProfile = pending.profiles.first(where: { $0.isDefault })?.name ?? pending.profiles.first?.name ?? ""
+        hermesPending = pending
+    }
+
+    private func addSignedInHermes(_ pending: HermesPendingSignIn) {
+        let profile = hermesPickedProfile.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard HermesChat.isValidProfile(profile) else {
+            statusMessage = String(localized: "Profile names use letters, digits, - and _ only.")
+            return
+        }
+        let typedName = hermesName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = !typedName.isEmpty ? typedName
+                 : !profile.isEmpty ? profile
+                 : (URL(string: pending.baseURL)?.host ?? "hermes")
+        guard !state.hermesAgents.contains(where: { $0.name == name }) else {
+            statusMessage = String(localized: "An agent named \(name) already exists.")
+            return
+        }
+        hermesPending = nil
+        hermesURL = ""; hermesProfile = ""; hermesName = ""; hermesPickedProfile = ""
+        statusMessage = String(localized: "✓ Signed in · \(name)")
+        let agent = HermesAgent(name: name, baseURL: pending.baseURL, profile: profile, modelName: "", connection: .signIn)
+        Task { await state.addHermesSignedInAgent(agent, record: pending.record) }
+    }
+
+    /// "Sign in again" for an existing agent: same address, same profile, new session.
+    private func resignInHermes(_ agent: HermesAgent) async {
+        guard let pending = await runHermesSignIn(base: agent.baseURL) else { return }
+        // The agent may have been disconnected or re-pointed while the browser was open: then drop the session.
+        guard await state.storeHermesSession(pending.record, for: agent) else {
+            statusMessage = String(localized: "\(agent.name) changed or was removed while you signed in. Nothing was saved.")
+            return
+        }
+        statusMessage = String(localized: "✓ Signed in · \(agent.name)")
+    }
+    #endif
+
+    /// Validates the form, tests the connection (the only request of the setup, made on this click)
+    /// and stores the agent. Nothing is stored on failure.
+    /// A pasted `.../p/NAME/v1` URL fills the empty Profile field with NAME.
+    private func prefillHermesProfile(from url: String) {
+        guard hermesProfile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let p = HermesChat.profileInURL(url) else { return }
+        hermesProfile = p
+    }
+
+    private func connectHermes() async {
+        prefillHermesProfile(from: hermesURL)
+        let base: String
+        switch HermesChat.normaliseBaseURL(hermesURL) {
+        case .success(let u): base = u
+        case .failure(let e): statusMessage = e.userMessage; return
+        }
+        let profile = hermesProfile.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard HermesChat.isValidProfile(profile) else {
+            statusMessage = String(localized: "Profile names use letters, digits, - and _ only.")
+            return
+        }
+        let key = hermesKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let typedName = hermesName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = !typedName.isEmpty ? typedName
+                 : !profile.isEmpty ? profile
+                 : (URL(string: base)?.host ?? "hermes")
+        guard !state.hermesAgents.contains(where: { $0.name == name }) else {
+            statusMessage = String(localized: "An agent named \(name) already exists.")
+            return
+        }
+        connectingHermes = true
+        statusMessage = ""
+        let result = await HermesChat.connect(baseURL: base, profile: profile, key: key)
+        connectingHermes = false
+        switch result {
+        case .success(let modelName):
+            state.addHermesAgent(HermesAgent(name: name, baseURL: base, profile: profile, modelName: modelName), key: key)
+            hermesURL = ""; hermesProfile = ""; hermesName = ""; hermesKey = ""
+            statusMessage = String(localized: "✓ Connected · \(name)")
+        case .failure(let e):
+            statusMessage = e.userMessage
         }
     }
 
@@ -962,9 +1456,9 @@ struct SettingsView: View {
         do {
             pendingHookJSON = try HookServer.shared.previewClaudeHooks()
             showDiff = true
-            statusMessage = "Review the JSON below before confirming."
+            statusMessage = String(localized: "Review the JSON below before confirming.")
         } catch {
-            statusMessage = "❌ \(error.localizedDescription)"
+            statusMessage = String(localized: "❌ \(error.localizedDescription)")
         }
     }
 
@@ -972,20 +1466,20 @@ struct SettingsView: View {
         do {
             try HookServer.shared.writeClaudeHooks()
             showDiff = false
-            statusMessage = "✓ Hooks installed in ~/.claude/settings.json"
+            statusMessage = String(localized: "✓ Hooks installed in ~/.claude/settings.json")
             pendingHookJSON = ""
             hookNeedsUpdate = false
         } catch {
-            statusMessage = "❌ Write error: \(error.localizedDescription)"
+            statusMessage = String(localized: "❌ Write error: \(error.localizedDescription)")
         }
     }
 
     private func uninstallHooks() {
         do {
             try HookServer.shared.uninstallClaudeHooks()
-            statusMessage = "✓ Hooks removed."
+            statusMessage = String(localized: "✓ Hooks removed.")
         } catch {
-            statusMessage = "❌ \(error.localizedDescription)"
+            statusMessage = String(localized: "❌ \(error.localizedDescription)")
         }
     }
 
@@ -995,11 +1489,11 @@ struct SettingsView: View {
             geminiPendingInstall = install
             pendingGeminiJSON = try HookServer.shared.previewGeminiHooks(install: install)
             showGeminiDiff = true
-            statusMessage = "Review the JSON below before confirming."
+            statusMessage = String(localized: "Review the JSON below before confirming.")
         } catch let e as NSError where e.domain == "CoucouNoop" {
             statusMessage = e.localizedDescription
         } catch {
-            statusMessage = "❌ \(error.localizedDescription)"
+            statusMessage = String(localized: "❌ \(error.localizedDescription)")
         }
     }
 
@@ -1010,10 +1504,10 @@ struct SettingsView: View {
             pendingGeminiJSON = ""
             geminiHooksInstalled = geminiPendingInstall
             statusMessage = geminiPendingInstall
-                ? "✓ Gemini CLI hooks installed in ~/.gemini/settings.json"
-                : "✓ Gemini CLI hooks removed."
+                ? String(localized: "✓ Gemini CLI hooks installed in ~/.gemini/settings.json")
+                : String(localized: "✓ Gemini CLI hooks removed.")
         } catch {
-            statusMessage = "❌ \(error.localizedDescription)"
+            statusMessage = String(localized: "❌ \(error.localizedDescription)")
         }
     }
 
@@ -1022,11 +1516,11 @@ struct SettingsView: View {
             agyPendingInstall = install
             pendingAgyJSON = try HookServer.shared.previewAgyHooks(install: install)
             showAgyDiff = true
-            statusMessage = "Review the JSON below before confirming."
+            statusMessage = String(localized: "Review the JSON below before confirming.")
         } catch let e as NSError where e.domain == "CoucouNoop" {
             statusMessage = e.localizedDescription
         } catch {
-            statusMessage = "❌ \(error.localizedDescription)"
+            statusMessage = String(localized: "❌ \(error.localizedDescription)")
         }
     }
 
@@ -1037,10 +1531,10 @@ struct SettingsView: View {
             pendingAgyJSON = ""
             agyHooksInstalled = agyPendingInstall
             statusMessage = agyPendingInstall
-                ? "✓ Antigravity hooks installed in ~/.gemini/config/hooks.json"
-                : "✓ Antigravity hooks removed."
+                ? String(localized: "✓ Antigravity hooks installed in ~/.gemini/config/hooks.json")
+                : String(localized: "✓ Antigravity hooks removed.")
         } catch {
-            statusMessage = "❌ \(error.localizedDescription)"
+            statusMessage = String(localized: "❌ \(error.localizedDescription)")
         }
     }
 
@@ -1049,11 +1543,11 @@ struct SettingsView: View {
             codexPendingInstall = install
             pendingCodexJSON = try HookServer.shared.previewCodexHooks(install: install)
             showCodexDiff = true
-            statusMessage = "Review the JSON below before confirming."
+            statusMessage = String(localized: "Review the JSON below before confirming.")
         } catch let e as NSError where e.domain == "CoucouNoop" {
             statusMessage = e.localizedDescription
         } catch {
-            statusMessage = "❌ \(error.localizedDescription)"
+            statusMessage = String(localized: "❌ \(error.localizedDescription)")
         }
     }
 
@@ -1064,10 +1558,10 @@ struct SettingsView: View {
             pendingCodexJSON = ""
             codexHooksInstalled = codexPendingInstall
             statusMessage = codexPendingInstall
-                ? "✓ Codex hooks installed — run /hooks in Codex or open Hooks in the app's settings to trust them."
-                : "✓ Codex hooks removed."
+                ? String(localized: "✓ Codex hooks installed — run /hooks in Codex or open Hooks in the app's settings to trust them.")
+                : String(localized: "✓ Codex hooks removed.")
         } catch {
-            statusMessage = "❌ \(error.localizedDescription)"
+            statusMessage = String(localized: "❌ \(error.localizedDescription)")
         }
     }
 
@@ -1076,9 +1570,9 @@ struct SettingsView: View {
             pendingStatusLineJSON = try HookServer.shared.previewStatusLine(install: true)
             showStatusLineDiff = true
             statusLinePendingInstall = true
-            statusMessage = "Review the JSON below before confirming."
+            statusMessage = String(localized: "Review the JSON below before confirming.")
         } catch {
-            statusMessage = "❌ \(error.localizedDescription)"
+            statusMessage = String(localized: "❌ \(error.localizedDescription)")
         }
     }
 
@@ -1087,9 +1581,9 @@ struct SettingsView: View {
             pendingStatusLineJSON = try HookServer.shared.previewStatusLine(install: false)
             showStatusLineDiff = true
             statusLinePendingInstall = false
-            statusMessage = "Review the JSON below before confirming."
+            statusMessage = String(localized: "Review the JSON below before confirming.")
         } catch {
-            statusMessage = "❌ \(error.localizedDescription)"
+            statusMessage = String(localized: "❌ \(error.localizedDescription)")
         }
     }
 
@@ -1107,11 +1601,11 @@ struct SettingsView: View {
                 state.showPlanInNotch = false
             }
             statusMessage = statusLinePendingInstall
-                ? "✓ Status line installed."
-                : "✓ Status line removed."
+                ? String(localized: "✓ Status line installed.")
+                : String(localized: "✓ Status line removed.")
         } catch {
             planTogglePending = false
-            statusMessage = "❌ \(error.localizedDescription)"
+            statusMessage = String(localized: "❌ \(error.localizedDescription)")
         }
     }
     #endif
@@ -1140,7 +1634,7 @@ struct SettingsView: View {
         saveKey("stripe-api-key",  value: stripeKey)
         saveKey("calcom-api-key",  value: calcomKey)
         saveKey("notion-api-key",  value: notionKey)
-        statusMessage = "✓ Integration keys saved."
+        statusMessage = String(localized: "✓ Integration keys saved.")
     }
 
     private func saveKey(_ key: String, value: String) {
@@ -1155,7 +1649,7 @@ struct SettingsView: View {
 
     private func loadVercelProjects() {
         guard let token = KeychainStore.shared.get("vercel-token") else {
-            statusMessage = "❌ Save Vercel token first."
+            statusMessage = String(localized: "❌ Save Vercel token first.")
             return
         }
         loadingVercel = true
@@ -1174,7 +1668,7 @@ struct SettingsView: View {
             DispatchQueue.main.async {
                 self.vercelProjects = names
                 self.loadingVercel = false
-                if names.isEmpty { self.statusMessage = "❌ No Vercel projects found." }
+                if names.isEmpty { self.statusMessage = String(localized: "❌ No Vercel projects found.") }
             }
         }.resume()
     }
@@ -1184,7 +1678,7 @@ struct SettingsView: View {
     private func loadN8nWorkflows() {
         guard let apiKey  = KeychainStore.shared.get("n8n-api-key"),
               let rawBase = KeychainStore.shared.get("n8n-url") else {
-            statusMessage = "❌ Save n8n URL and API key first."
+            statusMessage = String(localized: "❌ Save n8n URL and API key first.")
             return
         }
         loadingN8n = true
@@ -1195,7 +1689,7 @@ struct SettingsView: View {
 
     private func fetchN8nWorkflows(urls: [String], apiKey: String, idx: Int) {
         guard idx < urls.count, let url = URL(string: urls[idx]) else {
-            DispatchQueue.main.async { self.loadingN8n = false; self.statusMessage = "❌ No n8n workflows found." }
+            DispatchQueue.main.async { self.loadingN8n = false; self.statusMessage = String(localized: "❌ No n8n workflows found.") }
             return
         }
         var req = URLRequest(url: url, timeoutInterval: 10)
@@ -1215,7 +1709,7 @@ struct SettingsView: View {
             DispatchQueue.main.async {
                 self.n8nWorkflows = names
                 self.loadingN8n = false
-                if names.isEmpty { self.statusMessage = "❌ No n8n workflows found." }
+                if names.isEmpty { self.statusMessage = String(localized: "❌ No n8n workflows found.") }
             }
         }.resume()
     }
@@ -1227,20 +1721,23 @@ struct SettingsView: View {
         let atMax  = state.activeIntegrations.count >= 4 && !isOn && !isMain
         let hint: String? = {
             if isMain { return nil }
-            if def.comingSoon { return "Coming soon" }
+            if def.comingSoon { return String(localized: "Coming soon") }
             #if !APPSTORE
-            if def.id == "agent_gemini"        && !HookServer.geminiHooksInstalled()  { return "Hooks not installed" }
-            if def.id == "agent_antigravity"   && !HookServer.agyHooksInstalled()    { return "Hooks not installed" }
-            if def.id == "agent_codex"         && !HookServer.codexHooksInstalled()  { return "Hooks not installed" }
+            if def.id == "agent_gemini"        && !HookServer.geminiHooksInstalled()  { return String(localized: "Hooks not installed") }
+            if def.id == "agent_antigravity"   && !HookServer.agyHooksInstalled()    { return String(localized: "Hooks not installed") }
+            if def.id == "agent_codex"         && !HookServer.codexHooksInstalled()  { return String(localized: "Hooks not installed") }
+            if def.id == CmuxRouting.hubPillId && !CmuxHub.isInstalled()             { return String(localized: "Not installed") }
             #endif
             if def.category == .ai {
-                if let provider = ChatProvider(pillID: def.id), provider.isLocal {
+                if def.id == "ai_hermes" {
+                    if state.hermesAgents.isEmpty { return String(localized: "Not connected") }
+                } else if let provider = ChatProvider(pillID: def.id), provider.isLocal {
                     let url = provider == .ollama ? state.ollamaServerURL : state.lmstudioServerURL
-                    if url.isEmpty { return "Not connected" }
+                    if url.isEmpty { return String(localized: "Not connected") }
                 } else {
                     let keyId = def.id == "ai_anthropic" ? "anthropic-api-key"
                                : def.id == "ai_google"    ? "google-api-key" : "openai-api-key"
-                    if KeychainStore.shared.get(keyId) == nil { return "Key not configured" }
+                    if KeychainStore.shared.get(keyId) == nil { return String(localized: "Key not configured") }
                 }
             }
             return nil
@@ -1290,7 +1787,7 @@ struct SidebarBackground: NSViewRepresentable {
 // MARK: - Sidebar row (System Settings style icon)
 
 struct SettingsSidebarRow: View {
-    let title: String
+    let title: LocalizedStringKey
     let icon: String
     let color: String
 
@@ -1310,7 +1807,7 @@ struct SettingsSidebarRow: View {
 // MARK: - Integration filter row (reusable for Vercel / n8n)
 
 struct IntegrationFilterRow: View {
-    let label: String
+    let label: LocalizedStringKey
     let items: [String]
     @Binding var filter: Set<String>
     let loading: Bool
@@ -1326,7 +1823,7 @@ struct IntegrationFilterRow: View {
                 if loading {
                     ProgressView().scaleEffect(0.6)
                 } else {
-                    Button(items.isEmpty ? "Load list" : "Refresh") { onLoad() }
+                    Button(items.isEmpty ? String(localized: "Load list") : String(localized: "Refresh")) { onLoad() }
                         .buttonStyle(.bordered)
                         .controlSize(.mini)
                 }
@@ -1390,7 +1887,7 @@ struct ShortcutRecorderButton: View {
                 return nil
             }
         } label: {
-            Text(isRecording ? "Press keys…" : shortcutLabel)
+            Text(isRecording ? String(localized: "Press keys…") : shortcutLabel)
                 .font(.system(size: 11, design: .monospaced))
                 .padding(.horizontal, 8).padding(.vertical, 3)
                 .background(isRecording ? Color.accentColor.opacity(0.12) : Color(NSColor.controlBackgroundColor))
@@ -1408,14 +1905,14 @@ struct ShortcutRecorderButton: View {
         if f.contains(.shift)   { s += "⇧" }
         if f.contains(.command) { s += "⌘" }
         s += keyChar(code)
-        return s.isEmpty ? "None" : s
+        return s.isEmpty ? String(localized: "None") : s
     }
 
     private func keyChar(_ c: UInt16) -> String {
         let map: [UInt16: String] = [
             0:"A", 1:"S", 2:"D", 3:"F", 4:"H", 5:"G", 6:"Z", 7:"X", 8:"C", 9:"V",
             11:"B", 12:"Q", 13:"W", 14:"E", 15:"R", 16:"Y", 17:"T", 31:"O", 32:"U",
-            34:"I", 37:"L", 38:"J", 40:"K", 45:"N", 46:"M", 49:"Space", 50:"`", 27:"-"
+            34:"I", 37:"L", 38:"J", 40:"K", 45:"N", 46:"M", 49:String(localized: "Space"), 50:"`", 27:"-"
         ]
         return map[c] ?? "·"
     }
