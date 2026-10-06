@@ -543,6 +543,7 @@ final class IslandWindowController: NSWindowController {
             NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.annoyed)
             return
         }
+        if let t = state.focusTask, CmuxJump.jump(for: t) { collapse(); return }
         let terminalBundleIds = ["com.apple.Terminal", "com.googlecode.iterm2",
                                  "net.kovidgoyal.kitty", "com.mitchellh.ghostty"]
         let activated = terminalBundleIds.compactMap { id in

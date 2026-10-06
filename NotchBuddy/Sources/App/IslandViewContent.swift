@@ -179,6 +179,9 @@ struct OverviewView: View {
 
     private func openAgentTarget(_ task: AgentTask?) {
         guard let task else { return }
+        #if !APPSTORE
+        if CmuxJump.jump(for: task) { return }
+        #endif
         switch task.id {
         case "integration_claude":
             let vscodeBundleId = "com.microsoft.VSCode"

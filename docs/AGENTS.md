@@ -65,6 +65,8 @@ The relay adds `coucou_agent` to the JSON it forwards. You can also add it yours
 }
 ```
 
+When Claude Code runs inside the cmux terminal (GitHub build), the relay also adds `cmux_surface_id`, `cmux_workspace_id`, `cmux_socket_path` and `cmux_socket_capability` from the `CMUX_*` environment. Coucou keeps the capability in memory only, to focus the exact surface; it is never logged or written to disk.
+
 Send newline-terminated JSON to the socket:
 - **macOS (GitHub build):** `~/Library/Application Support/NotchBuddy/nb.sock`
 - **macOS (App Store build):** `~/Library/Containers/fr.louisraille.Coucou/Data/nb.sock`
