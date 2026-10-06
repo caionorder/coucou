@@ -152,7 +152,7 @@ final class IslandWindowController: NSWindowController {
             .receive(on: DispatchQueue.main)
             .sink { [weak self] newView in
                 guard let self else { return }
-                if newView == .prompt {
+                if newView == .prompt, !self.state.hermesAnnounceBlocksKey {
                     self.islandPanel.makeKey()
                 }
                 #if !APPSTORE
@@ -620,6 +620,15 @@ final class IslandWindowController: NSWindowController {
             self.expand(to: view)
         }
 
+        // A finished Hermes answer: the island opens on the chat without taking keyboard focus, and folds by
+        // itself after the usual delay (hovering cancels it), like after a hover.
+        NotificationCenter.default.addObserver(forName: .hermesAnnounceExpand, object: nil, queue: .main) { [weak self] note in
+            guard let self, let view = note.object as? IslandView else { return }
+            self.fsm.openedExternally()
+            self.expand(to: view)
+            self.fsm.mouseLeft()
+        }
+
         // Hook server compact reveal (non-alert work events: session start, tool use, etc.)
         NotificationCenter.default.addObserver(forName: .hookReveal, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
@@ -987,6 +996,8 @@ final class IslandWindowController: NSWindowController {
 
     func defaultView() -> IslandView {
         if state.pendingApproval != nil { return .approval }
+        // An unseen Hermes answer, or a turn still running: back to that chat, not the overview.
+        if state.opensOnHermesChat { return .prompt }
         return state.tasks.isEmpty ? .empty : .overview
     }
 
@@ -1010,6 +1021,8 @@ final class IslandWindowController: NSWindowController {
             guard let self else { return }
             self.state.removeTask(id: taskId)
             self.state.isPinned = false
+            // A Hermes answer announced meanwhile keeps the island open.
+            if self.state.hermesAnnounceHoldsIsland { return }
             self.collapse()
         }
         finishedPinTimer = item

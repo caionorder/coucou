@@ -13,6 +13,7 @@ final class AppState: ObservableObject {
             #if !APPSTORE
             if mode != .expanded { clearCmuxPrompt() }
             #endif
+            clearHermesBadgeIfChatShown()
         }
     }
     @Published var view: IslandView = .overview {
@@ -21,6 +22,7 @@ final class AppState: ObservableObject {
             // Every entry to the prompt view that is not the cmux one shows the normal chat.
             if view == .prompt && !cmuxOpeningPrompt { clearCmuxPrompt() }
             #endif
+            clearHermesBadgeIfChatShown()
         }
     }
 
@@ -113,6 +115,8 @@ final class AppState: ObservableObject {
     private func clearChatConversation() {
         chatHistory = []
         ClaudeService.shared.clearConversation()
+        // Cancelled turns end by themselves and release their own count in `hermesTurnsRunning`.
+        for i in tasks.indices where HermesPills.isTaskId(tasks[i].id) { tasks[i].pillBadge = nil }
     }
     @Published var googleChatModel: String = ChatProvider.google.defaultModel {
         didSet { UserDefaults.standard.set(googleChatModel, forKey: "googleChatModel") }
@@ -840,12 +844,97 @@ final class AppState: ObservableObject {
         if rest.map({ $0.id }) != tasks.map({ $0.id }) { tasks = rest }
     }
 
-    /// Pill state of an agent while a chat turn runs (thinking) and when it ends (idle).
+    /// Running chat turns per agent name. The pill stays thinking until the last of them ends.
+    private(set) var hermesTurnsRunning: [String: Int] = [:]
+
+    /// A turn starts (`true`) or ends (`false`) for an agent: the pill is thinking while any turn runs.
     func setHermesPillBusy(agentName: String, _ busy: Bool) {
+        let count = max(0, (hermesTurnsRunning[agentName] ?? 0) + (busy ? 1 : -1))
+        hermesTurnsRunning[agentName] = count == 0 ? nil : count
         guard let id = HermesPills.taskIds(for: hermesAgents.map { $0.name })[agentName],
               let i = tasks.firstIndex(where: { $0.id == id }) else { return }
-        let target: BotState = busy ? .thinking : .idle
+        let target: BotState = count > 0 ? .thinking : .idle
         if tasks[i].state != target { tasks[i].state = target }
+    }
+
+    /// Task id of the pill of the active Hermes agent, when the Hermes chat is the selected one.
+    var activeHermesPillId: String? {
+        guard chatProvider == .hermes, let agent = activeHermesAgent else { return nil }
+        return HermesPills.taskIds(for: hermesAgents.map { $0.name })[agent.name]
+    }
+
+    /// The pill of the active agent carries an answer the user has not seen yet.
+    var hermesHasUnseenAnswer: Bool {
+        guard let id = activeHermesPillId else { return false }
+        return tasks.first { $0.id == id }?.pillBadge == .finished
+    }
+
+    /// A chat turn of the active agent is running.
+    var hermesTurnRunning: Bool {
+        guard chatProvider == .hermes, let agent = activeHermesAgent else { return false }
+        return (hermesTurnsRunning[agent.name] ?? 0) > 0
+    }
+
+    /// An approval or question card is on screen, or cmux cards wait for their turn.
+    var alertCardPending: Bool {
+        if pendingApproval != nil || pendingQuestion != nil { return true }
+        #if !APPSTORE
+        if HookServer.shared.hasQueuedCmuxCards { return true }
+        #endif
+        return false
+    }
+
+    /// The island should open on the Hermes chat rather than the overview.
+    var opensOnHermesChat: Bool {
+        HermesAnnounce.opensOnChat(hermesChatActive: activeHermesPillId != nil, unseenAnswer: hermesHasUnseenAnswer,
+                                   turnRunning: hermesTurnRunning, alertPending: alertCardPending)
+    }
+
+    /// The cmux prompt occupies the prompt slot, or is being opened (the view changes before `cmuxPrompt` is set).
+    private var cmuxPromptIsOpenOrOpening: Bool {
+        #if !APPSTORE
+        return cmuxPrompt != nil || cmuxOpeningPrompt
+        #else
+        return false
+        #endif
+    }
+
+    /// Set when an announced answer takes the screen: it is not the user's own opening of the chat, so it must not
+    /// take keyboard focus, and the delayed collapses of earlier alerts must not close it right away.
+    private(set) var hermesAnnounceAt: Date = .distantPast
+    /// The panel must not become key for an announced answer (keystrokes meant for another app).
+    var hermesAnnounceBlocksKey: Bool { Date().timeIntervalSince(hermesAnnounceAt) < 1 }
+    /// A pending collapse from an earlier alert (approval note 3 s, finished pin 5.2 s) must leave an announced answer open.
+    var hermesAnnounceHoldsIsland: Bool { Date().timeIntervalSince(hermesAnnounceAt) < 8 }
+
+    /// The badge of the answer goes away once the chat with that agent is on screen.
+    private func clearHermesBadgeIfChatShown() {
+        guard let id = activeHermesPillId,
+              let i = tasks.firstIndex(where: { $0.id == id }), tasks[i].pillBadge != nil else { return }
+        guard HermesAnnounce.chatIsShown(expanded: mode == .expanded, viewIsChat: view == .prompt,
+                                         cmuxPromptOpen: cmuxPromptIsOpenOrOpening) else { return }
+        tasks[i].pillBadge = nil
+    }
+
+    /// A finished turn: tells the user when the chat is not on screen. Sound and badge always, the island
+    /// comes back to `target` (the chat, or the error note) unless an approval or question card holds the screen.
+    @discardableResult
+    func announceHermesTurn(agentName: String, failed: Bool, view target: IslandView) -> HermesAnnounce.Outcome {
+        let outcome = HermesAnnounce.decide(expanded: mode == .expanded, viewIsChat: view == .prompt,
+                                            cmuxPromptOpen: cmuxPromptIsOpenOrOpening, alertPending: alertCardPending)
+        guard outcome != .none else { return outcome }
+        SoundEngine.shared.play(failed ? "error" : "finish")
+        let pillId = HermesPills.taskIds(for: hermesAgents.map { $0.name })[agentName]
+        // An error that takes the screen is read on the spot: no badge left behind.
+        if let pillId, let i = tasks.firstIndex(where: { $0.id == pillId }), !(failed && outcome == .expand) {
+            tasks[i].pillBadge = failed ? .error : .finished
+        }
+        guard outcome == .expand else { return outcome }
+        if let pillId, tasks.contains(where: { $0.id == pillId }) { focusId = pillId }
+        hermesAnnounceAt = Date()
+        if mode == .expanded { view = target }
+        else { NotificationCenter.default.post(name: .hermesAnnounceExpand, object: target) }
+        return outcome
     }
 
     /// Toggle a catalog pill on/off.

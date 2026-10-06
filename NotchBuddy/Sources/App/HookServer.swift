@@ -121,6 +121,8 @@ final class HookServer: @unchecked Sendable {
         state.noteMessage = note
         state.view = .note
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            // A Hermes answer announced meanwhile keeps the island open.
+            if AppState.shared.hermesAnnounceHoldsIsland { return }
             NotificationCenter.default.post(name: .islandCollapse, object: nil)
         }
     }
@@ -1294,6 +1296,10 @@ final class HookServer: @unchecked Sendable {
         }
         pruneStaleCmux()
     }
+
+    /// cmux cards wait for the card slot.
+    @MainActor
+    var hasQueuedCmuxCards: Bool { !cmuxQueue.cards.isEmpty }
 
     /// True when the task has a queued card or owns the card on screen.
     @MainActor
@@ -2593,6 +2599,8 @@ final class HookServer: @unchecked Sendable {
 
 extension Notification.Name {
     static let hookExpand = Notification.Name("notchBuddy.hookExpand")
+    /// A finished Hermes answer opens the collapsed island: like `hookExpand`, then the island closes by itself.
+    static let hermesAnnounceExpand = Notification.Name("notchBuddy.hermesAnnounceExpand")
 }
 
 // MARK: - nb-hook shell wrapper (same for both GitHub and App Store)

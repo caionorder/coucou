@@ -190,7 +190,12 @@ final class ClaudeService {
 
     /// Bumped on every clear: a request that started before a clear must not touch the new conversation.
     private var conversationGeneration = 0
-    private var hermesTask: Task<String, Error>?
+    /// Hermes turns in flight, by id. A second message may start while the first still runs.
+    private struct HermesTurn {
+        var task: Task<String, Error>?
+        var hasText = false
+    }
+    private var hermesTurns: [UUID: HermesTurn] = [:]
     /// Stored server session of the current conversation with a signed-in Hermes agent (nil = none yet).
     private var hermesServerSession: String?
 
@@ -198,8 +203,27 @@ final class ClaudeService {
         conversationMessages = []
         hermesServerSession = nil
         conversationGeneration += 1
-        hermesTask?.cancel()
-        hermesTask = nil
+        for turn in hermesTurns.values { turn.task?.cancel() }
+        hermesTurns = [:]
+    }
+
+    /// The typing dots show while a running turn has not produced text yet. Every override this code sets (dots, or
+    /// the error left by a failed sibling turn) is dropped by the rule in `HermesAnnounce.typingOverride`.
+    private func refreshHermesTyping(_ state: AppState) {
+        let current: HermesAnnounce.Override
+        switch state.stateOverride {
+        case nil: current = .none
+        case .some(.thinking): current = .thinking
+        case .some(.error): current = .error
+        default: current = .other
+        }
+        let next = HermesAnnounce.typingOverride(current: current, anyTurnWaiting: hermesTurns.values.contains { !$0.hasText })
+        guard next != current else { return }
+        switch next {
+        case .none: state.stateOverride = nil
+        case .thinking: state.stateOverride = .thinking
+        case .error, .other: break
+        }
     }
 
     /// Resolved once: NSFullUserName() is a system call, and the name cannot change under us
@@ -506,17 +530,23 @@ final class ClaudeService {
         let placeholder = ChatMessage(role: .assistant, content: "")
         let msgId = placeholder.id
         state.chatHistory.append(placeholder)
-        state.stateOverride = .thinking
+        let turnId = UUID()
+        hermesTurns[turnId] = HermesTurn(task: nil, hasText: false)
+        refreshHermesTyping(state)
         state.setHermesPillBusy(agentName: agent.name, true)
         defer { state.setHermesPillBusy(agentName: agent.name, false) }
+        let startedAt = Date()
+        appendAppLog("nb.log", "hermes turn started signIn=\(signIn)")
         let body: [String: Any] = ["model": agent.modelName, "messages": msgs, "stream": true]
         let encodedBody = signIn ? Data() : ((try? JSONSerialization.data(withJSONObject: body)) ?? Data())
         let generation = conversationGeneration
         let storedSession = hermesServerSession
         let task = Task { [state, msgId] () async throws -> String in
             let onToken: @MainActor (String) -> Void = { visible in
-                if !visible.isEmpty, state.stateOverride == .thinking {
-                    state.stateOverride = nil   // hide typing dots on first visible text
+                if !visible.isEmpty, self.hermesTurns[turnId]?.hasText == false {
+                    self.hermesTurns[turnId]?.hasText = true   // hide typing dots once no turn waits for text
+                    appendAppLog("nb.log", "hermes turn first text after=\(Self.seconds(since: startedAt))s")
+                    self.refreshHermesTyping(state)
                 }
                 if let idx = state.chatHistory.firstIndex(where: { $0.id == msgId }) {
                     state.chatHistory[idx].content = visible
@@ -533,35 +563,57 @@ final class ClaudeService {
             }
             return try await HermesChat.streamChat(agent: agent, key: key, encodedBody: encodedBody, onToken: onToken)
         }
-        hermesTask = task
+        hermesTurns[turnId]?.task = task
         do {
             let final = try await task.value
+            hermesTurns[turnId] = nil
             guard generation == conversationGeneration else {
-                if hermesTask == nil, state.stateOverride == .thinking { state.stateOverride = nil }
+                appendAppLog("nb.log", "hermes turn discarded (conversation cleared) after=\(Self.seconds(since: startedAt))s")
+                refreshHermesTyping(state)
                 return
             }
-            hermesTask = nil
             conversationMessages.append(["role": "assistant", "content": final])
             if let idx = state.chatHistory.firstIndex(where: { $0.id == msgId }) {
                 state.chatHistory[idx].content = final
             }
-            state.stateOverride = nil
-            state.view = .prompt
+            refreshHermesTyping(state)
+            appendAppLog("nb.log", "hermes turn finished duration=\(Self.seconds(since: startedAt))s chars=\(final.count)")
+            // Chat on screen: nothing changes. Otherwise sound, badge and back to the chat.
+            state.announceHermesTurn(agentName: agent.name, failed: false, view: .prompt)
             NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
         } catch {
+            hermesTurns[turnId] = nil
             guard generation == conversationGeneration else {
                 // Cleared meanwhile: leave the new conversation alone, only stop the typing dots
-                // when no newer Hermes request has taken over.
-                if hermesTask == nil, state.stateOverride == .thinking { state.stateOverride = nil }
+                // when no newer Hermes request is still waiting for its first text.
+                appendAppLog("nb.log", "hermes turn discarded (conversation cleared) after=\(Self.seconds(since: startedAt))s")
+                refreshHermesTyping(state)
                 return
             }
-            hermesTask = nil
-            if !conversationMessages.isEmpty { conversationMessages.removeLast() }
+            // Remove this turn's own message: a sibling turn may have added its own after it.
+            if let own = conversationMessages.lastIndex(where: { ($0["role"] as? String) == "user" && ($0["content"] as? String) == userText }) {
+                conversationMessages.remove(at: own)
+            }
             state.chatHistory.removeAll { $0.id == msgId }
-            state.stateOverride = nil
+            refreshHermesTyping(state)
             let msg = (error as? HermesChatError)?.userMessage ?? String(localized: "Hermes request failed.")
-            await showError(msg, state: state)
+            appendAppLog("nb.log", "hermes turn failed after=\(Self.seconds(since: startedAt))s error=\(Self.errorCaseName(error))")
+            let outcome = state.announceHermesTurn(agentName: agent.name, failed: true, view: .note)
+            // A card on screen keeps the screen: the error is only signalled by the sound and the pill badge.
+            if outcome == .badgeOnly {
+                // The text waits in the chat for when it is next shown.
+                state.chatHistory.append(ChatMessage(role: .assistant, content: msg))
+            } else { await showError(msg, state: state) }
         }
+    }
+
+    private static func seconds(since start: Date) -> String { String(format: "%.1f", Date().timeIntervalSince(start)) }
+
+    /// Case name of an error, never its associated values (they may carry a host or a server text).
+    private static func errorCaseName(_ error: Error) -> String {
+        if error is CancellationError { return "cancelled" }
+        if error is HermesChatError { return String(String(describing: error).prefix { $0 != "(" }) }
+        return "other"
     }
 
     // MARK: - Structured search (M8 — window attach + web search)
