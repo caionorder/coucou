@@ -1484,6 +1484,17 @@
         }
       }
     },
+    "Drag to resize the chat · double-click to expand or reduce" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arraste para redimensionar o chat · duplo clique para expandir ou reduzir"
+          }
+        }
+      }
+    },
     "Drop a file or window, or ask me anything." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1568,6 +1579,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Erro"
+          }
+        }
+      }
+    },
+    "Expand chat" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Expandir o chat"
           }
         }
       }
@@ -3312,6 +3334,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Precisa reconectar"
+          }
+        }
+      }
+    },
+    "Reduce chat" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reduzir o chat"
           }
         }
       }

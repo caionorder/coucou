@@ -21,6 +21,8 @@ struct CmuxPromptView: View {
     /// Folder lookups hit the file system: done on appear and when the lists change, not per render.
     @State private var folders: [String] = []
     @FocusState private var focused: Bool
+    /// Follow the newest text unless the user scrolled up.
+    @State private var pinned = true
 
     private var mode: CmuxPromptMode { state.cmuxPrompt ?? .newChat }
 
@@ -159,6 +161,7 @@ struct CmuxPromptView: View {
             .padding(.top, 12)
             .padding(.bottom, 14)
         }
+        .overlay(alignment: .bottom) { ChatResizeGrip(state: state) }
         .padding(.bottom, 10)
         .onAppear {
             focused = true
@@ -193,9 +196,10 @@ struct CmuxPromptView: View {
                     }
                     .padding(.vertical, 2)
                 }
-                .onChange(of: transcript) { _, _ in scrollToEnd(proxy) }
-                .onChange(of: typing) { _, _ in scrollToEnd(proxy) }
-                .onAppear { scrollToEnd(proxy) }
+                .pinnedScrollTracking($pinned) { scrollToEnd(proxy) }
+                .onChange(of: transcript) { _, _ in if pinned { scrollToEnd(proxy) } }
+                .onChange(of: typing) { _, _ in if pinned { scrollToEnd(proxy) } }
+                .onAppear { pinned = true; scrollToEnd(proxy) }
             }
             .frame(maxHeight: .infinity)
         } else {
@@ -273,6 +277,7 @@ struct CmuxPromptView: View {
     private func send() {
         guard canSubmit else { return }
         let prompt = text
+        pinned = true
         state.cmuxNotice = nil
         switch mode {
         case .reply(let id):

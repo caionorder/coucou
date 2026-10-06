@@ -1194,6 +1194,8 @@ struct PromptView: View {
     @State private var text: String = ""
     @FocusState private var focused: Bool
     @State private var showModelPicker = false
+    /// Follow the newest text unless the user scrolled up.
+    @State private var pinned = true
 
     var body: some View {
         ZStack(alignment: .leading) {
@@ -1218,12 +1220,20 @@ struct PromptView: View {
                             }
                             .padding(.vertical, 2)
                         }
+                        .pinnedScrollTracking($pinned) {
+                            if state.stateOverride != nil { proxy.scrollTo("typing", anchor: .bottom) }
+                            else if let last = state.chatHistory.last(where: { !$0.content.isEmpty }) {
+                                proxy.scrollTo(last.id, anchor: .bottom)
+                            }
+                        }
                         .onChange(of: state.chatHistory) { _, _ in
+                            guard pinned else { return }
                             if let last = state.chatHistory.last(where: { !$0.content.isEmpty }) {
                                 proxy.scrollTo(last.id, anchor: .bottom)
                             }
                         }
                         .onChange(of: state.stateOverride) { _, v in
+                            guard pinned else { return }
                             if v != nil {
                                 withAnimation { proxy.scrollTo("typing", anchor: .bottom) }
                             } else if let last = state.chatHistory.last(where: { !$0.content.isEmpty }) {
@@ -1231,6 +1241,7 @@ struct PromptView: View {
                             }
                         }
                         .onAppear {
+                            pinned = true
                             if let last = state.chatHistory.last {
                                 proxy.scrollTo(last.id, anchor: .bottom)
                             }
@@ -1297,6 +1308,7 @@ struct PromptView: View {
             .padding(.top, 12)
             .padding(.bottom, 14)
         }
+        .overlay(alignment: .bottom) { ChatResizeGrip(state: state) }
         .padding(.bottom, 10)
         .onAppear { focused = true }
         .onChange(of: state.view) { _, view in
@@ -1327,6 +1339,7 @@ struct PromptView: View {
         guard !query.isEmpty else { return }
         text = ""
         focused = false
+        pinned = true
         state.chatHistory.append(ChatMessage(role: .user, content: query))
         state.stateOverride = .thinking
         Task {

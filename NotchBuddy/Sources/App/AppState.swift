@@ -551,6 +551,45 @@ final class AppState: ObservableObject {
         return chatHistory.count
     }
 
+    // MARK: Chat height (the user can stretch the chat card; see ChatHeight)
+
+    /// Height the user chose for the chat; nil = never stretched. Persisted, raw (clamped when read).
+    @Published private(set) var chatStretchedHeight: CGFloat? = ChatHeight.storedValue(
+        from: UserDefaults.standard.double(forKey: ChatHeight.defaultsKey))
+    /// Tallest the chat may be on the screen the island is on; the window controller keeps it current.
+    @Published var chatMaxHeight: CGFloat = ChatHeight.defaultCap
+    /// Height of the island panel (320 until the chat has been stretched); the window controller keeps it current.
+    @Published var panelHeight: CGFloat = ChatHeight.basePanelHeight
+    /// True while the grip is being dragged: the island follows the pointer without animation and stays open.
+    @Published var chatResizing = false
+    /// Set when the pointer reaches the grip: the panel grows before the mouse goes down, not inside the drag.
+    @Published var chatRoomRequested = false
+
+    /// Height of the chat card for the current messages and the user's stretch.
+    var chatPromptHeight: CGFloat {
+        ChatHeight.resolve(messageCount: promptMessageCount, stored: chatStretchedHeight, maximum: chatMaxHeight)
+    }
+    var chatCanStretch: Bool {
+        ChatHeight.canStretch(messageCount: promptMessageCount, maximum: chatMaxHeight)
+    }
+    var chatIsStretched: Bool {
+        ChatHeight.isStretched(messageCount: promptMessageCount, stored: chatStretchedHeight, maximum: chatMaxHeight)
+    }
+
+    /// Sets the stretch; `persist: false` while dragging (written once when the drag ends).
+    func setChatStretch(_ height: CGFloat?, persist: Bool = true) {
+        chatStretchedHeight = height
+        guard persist else { return }
+        if let height { UserDefaults.standard.set(Double(height), forKey: ChatHeight.defaultsKey) }
+        else { UserDefaults.standard.removeObject(forKey: ChatHeight.defaultsKey) }
+    }
+
+    /// Double click on the grip, or the header button.
+    func toggleChatStretch() {
+        setChatStretch(ChatHeight.toggled(messageCount: promptMessageCount,
+                                          stored: chatStretchedHeight, maximum: chatMaxHeight))
+    }
+
     // Pending approval request from Claude Code hook
     @Published var pendingApproval: ApprovalInfo? = nil
 
