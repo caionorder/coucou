@@ -18,32 +18,27 @@ enum CmuxJump {
 
         // Ids or token missing: cmux is in front on whatever surface it had.
         guard let s = HookServer.shared.cmuxSurface(for: task.id), s.canFocusExactly,
-              CmuxRouting.isValidSocketPath(s.socketPath),
-              CmuxRouting.socketFileIsTrusted(path: s.socketPath) else { return true }
+              CmuxRouting.isValidSocketPath(s.socketPath) else { return true }
         let bundles = candidates.compactMap { $0.bundleURL }
-
-        // The capability goes through the child's environment only, never argv, never logged.
-        let env: [String: String] = [
-            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-            "HOME": NSHomeDirectory(),
-            "CMUX_SOCKET_PATH": s.socketPath,
-            "CMUX_SOCKET_CAPABILITY": s.capability,
-            "CMUX_WORKSPACE_ID": s.workspaceId,
-            "CMUX_SURFACE_ID": s.surfaceId,
-        ]
         let workspace = s.workspaceId, surface = s.surfaceId
         DispatchQueue.global(qos: .userInitiated).async {
-            // The signature check hashes the bundle: keep it off the main thread.
-            // Only a bundle that passes the check is ever executed; otherwise cmux was just activated.
+            // The signature check hashes the bundle and the peer check blocks up to a second: keep both
+            // off the main thread. Only a bundle that passes the check is ever executed, and the token
+            // is put in the environment only after the socket file and its listener are verified.
             guard let bundle = bundles.first(where: bundleIsCmux) else {
                 appendAppLog("nb.log", "cmux focus skipped: app signature not verified")
                 return
             }
             let cli = bundle.appendingPathComponent("Contents/Resources/bin/cmux")
             guard FileManager.default.isExecutableFile(atPath: cli.path) else { return }
-            let first = run(cli: cli, args: ["select-workspace", "--workspace", workspace], env: env)
+            // The capability goes through the child's environment only, never argv, never logged.
+            guard case .success(let env) = CmuxControl.verifiedEnvironment(for: .token(s)) else {
+                appendAppLog("nb.log", "cmux focus skipped: socket not verified")
+                return
+            }
+            let first = CmuxControl.run(cli: cli, args: ["select-workspace", "--workspace", workspace], env: env).status
             if first != 0 { appendAppLog("nb.log", "cmux focus failed rc=\(first)"); return }
-            let second = run(cli: cli, args: ["focus-panel", "--panel", surface, "--workspace", workspace], env: env)
+            let second = CmuxControl.run(cli: cli, args: ["focus-panel", "--panel", surface, "--workspace", workspace], env: env).status
             if second != 0 { appendAppLog("nb.log", "cmux focus failed rc=\(second)") }
         }
         return true
@@ -57,30 +52,6 @@ enum CmuxJump {
         guard SecRequirementCreateWithString(CmuxRouting.codeRequirement as CFString, [], &requirement) == errSecSuccess,
               let requirement else { return false }
         return SecStaticCodeCheckValidity(code, [], requirement) == errSecSuccess
-    }
-
-    /// Runs the CLI with a 2 s watchdog. Returns the exit status, or -1 when it could not run.
-    private nonisolated static func run(cli: URL, args: [String], env: [String: String]) -> Int32 {
-        let p = Process()
-        p.executableURL = cli
-        p.arguments = args
-        p.environment = env
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        p.standardInput = FileHandle.nullDevice
-        let done = DispatchSemaphore(value: 0)
-        p.terminationHandler = { _ in done.signal() }
-        do { try p.run() } catch { return -1 }
-        if done.wait(timeout: .now() + 2) == .timedOut {
-            p.terminate()
-            if done.wait(timeout: .now() + 1) == .timedOut {
-                // Ignored SIGTERM: the child holds the token in its environment, do not leave it running.
-                kill(p.processIdentifier, SIGKILL)
-                _ = done.wait(timeout: .now() + 1)
-            }
-            return -2
-        }
-        return p.terminationStatus
     }
 }
 

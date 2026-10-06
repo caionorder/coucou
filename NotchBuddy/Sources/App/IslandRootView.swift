@@ -35,7 +35,7 @@ struct IslandContainer: View {
     private var chatPromptHeight: CGFloat {
         let base: CGFloat = 240
         let perMsg: CGFloat = 40
-        return min(300, base + CGFloat(state.chatHistory.count) * perMsg)
+        return min(300, base + CGFloat(state.promptMessageCount) * perMsg)
     }
 
     /// Pixels the content must be pushed down to clear the concave ear transparent area.
@@ -147,7 +147,7 @@ struct IslandContainer: View {
                 islandHeight = newView == .prompt ? chatPromptHeight : h
             }
         }
-        .onChange(of: state.chatHistory.count) { _, _ in
+        .onChange(of: state.promptMessageCount) { _, _ in
             guard state.mode == .expanded, state.view == .prompt else { return }
             withAnimation(openSpring) { islandHeight = chatPromptHeight }
         }
@@ -472,6 +472,8 @@ struct IslandHeader: View {
                 TabButton(icon: "house.fill", view: .overview, state: state)
                 TabButton(icon: "bubble.left.fill", view: .prompt, state: state, preAction: {
                     #if !APPSTORE
+                    // The chat tab always opens the normal chat, never a cmux reply.
+                    state.cmuxPrompt = nil
                     if state.promptContext == nil {
                         state.promptContext = WindowContextCapture.captureActive(from: state.lastExternalApp)
                     }

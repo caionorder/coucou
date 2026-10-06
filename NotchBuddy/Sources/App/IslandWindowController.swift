@@ -155,8 +155,28 @@ final class IslandWindowController: NSWindowController {
                 if newView == .prompt {
                     self.islandPanel.makeKey()
                 }
+                #if !APPSTORE
+                // The cmux prompt lives in the .prompt slot only.
+                if newView != .prompt {
+                    self.state.cmuxPrompt = nil
+                    self.state.cmuxNotice = nil
+                }
+                #endif
             }
     }
+
+    #if !APPSTORE
+    /// Opens the reply / new chat prompt of cmux in the `.prompt` slot.
+    func openCmuxPrompt(_ mode: CmuxPromptMode) {
+        state.cmuxNotice = nil
+        islandPanel.makeKey()
+        // AppState clears the cmux prompt on every other entry to the prompt view; this one keeps it.
+        state.cmuxOpeningPrompt = true
+        expand(to: .prompt)
+        state.cmuxPrompt = mode
+        state.cmuxOpeningPrompt = false
+    }
+    #endif
 
     // MARK: - FSM wiring
 
@@ -584,6 +604,14 @@ final class IslandWindowController: NSWindowController {
                 }
             }
         }
+
+        #if !APPSTORE
+        NotificationCenter.default.addObserver(forName: .openCmuxPrompt, object: nil, queue: .main) { [weak self] note in
+            guard let self, let mode = note.object as? CmuxPromptModeBox else { return }
+            self.fsm.openedExternally()
+            self.openCmuxPrompt(mode.mode)
+        }
+        #endif
 
         // Hook server expand requests (alerts only)
         NotificationCenter.default.addObserver(forName: .hookExpand, object: nil, queue: .main) { [weak self] note in
@@ -1021,7 +1049,7 @@ final class IslandWindowController: NSWindowController {
         if s.mode == .expanded && s.view == .prompt {
             let base: CGFloat = 240
             let perMsg: CGFloat = 40
-            islandH = min(300, base + CGFloat(s.chatHistory.count) * perMsg)
+            islandH = min(300, base + CGFloat(s.promptMessageCount) * perMsg)
         } else {
             islandH = fixedH
         }
@@ -1086,7 +1114,7 @@ final class IslandPanel: NSPanel {
         if s.mode == .expanded && s.view == .prompt {
             let base: CGFloat = 240
             let perMsg: CGFloat = 40
-            h = min(300, base + CGFloat(s.chatHistory.count) * perMsg)
+            h = min(300, base + CGFloat(s.promptMessageCount) * perMsg)
         } else {
             h = fixedH
         }
@@ -1130,6 +1158,9 @@ extension Notification.Name {
     static let islandToggleDiff           = Notification.Name("notchBuddy.islandToggleDiff")
     static let islandActivateCardSelection = Notification.Name("notchBuddy.islandActivateCardSelection")
     static let openFullSettings    = Notification.Name("notchBuddy.openFullSettings")
+    #if !APPSTORE
+    static let openCmuxPrompt      = Notification.Name("notchBuddy.openCmuxPrompt")
+    #endif
     static let hookReveal       = Notification.Name("notchBuddy.hookReveal")
     static let musicReveal      = Notification.Name("notchBuddy.musicReveal")
     // Greeting ↔ IslandWindowController

@@ -44,6 +44,10 @@ Vérifier dans la doc la liste exacte des événements et leurs champs.
 - Une seule carte d'approbation ou de question est affichée à la fois. Les suivantes (autres surfaces) attendent en file, sans son, et passent à leur tour ; chacune demande son propre clic. Une demande en file qui expire ou qui est réglée dans le terminal est retirée sans réponse.
 - Avec le lien iPhone activé, les sessions cmux sont relayées comme les sessions VS Code ; le jeton cmux n'en fait jamais partie.
 - Codex, Gemini et Antigravity lancés dans cmux gardent leur pastille actuelle.
+- **cmux comme pastille Main** (version GitHub) : `integration_cmux` est une pastille hub (statut, `New chat`, `Open cmux`) qui ne reçoit aucun événement de hook. Les sessions restent des pastilles `agent_cmux_<surface>` ; avec cmux en Main, une nouvelle session prend le focus seulement si le focus est sur le hub et que la vue le permet.
+- **Répondre** à une session depuis le notch : le texte part par `cmux rpc surface.send_text` puis `surface.send_key` (`enter`), JSON construit par `JSONSerialization`, passé comme un seul argument de processus, jamais par un shell. L'envoi est désactivé tant que la session attend une approbation ou une question.
+- **Nouveau chat** : `cmux new-workspace --cwd <dossier> --command <commande de lancement>` (`claude` par défaut, réglable dans Réglages › Agents › cmux). Le prompt n'est jamais dans la commande : il est tapé une seule fois, à la réception du `SessionStart` de la nouvelle surface. Sans session ouverte, un mot de passe de socket (Keychain, clé `cmux-socket-password`) est nécessaire ; il passe par l'environnement du processus fils uniquement.
+- Chaque pastille de session cmux a une couleur et une forme d'yeux dérivées de l'identifiant de surface, stables pendant la session.
 
 ### Approuver depuis le notch
 - Sur `PermissionRequest`, `nb-hook` **attend** la décision de l'app (défaut 110 s, réglable) puis écrit sur stdout le JSON de décision du hook (d'après la doc actuelle : `hookSpecificOutput` avec `decision.behavior` = `allow` ou `deny`). Timeout du hook dans settings.json : décision + 10 s.

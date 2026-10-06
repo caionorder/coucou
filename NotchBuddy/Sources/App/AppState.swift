@@ -8,8 +8,21 @@ final class AppState: ObservableObject {
     static let shared = AppState()
 
     // Island state
-    @Published var mode: IslandMode = .hidden
-    @Published var view: IslandView = .overview
+    @Published var mode: IslandMode = .hidden {
+        didSet {
+            #if !APPSTORE
+            if mode != .expanded { clearCmuxPrompt() }
+            #endif
+        }
+    }
+    @Published var view: IslandView = .overview {
+        didSet {
+            #if !APPSTORE
+            // Every entry to the prompt view that is not the cmux one shows the normal chat.
+            if view == .prompt && !cmuxOpeningPrompt { clearCmuxPrompt() }
+            #endif
+        }
+    }
 
     // Tasks
     @Published var tasks: [AgentTask] = []
@@ -90,7 +103,16 @@ final class AppState: ObservableObject {
 
     // In-chat provider + model — picked via the model selector in the prompt view
     @Published var chatProvider: ChatProvider = .anthropic {
-        didSet { UserDefaults.standard.set(chatProvider.rawValue, forKey: "chatProvider") }
+        didSet {
+            UserDefaults.standard.set(chatProvider.rawValue, forKey: "chatProvider")
+            // The conversation never crosses to or from a Hermes agent (other switches keep it).
+            if (oldValue == .hermes) != (chatProvider == .hermes) { clearChatConversation() }
+        }
+    }
+
+    private func clearChatConversation() {
+        chatHistory = []
+        ClaudeService.shared.clearConversation()
     }
     @Published var googleChatModel: String = ChatProvider.google.defaultModel {
         didSet { UserDefaults.standard.set(googleChatModel, forKey: "googleChatModel") }
@@ -110,6 +132,61 @@ final class AppState: ObservableObject {
     @Published var lmstudioServerURL: String = "" {
         didSet { UserDefaults.standard.set(lmstudioServerURL, forKey: "lmstudioServerURL") }
     }
+    // Hermes agents: the list holds no secret (keys live in the Keychain item "hermes-agent-keys")
+    @Published var hermesAgents: [HermesAgent] = [] {
+        didSet { UserDefaults.standard.set(HermesChat.encodeAgents(hermesAgents), forKey: "hermesAgents") }
+    }
+    @Published var hermesChatAgent: String = "" {
+        didSet { UserDefaults.standard.set(hermesChatAgent, forKey: "hermesChatAgent") }
+    }
+    /// The agent picked in the chat (by name), else the first configured one.
+    var activeHermesAgent: HermesAgent? {
+        hermesAgents.first(where: { $0.name == hermesChatAgent }) ?? hermesAgents.first
+    }
+
+    /// Picks the Hermes agent used by the chat. Each agent is a separate conversation partner, so the
+    /// conversation is cleared when the active agent changes.
+    func selectHermesAgent(_ name: String) {
+        let previous = activeHermesAgent?.name
+        hermesChatAgent = name
+        guard name != previous else { return }
+        clearChatConversation()
+    }
+
+    /// Stores the agent and its key bound to its URL and profile (Keychain only), then selects it.
+    func addHermesAgent(_ agent: HermesAgent, key: String) {
+        var keys = HermesChat.decodeKeys(KeychainStore.shared.get("hermes-agent-keys") ?? "")
+        keys[agent.name] = HermesChat.KeyRecord(key: key, baseURL: agent.baseURL, profile: agent.profile)
+        KeychainStore.shared.set("hermes-agent-keys", value: HermesChat.encodeKeys(keys))
+        let previous = activeHermesAgent
+        hermesAgents.removeAll { $0.name == agent.name }
+        hermesAgents.append(agent)
+        fetchedProviderModels[.hermes] = nil
+        providerModelFetchError[.hermes] = nil
+        hermesChatAgent = agent.name
+        // Only a Hermes conversation is tied to the active agent.
+        if chatProvider == .hermes, previous != agent { clearChatConversation() }
+    }
+
+    /// True when the key stored for `agent` is bound to its current URL and profile.
+    func isHermesAgentBound(_ agent: HermesAgent) -> Bool {
+        if case .success = HermesChat.boundKey(for: agent, in: HermesChat.decodeKeys(KeychainStore.shared.get("hermes-agent-keys") ?? "")) { return true }
+        return false
+    }
+
+    func removeHermesAgent(named name: String) {
+        let wasActive = activeHermesAgent?.name == name
+        var keys = HermesChat.decodeKeys(KeychainStore.shared.get("hermes-agent-keys") ?? "")
+        keys[name] = nil
+        if keys.isEmpty { KeychainStore.shared.remove("hermes-agent-keys") }
+        else { KeychainStore.shared.set("hermes-agent-keys", value: HermesChat.encodeKeys(keys)) }
+        hermesAgents.removeAll { $0.name == name }
+        fetchedProviderModels[.hermes] = nil
+        providerModelFetchError[.hermes] = nil
+        if hermesChatAgent == name { hermesChatAgent = hermesAgents.first?.name ?? "" }
+        if wasActive, chatProvider == .hermes { clearChatConversation() }
+        if hermesAgents.isEmpty, chatProvider == .hermes { chatProvider = .anthropic }
+    }
 
     // The always-on workspace pill (default: VS Code). Persisted.
     @Published var mainPillId: String = PillCatalog.defaultMainPillId {
@@ -126,6 +203,19 @@ final class AppState: ObservableObject {
     func fetchModelsIfNeeded(for provider: ChatProvider) {
         guard !loadingProviderModels.contains(provider),
               fetchedProviderModels[provider] == nil else { return }
+        // Hermes: the picker lists the configured agents (local list, no network call)
+        if provider == .hermes {
+            if hermesAgents.isEmpty {
+                providerModelFetchError[.hermes] = "Connect a Hermes agent in Settings → Chat first."
+            } else {
+                fetchedProviderModels[.hermes] = hermesAgents.map { (id: $0.name, label: $0.name) }
+                providerModelFetchError.removeValue(forKey: .hermes)
+                if !hermesAgents.contains(where: { $0.name == hermesChatAgent }) {
+                    selectHermesAgent(hermesAgents[0].name)
+                }
+            }
+            return
+        }
         // Local providers: fetch from server URL (no API key needed)
         if provider.isLocal {
             let baseURL = provider == .ollama ? ollamaServerURL : lmstudioServerURL
@@ -173,7 +263,7 @@ final class AppState: ObservableObject {
             case .anthropic: models = await ClaudeService.fetchModels(apiKey: apiKey)
             case .google:    models = await ClaudeService.fetchGoogleModels(apiKey: apiKey)
             case .openai:    models = await ClaudeService.fetchOpenAIModels(apiKey: apiKey)
-            case .ollama, .lmstudio: models = []  // handled above
+            case .ollama, .lmstudio, .hermes: models = []  // handled above
             }
             loadingProviderModels.remove(provider)
             if models.isEmpty {
@@ -193,7 +283,7 @@ final class AppState: ObservableObject {
                     if !models.contains(where: { $0.id == openAIChatModel }) {
                         openAIChatModel = models.first(where: { $0.id.contains("mini") })?.id ?? models.first!.id
                     }
-                case .ollama, .lmstudio: break
+                case .ollama, .lmstudio, .hermes: break
                 }
             }
         }
@@ -207,6 +297,7 @@ final class AppState: ObservableObject {
         case .openai:    return openAIChatModel
         case .ollama:    return ollamaChatModel
         case .lmstudio:  return lmstudioChatModel
+        case .hermes:    return activeHermesAgent?.name ?? "Hermes"
         }
     }
 
@@ -324,6 +415,47 @@ final class AppState: ObservableObject {
     // Chat conversation history
     @Published var chatHistory: [ChatMessage] = []
 
+    #if !APPSTORE
+    // cmux as the main workspace: the reply / new chat prompt, per session transcripts, settings.
+    @Published var cmuxPrompt: CmuxPromptMode? = nil {
+        didSet { if cmuxPrompt == nil { cmuxDraft = nil } }
+    }
+    /// True only while `IslandWindowController.openCmuxPrompt` switches to the prompt view.
+    var cmuxOpeningPrompt = false
+    @Published var cmuxTranscripts: [String: [ChatMessage]] = [:]
+    @Published var cmuxNotice: String? = nil
+    @Published var cmuxBusy = false
+    @Published var cmuxDraft: CmuxDraft? = nil
+    @Published var cmuxRecentFolders: [String] = UserDefaults.standard.stringArray(forKey: "cmuxRecentFolders") ?? [] {
+        didSet { UserDefaults.standard.set(cmuxRecentFolders, forKey: "cmuxRecentFolders") }
+    }
+    @Published var cmuxDefaultFolder: String = UserDefaults.standard.string(forKey: "cmuxDefaultFolder") ?? "" {
+        didSet { UserDefaults.standard.set(cmuxDefaultFolder, forKey: "cmuxDefaultFolder") }
+    }
+    @Published var cmuxLaunchCommand: String = UserDefaults.standard.string(forKey: "cmuxLaunchCommand") ?? "claude" {
+        didSet { UserDefaults.standard.set(cmuxLaunchCommand, forKey: "cmuxLaunchCommand") }
+    }
+
+    /// Closes the cmux prompt (reply / new chat) and its notice and draft.
+    func clearCmuxPrompt() {
+        if cmuxPrompt != nil { cmuxPrompt = nil }
+        if cmuxNotice != nil { cmuxNotice = nil }
+    }
+    #endif
+
+    /// Messages shown in the prompt view, for its height: the cmux transcript or new chat when one is
+    /// open, else the normal chat. Equal to `chatHistory.count` whenever cmux is not involved.
+    var promptMessageCount: Int {
+        #if !APPSTORE
+        switch cmuxPrompt {
+        case .reply(let id)?: return cmuxTranscripts[id]?.count ?? 0
+        case .newChat?:       return 1
+        case nil:             break
+        }
+        #endif
+        return chatHistory.count
+    }
+
     // Pending approval request from Claude Code hook
     @Published var pendingApproval: ApprovalInfo? = nil
 
@@ -415,6 +547,8 @@ final class AppState: ObservableObject {
         if let v = ud.string(forKey: "lmstudioChatModel"), !v.isEmpty { lmstudioChatModel = v }
         if let v = ud.string(forKey: "ollamaServerURL"), !v.isEmpty { ollamaServerURL = v }
         if let v = ud.string(forKey: "lmstudioServerURL"), !v.isEmpty { lmstudioServerURL = v }
+        if let v = ud.string(forKey: "hermesAgents"), !v.isEmpty { hermesAgents = HermesChat.decodeAgents(v) }
+        if let v = ud.string(forKey: "hermesChatAgent"), !v.isEmpty { hermesChatAgent = v }
         // Migrate old 60s default → 15s
         if let v = ud.object(forKey: "autoCloseInterval") as? Double {
             autoCloseInterval = (v == 60) ? 15 : v

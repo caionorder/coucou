@@ -71,6 +71,7 @@ final class KeychainStore: @unchecked Sendable {
         "stripe-api-key",
         "calcom-api-key",
         "notion-api-key",
+        "hermes-agent-keys",
     ]
 
     private init() {
@@ -186,8 +187,15 @@ final class ClaudeService {
     // Multi-turn conversation messages (for API)
     private var conversationMessages: [[String: Any]] = []
 
+    /// Bumped on every clear: a request that started before a clear must not touch the new conversation.
+    private var conversationGeneration = 0
+    private var hermesTask: Task<String, Error>?
+
     func clearConversation() {
         conversationMessages = []
+        conversationGeneration += 1
+        hermesTask?.cancel()
+        hermesTask = nil
     }
 
     /// Resolved once: NSFullUserName() is a system call, and the name cannot change under us
@@ -217,6 +225,7 @@ final class ClaudeService {
     // MARK: - Chat (multi-turn, natural text + web search)
 
     func chat(query: String, context: PromptContext?, state: AppState) async {
+        if state.chatProvider == .hermes { await chatHermes(query: query, context: context, state: state); return }
         guard state.chatProvider == .anthropic else {
             await chatOpenAICompatible(query: query, context: context, state: state)
             return
@@ -259,7 +268,7 @@ final class ClaudeService {
             let data = try await callAPI(body: body, key: key, beta: "web-search-2025-03-05")
             await handleChatResult(data, state: state)
         } catch {
-            conversationMessages.removeLast()
+            if !conversationMessages.isEmpty { conversationMessages.removeLast() }
             await showError(error.localizedDescription, state: state)
         }
     }
@@ -279,7 +288,7 @@ final class ClaudeService {
             switch provider {
             case .google:  baseURL = "https://generativelanguage.googleapis.com/v1beta/openai"
             case .openai:  baseURL = "https://api.openai.com/v1"
-            case .anthropic, .ollama, .lmstudio: baseURL = ""
+            case .anthropic, .ollama, .lmstudio, .hermes: baseURL = ""
             }
         }
 
@@ -315,31 +324,7 @@ final class ClaudeService {
             }
             msgs.append(simplified)
         }
-        var userText = query
-        if conversationMessages.isEmpty, let ctx = context {
-            switch ctx {
-            case .window(let app, let title, let url):
-                var prefix = "Context — App: \(app), Window: \(title)"
-                if let u = url { prefix += ", URL: \(u)" }
-                userText = prefix + "\n\n" + query
-            case .file(let name, let fileURL):
-                if provider.isLocal, let fileURL = fileURL {
-                    let ext = fileURL.pathExtension.lowercased()
-                    let binaryExts = ["pdf", "jpg", "jpeg", "png", "gif", "webp"]
-                    if !binaryExts.contains(ext),
-                       let text = try? String(contentsOf: fileURL, encoding: .utf8), !text.isEmpty {
-                        let truncated = text.count > 24_000
-                            ? String(text.prefix(24_000)) + "\n[truncated]"
-                            : text
-                        userText = "File: \(name)\n\n\(truncated)\n\n" + query
-                    } else {
-                        userText = "File: \(name)\n\n" + query
-                    }
-                } else {
-                    userText = "File: \(name)\n\n" + query
-                }
-            }
-        }
+        let userText = openAIUserText(query: query, context: context, inlineFiles: provider.isLocal)
         msgs.append(["role": "user", "content": userText])
         conversationMessages.append(["role": "user", "content": userText])
 
@@ -392,7 +377,7 @@ final class ClaudeService {
                 state.view = .prompt
                 NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
             } catch let e as LocalChatError {
-                conversationMessages.removeLast()
+                if !conversationMessages.isEmpty { conversationMessages.removeLast() }
                 state.chatHistory.removeAll { $0.id == msgId }
                 state.stateOverride = nil
                 let msg: String
@@ -408,7 +393,7 @@ final class ClaudeService {
                 }
                 await showError(msg, state: state)
             } catch {
-                conversationMessages.removeLast()
+                if !conversationMessages.isEmpty { conversationMessages.removeLast() }
                 state.chatHistory.removeAll { $0.id == msgId }
                 state.stateOverride = nil
                 await showError(error.localizedDescription, state: state)
@@ -437,9 +422,119 @@ final class ClaudeService {
                 state.view = .prompt
                 NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
             } catch {
-                conversationMessages.removeLast()
+                if !conversationMessages.isEmpty { conversationMessages.removeLast() }
                 await showError(error.localizedDescription, state: state)
             }
+        }
+    }
+
+    /// User text for the first turn of an OpenAI-style chat: window/file context prepended to the query.
+    /// `inlineFiles` inlines text files (up to 24 000 chars); otherwise only the file name is sent.
+    private func openAIUserText(query: String, context: PromptContext?, inlineFiles: Bool) -> String {
+        var userText = query
+        if conversationMessages.isEmpty, let ctx = context {
+            switch ctx {
+            case .window(let app, let title, let url):
+                var prefix = "Context — App: \(app), Window: \(title)"
+                if let u = url { prefix += ", URL: \(u)" }
+                userText = prefix + "\n\n" + query
+            case .file(let name, let fileURL):
+                if inlineFiles, let fileURL = fileURL {
+                    let ext = fileURL.pathExtension.lowercased()
+                    let binaryExts = ["pdf", "jpg", "jpeg", "png", "gif", "webp"]
+                    if !binaryExts.contains(ext),
+                       let text = try? String(contentsOf: fileURL, encoding: .utf8), !text.isEmpty {
+                        let truncated = text.count > 24_000
+                            ? String(text.prefix(24_000)) + "\n[truncated]"
+                            : text
+                        userText = "File: \(name)\n\n\(truncated)\n\n" + query
+                    } else {
+                        userText = "File: \(name)\n\n" + query
+                    }
+                } else {
+                    userText = "File: \(name)\n\n" + query
+                }
+            }
+        }
+        return userText
+    }
+
+    // MARK: - Hermes agents (stateless, streamed, no Mochi system prompt)
+
+    func chatHermes(query: String, context: PromptContext?, state: AppState) async {
+        guard let agent = state.activeHermesAgent else {
+            await showError("Connect a Hermes agent in Settings → Chat first.", state: state)
+            return
+        }
+        let key: String
+        switch HermesChat.boundKey(for: agent, in: HermesChat.decodeKeys(KeychainStore.shared.get("hermes-agent-keys") ?? "")) {
+        case .success(let k): key = k
+        case .failure(let e):
+            // The key is never sent: the stored agent does not match what the key was connected to.
+            await showError(e.userMessage, state: state)
+            return
+        }
+
+        // No system message: Hermes layers it over the agent's own prompt.
+        var msgs: [[String: Any]] = []
+        for m in conversationMessages {
+            var simplified = m
+            if let content = m["content"] as? [[String: Any]],
+               let textBlock = content.first(where: { ($0["type"] as? String) == "text" }),
+               let text = textBlock["text"] as? String {
+                simplified["content"] = text
+            }
+            msgs.append(simplified)
+        }
+        let userText = openAIUserText(query: query, context: context, inlineFiles: true)
+        msgs.append(["role": "user", "content": userText])
+        conversationMessages.append(["role": "user", "content": userText])
+
+        let placeholder = ChatMessage(role: .assistant, content: "")
+        let msgId = placeholder.id
+        state.chatHistory.append(placeholder)
+        state.stateOverride = .thinking
+        let body: [String: Any] = ["model": agent.modelName, "messages": msgs, "stream": true]
+        let encodedBody = (try? JSONSerialization.data(withJSONObject: body)) ?? Data()
+        let generation = conversationGeneration
+        let task = Task { [state, msgId] () async throws -> String in
+            try await HermesChat.streamChat(agent: agent, key: key, encodedBody: encodedBody) { visible in
+                if !visible.isEmpty, state.stateOverride == .thinking {
+                    state.stateOverride = nil   // hide typing dots on first visible text
+                }
+                if let idx = state.chatHistory.firstIndex(where: { $0.id == msgId }) {
+                    state.chatHistory[idx].content = visible
+                }
+            }
+        }
+        hermesTask = task
+        do {
+            let final = try await task.value
+            guard generation == conversationGeneration else {
+                if hermesTask == nil, state.stateOverride == .thinking { state.stateOverride = nil }
+                return
+            }
+            hermesTask = nil
+            conversationMessages.append(["role": "assistant", "content": final])
+            if let idx = state.chatHistory.firstIndex(where: { $0.id == msgId }) {
+                state.chatHistory[idx].content = final
+            }
+            state.stateOverride = nil
+            state.view = .prompt
+            NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
+        } catch {
+            guard generation == conversationGeneration else {
+                // Cleared meanwhile: leave the new conversation alone, only stop the typing dots
+                // when no newer Hermes request has taken over.
+                if hermesTask == nil, state.stateOverride == .thinking { state.stateOverride = nil }
+                return
+            }
+            hermesTask = nil
+            if !conversationMessages.isEmpty { conversationMessages.removeLast() }
+            state.chatHistory.removeAll { $0.id == msgId }
+            state.stateOverride = nil
+            let msg = (error as? HermesChatError)?.userMessage ?? "Hermes request failed."
+            await showError(msg, state: state)
         }
     }
 

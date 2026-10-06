@@ -19,7 +19,12 @@ struct IslandViewContent: View {
         case .uploading: UploadingView(state: state)
         case .choose:    ChooseView(state: state)
         case .mail:      MailView(state: state)
-        case .prompt:    PromptView(state: state)
+        case .prompt:
+            #if !APPSTORE
+            if let mode = state.cmuxPrompt { CmuxPromptView(state: state).id(mode) } else { PromptView(state: state) }
+            #else
+            PromptView(state: state)
+            #endif
         case .searching: SearchingView(state: state)
         case .result:    ResultView(state: state)
         case .note:      NoteView(state: state)
@@ -39,6 +44,14 @@ struct OverviewView: View {
 
     var agent: AgentTask? { state.focusTask }
 
+    /// Room for the ↗ button; cmux sessions also carry a reply button.
+    static func headerTrailing(for task: AgentTask) -> CGFloat {
+        #if !APPSTORE
+        if CmuxRouting.isCmuxTaskId(task.id) { return 58 }
+        #endif
+        return 36
+    }
+
     var body: some View {
         HStack(spacing: 10) {
             // Left card: title row + ticker below + ↗ button overlay
@@ -52,6 +65,12 @@ struct OverviewView: View {
                             withAnimation(.easeIn(duration: 0.16)) { activeDiffId = diffIdx }
                         })
                     } else {
+                        // A cmux session shows `folder (branch)` on a second line under its name.
+                        #if !APPSTORE
+                        let cmuxLine: String? = CmuxRouting.isCmuxTaskId(agent.id) ? agent.subtitle : nil
+                        #else
+                        let cmuxLine: String? = nil
+                        #endif
                         VStack(alignment: .leading, spacing: 0) {
                             HStack(spacing: 6) {
                                 Circle()
@@ -63,6 +82,7 @@ struct OverviewView: View {
                                     .lineLimit(1)
                                     .truncationMode(.tail)
                                     .layoutPriority(1)
+                                if cmuxLine == nil {
                                 Text({ () -> String in
                                     switch agent.source {
                                     case .claudeCode: return "Claude Code"
@@ -74,6 +94,7 @@ struct OverviewView: View {
                                     .foregroundColor(Color(hex: "#8E939C"))
                                     .lineLimit(1)
                                     .truncationMode(.tail)
+                                }
                                 Spacer(minLength: 2)
                                 if agent.steps.count > 1 {
                                     Text("\(min(agent.stepIndex + 1, agent.steps.count))/\(agent.steps.count)")
@@ -84,13 +105,24 @@ struct OverviewView: View {
                             }
                             .padding(.top, 6)
                             .padding(.leading, 108)
-                            .padding(.trailing, 36)
+                            .padding(.trailing, Self.headerTrailing(for: agent))
+
+                            if let cmuxLine {
+                                Text(cmuxLine)
+                                    .font(.system(size: 11))
+                                    .foregroundColor(Color(hex: "#8E939C"))
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                    .padding(.top, 1)
+                                    .padding(.leading, 108)
+                                    .padding(.trailing, Self.headerTrailing(for: agent))
+                            }
 
                             TickerView(task: agent, onDiffTap: { diffIdx in
                                 withAnimation(.easeIn(duration: 0.16)) { activeDiffId = diffIdx }
                             })
                                 .frame(height: 44)
-                                .padding(.top, 6)
+                                .padding(.top, cmuxLine == nil ? 6 : 2)
                                 .padding(.leading, 108)
                                 .padding(.trailing, 12)
                         }
@@ -136,6 +168,23 @@ struct OverviewView: View {
                     .padding(.top, 8)
                     .padding(.trailing, 10)
                     .frame(maxWidth: .infinity, alignment: .trailing)
+                    #if !APPSTORE
+                    // Reply to the focused cmux session, next to the jump button.
+                    if let a = agent, CmuxRouting.isCmuxTaskId(a.id) {
+                        Button(action: { CmuxHub.open(.reply(taskId: a.id)) }) {
+                            Image(systemName: "arrowshape.turn.up.left")
+                                .font(.system(size: 8, weight: .medium))
+                                .foregroundColor(Color(hex: "#5F646D"))
+                                .frame(width: 16, height: 16)
+                                .background(Color.white.opacity(0.07))
+                                .clipShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.top, 8)
+                        .padding(.trailing, 32)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                    }
+                    #endif
                 }
             }
             .frame(width: 322)
@@ -183,6 +232,10 @@ struct OverviewView: View {
         if CmuxJump.jump(for: task) { return }
         #endif
         switch task.id {
+        #if !APPSTORE
+        case CmuxRouting.hubPillId:
+            CmuxHub.openCmux()
+        #endif
         case "integration_claude":
             let vscodeBundleId = "com.microsoft.VSCode"
             if let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == vscodeBundleId }) {
@@ -240,6 +293,8 @@ struct OverviewView: View {
             switchChatProvider(.ollama)
         case "ai_lmstudio":
             switchChatProvider(.lmstudio)
+        case "ai_hermes":
+            switchChatProvider(.hermes)
         case "integration_music":
             #if !APPSTORE
             MusicController.shared.openMusic()
@@ -562,6 +617,13 @@ struct FinishedView: View {
                     .truncationMode(.tail)
                 HStack(spacing: 8) {
                     #if !APPSTORE
+                    if let t = state.focusTask, CmuxRouting.isCmuxTaskId(t.id) {
+                        PrimaryButton("Reply") { CmuxHub.open(.reply(taskId: t.id)) }
+                        SecondaryButton("Open terminal") {
+                            _ = CmuxJump.jump(for: t)
+                            NotificationCenter.default.post(name: .islandCollapse, object: nil)
+                        }
+                    } else {
                     PrimaryButton("Open terminal") {
                         let terminalBundleIds = ["com.apple.Terminal", "com.googlecode.iterm2", "net.kovidgoyal.kitty", "com.mitchellh.ghostty"]
                         let activated = terminalBundleIds.compactMap { id in
@@ -571,6 +633,7 @@ struct FinishedView: View {
                             NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"))
                         }
                         NotificationCenter.default.post(name: .islandCollapse, object: nil)
+                    }
                     }
                     #endif
                     SecondaryButton("OK") {
@@ -1305,6 +1368,7 @@ struct ModelPickerView: View {
             let visibleProviders = ChatProvider.allCases.filter { p in
                 if p == .ollama   { return !AppState.shared.ollamaServerURL.isEmpty   || state.chatProvider == .ollama }
                 if p == .lmstudio { return !AppState.shared.lmstudioServerURL.isEmpty || state.chatProvider == .lmstudio }
+                if p == .hermes   { return !AppState.shared.hermesAgents.isEmpty      || state.chatProvider == .hermes }
                 return true
             }
             ChipFlowLayout(spacing: 6) {
@@ -1350,14 +1414,14 @@ struct ModelPickerView: View {
         .background(Color(hex: "#16171B"))
         .onAppear {
             // Force-refresh local providers every time the picker opens
-            if state.chatProvider.isLocal {
+            if state.chatProvider.isLocal || state.chatProvider == .hermes {
                 state.fetchedProviderModels[state.chatProvider] = nil
                 state.providerModelFetchError[state.chatProvider] = nil
             }
             state.fetchModelsIfNeeded(for: state.chatProvider)
         }
         .onChange(of: state.chatProvider) { _, provider in
-            if provider.isLocal {
+            if provider.isLocal || provider == .hermes {
                 state.fetchedProviderModels[provider] = nil
                 state.providerModelFetchError[provider] = nil
             }
@@ -1392,6 +1456,7 @@ struct ModelPickerView: View {
                             case .openai:    state.openAIChatModel = model.id
                             case .ollama:    state.ollamaChatModel = model.id
                             case .lmstudio:  state.lmstudioChatModel = model.id
+                            case .hermes:    state.selectHermesAgent(model.id)
                             }
                             isPresented = false
                             SoundEngine.shared.play("blip")
@@ -1612,6 +1677,12 @@ struct IntegrationCardView: View {
             #endif
         case "agent_cursor", "agent_codex":
             return false  // coming soon
+        case "integration_cmux":
+            #if !APPSTORE
+            return CmuxHub.isInstalled()
+            #else
+            return false
+            #endif
         case "integration_music":
             #if !APPSTORE
             return true  // Apple Music is always installed on macOS
@@ -1623,6 +1694,7 @@ struct IntegrationCardView: View {
         case "ai_openai":     return KeychainStore.shared.get("openai-api-key")    != nil
         case "ai_ollama":     return !AppState.shared.ollamaServerURL.isEmpty
         case "ai_lmstudio":   return !AppState.shared.lmstudioServerURL.isEmpty
+        case "ai_hermes":     return !AppState.shared.hermesAgents.isEmpty
         case "integration_resend":  return KeychainStore.shared.get("resend-api-key") != nil
         case "integration_n8n":     return KeychainStore.shared.get("n8n-api-key")    != nil
         case "integration_vercel":  return KeychainStore.shared.get("vercel-token")   != nil
@@ -1726,6 +1798,12 @@ struct IntegrationCardView: View {
 
     private var statusLabel: String {
         #if !APPSTORE
+        if task.id == CmuxRouting.hubPillId {
+            if !CmuxHub.isInstalled() { return "cmux not installed" }
+            let n = appState.tasks.filter { CmuxRouting.isCmuxTaskId($0.id) }.count
+            if n == 0 { return CmuxHub.isRunning() ? "No session" : "cmux is not running" }
+            return n == 1 ? "1 session" : "\(n) sessions"
+        }
         if task.id == "integration_music" {
             if appState.musicAutomationDenied { return "Automation not allowed" }
             if appState.musicPlaying { return "Playing · \(MusicController.shared.trackTitle ?? "Unknown")" }
@@ -1743,6 +1821,9 @@ struct IntegrationCardView: View {
             if isHooks { return "Hooks installed" }
             if isAI {
                 let provider = ChatProvider(pillID: task.id)!
+                if provider == .hermes {
+                    return "Connected · \(appState.activeHermesAgent?.name ?? "")"
+                }
                 if provider.isLocal {
                     let model = provider == .ollama ? appState.ollamaChatModel : appState.lmstudioChatModel
                     return "Connected · \(model)"
@@ -1761,7 +1842,7 @@ struct IntegrationCardView: View {
             if isHooks { return "Hooks not installed" }
             if isAI {
                 let provider = ChatProvider(pillID: task.id)!
-                return provider.isLocal ? "Not connected" : "Key not configured"
+                return provider.isLocal || provider == .hermes ? "Not connected" : "Key not configured"
             }
             return "Key not configured"
         }
@@ -1930,6 +2011,19 @@ struct IntegrationCardView: View {
                             .foregroundColor(Color(hex: task.color).opacity(0.85))
                             .buttonStyle(.plain)
                         }
+                    } else if task.id == "integration_cmux" {
+                        #if !APPSTORE
+                        if isConfigured {
+                            Button("New chat") { CmuxHub.open(.newChat) }
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(Color(hex: task.color).opacity(0.85))
+                                .buttonStyle(.plain)
+                            Button("Open cmux") { CmuxHub.openCmux() }
+                                .font(.system(size: 11, weight: .medium))
+                                .foregroundColor(Color(hex: task.color).opacity(0.85))
+                                .buttonStyle(.plain)
+                        }
+                        #endif
                     } else if task.id == "integration_music" {
                         #if !APPSTORE
                         Button("Open Music") { MusicController.shared.openMusic() }
@@ -3709,7 +3803,20 @@ struct AgentPill: View {
 
     // VS Code pill always shows "VS Code" label regardless of active project name
     private var displayName: String {
-        task.id == "integration_claude" ? "VS Code" : task.name
+        if task.id == "integration_claude" { return "VS Code" }
+        #if !APPSTORE
+        if CmuxRouting.isCmuxTaskId(task.id) { return CmuxRouting.pillLabel(task.name) }
+        #endif
+        return task.name
+    }
+
+    // Only cmux session labels (pane titles, often long) are kept clear of the mascot
+    // (8 + 22 + 4); every other pill keeps its original full-width label.
+    private var labelInset: CGFloat {
+        #if !APPSTORE
+        if CmuxRouting.isCmuxTaskId(task.id) { return 34 }
+        #endif
+        return 0
     }
 
     var body: some View {
@@ -3736,6 +3843,7 @@ struct AgentPill: View {
                                          : Color(hex: "#6B7079"))
                         .lineLimit(1)
                         .truncationMode(.tail)
+                        .padding(.horizontal, labelInset)
                         .frame(maxWidth: .infinity, alignment: .center)
                 }
                 .frame(maxWidth: .infinity)

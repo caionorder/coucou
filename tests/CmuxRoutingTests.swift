@@ -54,6 +54,18 @@ enum CmuxRoutingTests {
         check("integration_claude → false", !CmuxRouting.isCmuxTaskId("integration_claude"))
         check("nil → false", !CmuxRouting.isCmuxTaskId(nil))
 
+        // ── pillLabel ──────────────────────────────────────────────────────────
+        print("CmuxRouting.pillLabel")
+        check("name, role and tag cut to the name",
+              CmuxRouting.pillLabel("Proteus (Swift Implementer) [names]") == "Proteus")
+        check("bracket after space", CmuxRouting.pillLabel("Zeus [codex]") == "Zeus")
+        check("plain title kept whole", CmuxRouting.pillLabel("cmux") == "cmux")
+        check("title with spaces but no marker kept", CmuxRouting.pillLabel("Integração com cmux") == "Integração com cmux")
+        check("no space before paren kept", CmuxRouting.pillLabel("coucou(feat)") == "coucou(feat)")
+        check("marker at start kept whole", CmuxRouting.pillLabel(" (x)") == " (x)")
+        check("empty and short", CmuxRouting.pillLabel("") == "" && CmuxRouting.pillLabel("a") == "a")
+        check("multi word head", CmuxRouting.pillLabel("My project (x)") == "My project")
+
         // ── displayName ────────────────────────────────────────────────────────
         print("CmuxRouting.displayName")
         check("unique base unchanged",
@@ -96,15 +108,37 @@ enum CmuxRoutingTests {
               reg.surface(for: "t1")?.capability == "tok1" && reg.surface(for: "t1")?.workspaceId == "w"
               && reg.surface(for: "t1")?.sessionId == "sess")
         check("lastSeen advances", reg.surface(for: "t1")?.lastSeen == 20)
-        reg.note(taskId: "t1", surfaceId: "s2", workspaceId: "w2", socketPath: "/tmp/d.sock",
-                 capability: "tok2", sessionId: "", now: 30)
-        check("new capability replaces the whole unit",
-              reg.surface(for: "t1")?.capability == "tok2" && reg.surface(for: "t1")?.surfaceId == "s2"
-              && reg.surface(for: "t1")?.workspaceId == "w2" && reg.surface(for: "t1")?.socketPath == "/tmp/d.sock")
+        let rotated = reg.note(taskId: "t1", surfaceId: "s2", workspaceId: "w2", socketPath: "/tmp/c.sock",
+                               capability: "tok2", sessionId: "", now: 30)
+        check("new capability on the same socket replaces the whole unit",
+              rotated && reg.surface(for: "t1")?.capability == "tok2" && reg.surface(for: "t1")?.surfaceId == "s2"
+              && reg.surface(for: "t1")?.workspaceId == "w2" && reg.surface(for: "t1")?.socketPath == "/tmp/c.sock")
+        let moved = reg.note(taskId: "t1", surfaceId: "s3", workspaceId: "w3", socketPath: "/tmp/d.sock",
+                             capability: "tok3", sessionId: "", now: 35, isStoredSocketTrusted: { _ in true })
+        check("live entry: a different socket path refuses the whole unit while the stored socket is trusted",
+              !moved && reg.surface(for: "t1")?.socketPath == "/tmp/c.sock" && reg.surface(for: "t1")?.capability == "tok2"
+              && reg.surface(for: "t1")?.surfaceId == "s2" && reg.surface(for: "t1")?.workspaceId == "w2")
+        var rb = CmuxRegistry()
+        rb.note(taskId: "x", surfaceId: "s", workspaceId: "w", socketPath: "/tmp/c.sock", capability: "T", sessionId: "", now: 1)
+        rb.clearCredentials()
+        check("entry without a live token accepts a new socket path (cmux restarted)",
+              rb.note(taskId: "x", surfaceId: "s", workspaceId: "w", socketPath: "/tmp/e.sock", capability: "T2", sessionId: "", now: 2)
+              && rb.surface(for: "x")?.socketPath == "/tmp/e.sock")
+        var rg = reg
+        let healed = rg.note(taskId: "t1", surfaceId: "s4", workspaceId: "w4", socketPath: "/tmp/d.sock",
+                             capability: "tok4", sessionId: "", now: 36, isStoredSocketTrusted: { _ in false })
+        check("live entry: the new unit is accepted when the stored socket file is gone or not a user socket",
+              healed && rg.surface(for: "t1")?.socketPath == "/tmp/d.sock" && rg.surface(for: "t1")?.capability == "tok4")
+        check("trust is asked about the stored path, not the new one",
+              { var asked: [String] = []
+                var r2 = reg
+                r2.note(taskId: "t1", surfaceId: "s5", workspaceId: "w5", socketPath: "/tmp/z.sock",
+                        capability: "t5", sessionId: "", now: 37, isStoredSocketTrusted: { asked.append($0); return true })
+                return asked == ["/tmp/c.sock"] }())
         reg.note(taskId: "t1", surfaceId: "evil", workspaceId: "evil", socketPath: "/tmp/evil.sock",
                  capability: "", sessionId: "sess2", now: 40)
         check("no capability: socket, ids and token unchanged",
-              reg.surface(for: "t1")?.socketPath == "/tmp/d.sock" && reg.surface(for: "t1")?.surfaceId == "s2"
+              reg.surface(for: "t1")?.socketPath == "/tmp/c.sock" && reg.surface(for: "t1")?.surfaceId == "s2"
               && reg.surface(for: "t1")?.workspaceId == "w2" && reg.surface(for: "t1")?.capability == "tok2")
         check("no capability: sessionId and lastSeen still refresh",
               reg.surface(for: "t1")?.sessionId == "sess2" && reg.surface(for: "t1")?.lastSeen == 40)
@@ -368,6 +402,462 @@ enum CmuxRoutingTests {
         check("requirement pins identifier and team",
               CmuxRouting.codeRequirement.contains("com.cmuxterm.app") && CmuxRouting.codeRequirement.contains("7WLXT3NR37")
               && CmuxRouting.codeRequirement.hasPrefix("anchor apple generic"))
+
+
+        // ── cmux as Main: reply, new chat, icons ───────────────────────────────
+        do {
+        print("hub pill id")
+        check("hub id is not a cmux task id", !CmuxRouting.isCmuxTaskId(CmuxRouting.hubPillId))
+        check("taskId never returns the hub id",
+              CmuxRouting.taskId(payload: ["cmux_surface_id": "integration_cmux"]) != CmuxRouting.hubPillId
+              && CmuxRouting.taskId(payload: ["bundle_id": "com.cmuxterm.app", "session_id": "integration_cmux"]) != CmuxRouting.hubPillId)
+
+        print("fnv1a / appearance")
+        check("fnv1a empty", CmuxRouting.fnv1a("") == 0xcbf29ce484222325)
+        check("fnv1a a", CmuxRouting.fnv1a("a") == 0xaf63dc4c8601ec8c)
+        let a1 = CmuxRouting.appearance(key: "abc", takenColors: [])
+        let a2 = CmuxRouting.appearance(key: "abc", takenColors: [])
+        let sameColor = a1.color == a2.color
+        let sameEye = a1.eye == a2.eye
+        check("appearance deterministic", sameColor && sameEye)
+        let a3 = CmuxRouting.appearance(key: "abc", takenColors: [a1.color])
+        check("taken colour is skipped", a3.color != a1.color && CmuxRouting.palette.contains(a3.color))
+        check("eye of the probed result is unchanged", a3.eye == a1.eye)
+        check("all 8 taken → base colour",
+              CmuxRouting.appearance(key: "abc", takenColors: Set(CmuxRouting.palette)).color == a1.color)
+        var live = Set<String>()
+        var distinct = true
+        for i in 0..<8 {
+            let c = CmuxRouting.appearance(key: "surface-\(i)", takenColors: live).color
+            if live.contains(c) { distinct = false }
+            live.insert(c)
+        }
+        check("8 live sessions get 8 different colours", distinct && live.count == 8)
+        check("eye always in the list",
+              (0..<200).allSatisfy { CmuxRouting.eyes.contains(CmuxRouting.appearance(key: "k\($0)", takenColors: []).eye) })
+
+        print("preparePrompt")
+        check("newline, CR, tab become spaces",
+              CmuxRouting.preparePrompt("a\nb\rc\td") == "a b c d")
+        check("ESC, 0x03, 0x7F become spaces",
+              CmuxRouting.preparePrompt("x\u{1B}y\u{03}z\u{7F}w") == "x y z w")
+        check("C1 control becomes a space", CmuxRouting.preparePrompt("a\u{85}b") == "a b")
+        check("literal backslash-n kept", CmuxRouting.preparePrompt("a\\nb") == "a\\nb")
+        check("quotes, $(), backticks, ; kept verbatim",
+              CmuxRouting.preparePrompt("say \"hi\" $(id) `ls`; 'x'") == "say \"hi\" $(id) `ls`; 'x'")
+        check("whitespace only → nil", CmuxRouting.preparePrompt(" \n\t ") == nil && CmuxRouting.preparePrompt("") == nil)
+        check("capped at 8000", CmuxRouting.preparePrompt(String(repeating: "a", count: 9000))?.count == 8000)
+
+        print("isValidLaunchCommand / isValidFolder")
+        check("accepts claude", CmuxRouting.isValidLaunchCommand("claude"))
+        check("accepts flag", CmuxRouting.isValidLaunchCommand("claude --dangerously-skip-permissions"))
+        check("accepts path and =", CmuxRouting.isValidLaunchCommand("/opt/bin/claude --model=opus"))
+        check("rejects empty", !CmuxRouting.isValidLaunchCommand(""))
+        check("rejects shell syntax",
+              [";", "&&", "|", "$", "`", "\"", "'", "\n", "(", ">", "\\"].allSatisfy { !CmuxRouting.isValidLaunchCommand("claude\($0)x") })
+        check("rejects leading dash", !CmuxRouting.isValidLaunchCommand("-claude"))
+        check("rejects an environment prefix (= in the first token)",
+              !CmuxRouting.isValidLaunchCommand("ANTHROPIC_BASE_URL=http://host claude")
+              && !CmuxRouting.isValidLaunchCommand("A=b")
+              && CmuxRouting.isValidLaunchCommand("claude --model=opus"))
+        check("121 chars rejected, 120 accepted",
+              !CmuxRouting.isValidLaunchCommand(String(repeating: "a", count: 121))
+              && CmuxRouting.isValidLaunchCommand(String(repeating: "a", count: 120)))
+        check("folder absolute ok", CmuxRouting.isValidFolder("/Users/me/Dev/app"))
+        check("folder relative rejected", !CmuxRouting.isValidFolder("Dev/app"))
+        check("folder .. rejected", !CmuxRouting.isValidFolder("/Users/me/../root"))
+        check("folder control char rejected", !CmuxRouting.isValidFolder("/Users/me\n/x"))
+        check("folder C1 control char rejected", !CmuxRouting.isValidFolder("/Users/me/\u{85}x") && !CmuxRouting.isValidFolder("/Users/me/\u{9F}x"))
+        check("folder DEL rejected", !CmuxRouting.isValidFolder("/Users/me/\u{7F}x"))
+        check("folder with accents ok", CmuxRouting.isValidFolder("/Users/me/Projetos/açaí"))
+        check("existing folder: / yes, missing no, invalid no",
+              CmuxRouting.isExistingFolder("/tmp") && !CmuxRouting.isExistingFolder("/no/such/dir/at/all")
+              && !CmuxRouting.isExistingFolder("tmp") && !CmuxRouting.isExistingFolder("/tmp/../etc"))
+        check("chip labels: last component, parent when two share it",
+              CmuxRouting.chipLabels(for: ["/a/x/coucou", "/b/y/api", "/c/z/coucou"]) == ["x/coucou", "api", "z/coucou"]
+              && CmuxRouting.chipLabels(for: ["/a/app", "/b/web"]) == ["app", "web"])
+        check("folder over 1024 bytes rejected", !CmuxRouting.isValidFolder("/" + String(repeating: "a", count: 1030)))
+
+        print("rpcParams")
+        check("invalid ids give nil",
+              CmuxRouting.rpcParams(workspaceId: "", surfaceId: "s1", text: "x") == nil
+              && CmuxRouting.rpcParams(workspaceId: "w1", surfaceId: "a b", text: "x") == nil
+              && CmuxRouting.rpcParams(workspaceId: "w1", surfaceId: "../x", key: "enter") == nil)
+        let nasty = "q\"uote \\ back $(id) `x` é 🙂 \\n"
+        if let p = CmuxRouting.rpcParams(workspaceId: "w1", surfaceId: "s1", text: nasty),
+           let data = try? JSONSerialization.data(withJSONObject: p),
+           let back = try? JSONSerialization.jsonObject(with: data) as? [String: String] {
+            check("text round trips byte for byte", back["text"] == nasty && back["surface_id"] == "s1")
+        } else { check("text round trips byte for byte", false) }
+        check("key params", CmuxRouting.rpcParams(workspaceId: "w1", surfaceId: "s1", key: "enter")?["key"] == "enter")
+
+        print("credential / clearCredentials")
+        var cr = CmuxRegistry()
+        cr.note(taskId: "a", surfaceId: "sa", workspaceId: "w", socketPath: "/s.sock", capability: "TA", sessionId: "x", now: 10)
+        cr.note(taskId: "b", surfaceId: "sb", workspaceId: "w", socketPath: "/s.sock", capability: "TB", sessionId: "y", now: 20)
+        cr.note(taskId: "c", surfaceId: "", workspaceId: "", socketPath: "", capability: "", sessionId: "z", now: 30)
+        if case .token(let s) = cr.credential(for: "a", hasPassword: true) { check("own token wins", s.taskId == "a") }
+        else { check("own token wins", false) }
+        if case .token(let s) = cr.credential(for: "c", hasPassword: true) { check("entry without token → freshest other", s.taskId == "b") }
+        else { check("entry without token → freshest other", false) }
+        if case .token(let s) = cr.credential(for: nil, hasPassword: false) { check("no target → freshest token", s.taskId == "b") }
+        else { check("no target → freshest token", false) }
+        cr.clearCredentials()
+        check("clear keeps entries and ids, empties tokens",
+              cr.surfaces.count == 3 && cr.surface(for: "a")?.surfaceId == "sa"
+              && cr.surface(for: "a")?.capability == "" && cr.surface(for: "a")?.canFocusExactly == false)
+        check("password when no token", cr.credential(for: "a", hasPassword: true) == .password)
+        check("none without token or password", cr.credential(for: "a", hasPassword: false) == CmuxCredential.none)
+
+        print("staleTaskIds busy")
+        var sb = CmuxRegistry()
+        sb.note(taskId: "busy", surfaceId: "s", workspaceId: "w", socketPath: "/s.sock", capability: "T", sessionId: "", now: 0)
+        sb.note(taskId: "idle", surfaceId: "s", workspaceId: "w", socketPath: "/s.sock", capability: "T", sessionId: "", now: 0)
+        sb.note(taskId: "held", surfaceId: "s", workspaceId: "w", socketPath: "/s.sock", capability: "T", sessionId: "", now: 0)
+        check("busy at 31 min kept, idle stale",
+              sb.staleTaskIds(now: 31 * 60, protected: ["held"], busy: ["busy"]) == ["idle"])
+        check("busy at 6 h + 1 s stale, protected never",
+              sb.staleTaskIds(now: 6 * 3600 + 1, protected: ["held"], busy: ["busy"]) == ["busy", "idle"])
+
+        print("CmuxPendingLaunch")
+        let pl = CmuxPendingLaunch(workspaceId: "AB12", socketPath: "/s.sock", cwd: "/a/b", prompt: "p", createdAt: 100)
+        check("workspace and socket match", pl.matches(workspaceId: "AB12", socketPath: "/s.sock", isNewTask: true, now: 105))
+        check("workspace id compared case insensitively", pl.matches(workspaceId: "ab12", socketPath: "/s.sock", isNewTask: true, now: 105))
+        check("workspace mismatch", !pl.matches(workspaceId: "W2", socketPath: "/s.sock", isNewTask: true, now: 105))
+        check("socket path mismatch", !pl.matches(workspaceId: "AB12", socketPath: "/other.sock", isNewTask: true, now: 105))
+        check("empty incoming workspace id never matches", !pl.matches(workspaceId: "", socketPath: "/s.sock", isNewTask: true, now: 105))
+        let unresolved = CmuxPendingLaunch(workspaceId: "", socketPath: "/s.sock", cwd: "/a/b", prompt: "p", createdAt: 100)
+        check("empty stored workspace id never matches, even with an empty one",
+              !unresolved.matches(workspaceId: "", socketPath: "/s.sock", isNewTask: true, now: 105)
+              && !unresolved.matches(workspaceId: "Z", socketPath: "/s.sock", isNewTask: true, now: 105))
+        let noSocket = CmuxPendingLaunch(workspaceId: "AB12", socketPath: "", cwd: "/a/b", prompt: "p", createdAt: 100)
+        check("password mode (no socket path) is not auto sendable",
+              !noSocket.autoSendable && !noSocket.matches(workspaceId: "AB12", socketPath: "", isNewTask: true, now: 105))
+        check("autoSendable needs both", pl.autoSendable && !unresolved.autoSendable)
+        check("existing task (/clear) never matches", !pl.matches(workspaceId: "AB12", socketPath: "/s.sock", isNewTask: false, now: 105))
+        check("expired never matches", !pl.matches(workspaceId: "AB12", socketPath: "/s.sock", isNewTask: true, now: 191))
+        check("90 s boundary still matches", pl.matches(workspaceId: "AB12", socketPath: "/s.sock", isNewTask: true, now: 190))
+        check("clock before creation never matches", !pl.matches(workspaceId: "AB12", socketPath: "/s.sock", isNewTask: true, now: 99))
+        check("folder match only for a launch started with the password (no socket path)",
+              noSocket.matchesFolder(cwd: "/a/b/", isNewTask: true, now: 105)
+              && !unresolved.matchesFolder(cwd: "/a/b", isNewTask: true, now: 105)
+              && !pl.matchesFolder(cwd: "/a/b", isNewTask: true, now: 105))
+        check("folder match: other folder, existing task, expired, empty cwd all refused",
+              !noSocket.matchesFolder(cwd: "/a/c", isNewTask: true, now: 105)
+              && !noSocket.matchesFolder(cwd: "/a/b", isNewTask: false, now: 105)
+              && !noSocket.matchesFolder(cwd: "/a/b", isNewTask: true, now: 191)
+              && !noSocket.matchesFolder(cwd: "", isNewTask: true, now: 105))
+        check("folder notice names the session",
+              CmuxRouting.folderDraftNotice(sessionName: "Hera (Code Reviewer)")
+                == "claude started in Hera (Code Reviewer). Check the prompt and press Send."
+              && CmuxRouting.folderDraftNotice(sessionName: "") == "claude started in the new session. Check the prompt and press Send.")
+
+        print("workspace ref / UUID parsers")
+        let wsUUID = "7A1B2C3D-0000-4abc-8def-0123456789AB"
+        check("ref from stdout", CmuxRouting.workspaceRef(inNewWorkspaceOutput: "OK workspace:10\n") == "workspace:10")
+        check("ref: none, junk, empty digits",
+              CmuxRouting.workspaceRef(inNewWorkspaceOutput: "") == nil
+              && CmuxRouting.workspaceRef(inNewWorkspaceOutput: "Error: nope") == nil
+              && CmuxRouting.workspaceRef(inNewWorkspaceOutput: "OK workspace:") == nil
+              && CmuxRouting.workspaceRef(inNewWorkspaceOutput: "OK workspace:1a") == nil)
+        check("ref: anchored, the first token is OK and the second is the ref",
+              CmuxRouting.workspaceRef(inNewWorkspaceOutput: "workspace:3") == nil
+              && CmuxRouting.workspaceRef(inNewWorkspaceOutput: "x workspace:3 y") == nil
+              && CmuxRouting.workspaceRef(inNewWorkspaceOutput: "OK /tmp/x workspace:3 y") == nil
+              && CmuxRouting.workspaceRef(inNewWorkspaceOutput: "OK") == nil
+              && CmuxRouting.workspaceRef(inNewWorkspaceOutput: "ERR workspace:3") == nil
+              && CmuxRouting.workspaceRef(inNewWorkspaceOutput: "OK workspace:3 workspace:4") == "workspace:3"
+              && CmuxRouting.workspaceRef(inNewWorkspaceOutput: "  OK\tworkspace:12\r\n") == "workspace:12")
+        let listJSON = "{\"workspaces\":[{\"id\":\"11111111-1111-4111-8111-111111111111\",\"ref\":\"workspace:9\",\"title\":\"a\",\"current_directory\":\"/x\"},{\"id\":\"\(wsUUID)\",\"ref\":\"workspace:10\",\"title\":\"b\",\"current_directory\":\"/y\"}]}"
+        check("UUID from the list by ref", CmuxRouting.workspaceId(forRef: "workspace:10", inListJSON: listJSON) == wsUUID)
+        check("UUID: unknown ref, bad JSON, id that is not a UUID",
+              CmuxRouting.workspaceId(forRef: "workspace:11", inListJSON: listJSON) == nil
+              && CmuxRouting.workspaceId(forRef: "workspace:10", inListJSON: "not json") == nil
+              && CmuxRouting.workspaceId(forRef: "workspace:10", inListJSON: "{\"workspaces\":[{\"id\":\"workspace:10\",\"ref\":\"workspace:10\"}]}") == nil)
+        check("UUID under a result wrapper",
+              CmuxRouting.workspaceId(forRef: "workspace:10", inListJSON: "{\"result\":\(listJSON)}") == wsUUID)
+
+        print("sendCredential (never the password)")
+        var sc = CmuxRegistry()
+        sc.note(taskId: "a", surfaceId: "sa", workspaceId: "w", socketPath: "/s.sock", capability: "TA", sessionId: "", now: 10)
+        sc.note(taskId: "b", surfaceId: "sb", workspaceId: "w", socketPath: "/s.sock", capability: "TB", sessionId: "", now: 20)
+        sc.note(taskId: "o", surfaceId: "so", workspaceId: "w", socketPath: "/other.sock", capability: "TO", sessionId: "", now: 30)
+        if case .token(let t) = sc.sendCredential(for: "a") { check("own token", t.taskId == "a") } else { check("own token", false) }
+        check("unknown task: none", sc.sendCredential(for: "zzz") == CmuxCredential.none)
+        sc.clearCredentials()
+        check("no token anywhere: none, even with a password stored", sc.sendCredential(for: "a") == CmuxCredential.none)
+        sc.note(taskId: "b", surfaceId: "sb", workspaceId: "w", socketPath: "/s.sock", capability: "TB2", sessionId: "", now: 40)
+        if case .token(let t) = sc.sendCredential(for: "a") { check("no own token: freshest on the same socket", t.taskId == "b") }
+        else { check("no own token: freshest on the same socket", false) }
+        sc.note(taskId: "o", surfaceId: "so", workspaceId: "w", socketPath: "/other.sock", capability: "TO2", sessionId: "", now: 50)
+        if case .token(let t) = sc.sendCredential(for: "a") { check("a fresher token on another socket is not used", t.taskId == "b") }
+        else { check("a fresher token on another socket is not used", false) }
+        var sd = CmuxRegistry()
+        sd.note(taskId: "d", surfaceId: "", workspaceId: "", socketPath: "", capability: "", sessionId: "x", now: 1)
+        sd.note(taskId: "e", surfaceId: "se", workspaceId: "w", socketPath: "/s.sock", capability: "TE", sessionId: "", now: 2)
+        check("entry that never had a socket: none", sd.sendCredential(for: "d") == CmuxCredential.none)
+        check("password is never a send credential",
+              ["a", "b", "o", "zzz"].allSatisfy { sc.sendCredential(for: $0) != .password })
+
+        print("shouldFocusNewSession / nextFocus / canSend")
+        let hub = CmuxRouting.hubPillId
+        check("hub main, focus nil, allowed", CmuxRouting.shouldFocusNewSession(mainPillId: hub, focusId: nil, viewAllowsSteal: true))
+        check("hub main, focus hub, allowed", CmuxRouting.shouldFocusNewSession(mainPillId: hub, focusId: hub, viewAllowsSteal: true))
+        check("hub main, focus on a session, never", !CmuxRouting.shouldFocusNewSession(mainPillId: hub, focusId: "agent_cmux_x", viewAllowsSteal: true))
+        check("view does not allow", !CmuxRouting.shouldFocusNewSession(mainPillId: hub, focusId: nil, viewAllowsSteal: false))
+        check("VS Code main never", !CmuxRouting.shouldFocusNewSession(mainPillId: "integration_claude", focusId: nil, viewAllowsSteal: true))
+        check("nextFocus: most recent remaining",
+              CmuxRouting.nextFocus(afterRemoving: "c", mainPillId: hub,
+                                    candidates: [(id: "a", lastSeen: 1), (id: "b", lastSeen: 5), (id: "c", lastSeen: 9)]) == "b")
+        check("nextFocus: none left → hub", CmuxRouting.nextFocus(afterRemoving: "c", mainPillId: hub, candidates: [(id: "c", lastSeen: 9)]) == hub)
+        check("nextFocus: VS Code main → main",
+              CmuxRouting.nextFocus(afterRemoving: "c", mainPillId: "integration_claude", candidates: [(id: "a", lastSeen: 1)]) == "integration_claude")
+        check("canSend", CmuxRouting.canSend(state: "idle", holdsCard: false) && CmuxRouting.canSend(state: "thinking", holdsCard: false)
+              && !CmuxRouting.canSend(state: "approval", holdsCard: false) && !CmuxRouting.canSend(state: "question", holdsCard: false)
+              && !CmuxRouting.canSend(state: "idle", holdsCard: true))
+        check("canSend false while a dialog may be open in the terminal",
+              !CmuxRouting.canSend(state: "working", holdsCard: false, dialogMayBeOpen: true)
+              && CmuxRouting.canSend(state: "working", holdsCard: false, dialogMayBeOpen: false))
+
+        print("dialogResolved (marker of a dialog left in the terminal)")
+        let permMark = CmuxRouting.DialogMark(tool: "Bash", inputKey: "{\"command\":\"ls\"}")
+        let askMark = CmuxRouting.DialogMark(tool: "AskUserQuestion", inputKey: nil)
+        check("matching PostToolUse / PostToolUseFailure resolves",
+              CmuxRouting.dialogResolved(mark: permMark, event: "PostToolUse", tool: "Bash", inputKey: "{\"command\":\"ls\"}")
+              && CmuxRouting.dialogResolved(mark: permMark, event: "PostToolUseFailure", tool: "Bash", inputKey: "{\"command\":\"ls\"}"))
+        check("another tool or another input does not resolve",
+              !CmuxRouting.dialogResolved(mark: permMark, event: "PostToolUse", tool: "Read", inputKey: "{\"command\":\"ls\"}")
+              && !CmuxRouting.dialogResolved(mark: permMark, event: "PostToolUse", tool: "Bash", inputKey: "{\"command\":\"rm\"}"))
+        check("Stop, StopFailure, UserPromptSubmit, SessionEnd, SessionStart resolve",
+              ["Stop", "StopFailure", "UserPromptSubmit", "SessionEnd", "SessionStart"].allSatisfy {
+                  CmuxRouting.dialogResolved(mark: permMark, event: $0, tool: "", inputKey: "") })
+        check("PreToolUse, Notification, SubagentStop, Interrupt do not resolve",
+              ["PreToolUse", "Notification", "SubagentStop", "SubagentStart", "Interrupt", "PermissionRequest"].allSatisfy {
+                  !CmuxRouting.dialogResolved(mark: permMark, event: $0, tool: "Bash", inputKey: "{\"command\":\"ls\"}") })
+        check("question mark: any PostToolUse of AskUserQuestion resolves, other tools do not",
+              CmuxRouting.dialogResolved(mark: askMark, event: "PostToolUse", tool: "AskUserQuestion", inputKey: "anything")
+              && !CmuxRouting.dialogResolved(mark: askMark, event: "PostToolUse", tool: "Bash", inputKey: ""))
+
+        print("prune / eviction protection, answer in place, launch focus")
+        check("pruneProtected adds the open reply task",
+              CmuxRouting.pruneProtected(holdingCard: ["a"], openReplyTask: "b") == ["a", "b"]
+              && CmuxRouting.pruneProtected(holdingCard: ["a"], openReplyTask: nil) == ["a"])
+        check("evictableIdle drops the open reply task",
+              CmuxRouting.evictableIdle(["a", "b"], openReplyTask: "a") == ["b"]
+              && CmuxRouting.evictableIdle(["a", "b"], openReplyTask: nil) == ["a", "b"])
+        var ev = CmuxRegistry()
+        for i in 0..<7 { ev.note(taskId: "t\(i)", surfaceId: "s", workspaceId: "w", socketPath: "/x.sock", capability: "c", sessionId: "", now: Double(i)) }
+        check("eviction never picks the open reply task even when it is the oldest",
+              ev.evictionCandidates(idle: CmuxRouting.evictableIdle(["t0", "t1", "t2"], openReplyTask: "t0"), keep: "t6") == ["t1"])
+        check("stale prune never picks the open reply task",
+              ev.staleTaskIds(now: 99999, protected: CmuxRouting.pruneProtected(holdingCard: [], openReplyTask: "t0")).contains("t0") == false)
+        check("answer stays in the reply view of that session only",
+              CmuxRouting.answerStaysInReply(prompt: .reply(taskId: "a"), taskId: "a", viewIsPrompt: true)
+              && !CmuxRouting.answerStaysInReply(prompt: .reply(taskId: "a"), taskId: "b", viewIsPrompt: true)
+              && !CmuxRouting.answerStaysInReply(prompt: .reply(taskId: "a"), taskId: "a", viewIsPrompt: false)
+              && !CmuxRouting.answerStaysInReply(prompt: .newChat, taskId: "a", viewIsPrompt: true)
+              && !CmuxRouting.answerStaysInReply(prompt: nil, taskId: "a", viewIsPrompt: true))
+        check("matched launch takes focus only from the New chat view with no card open",
+              CmuxRouting.launchMayTakeFocus(cardOpen: false, promptIsNewChat: true)
+              && !CmuxRouting.launchMayTakeFocus(cardOpen: true, promptIsNewChat: true)
+              && !CmuxRouting.launchMayTakeFocus(cardOpen: false, promptIsNewChat: false))
+
+        print("recentFolders / firstUUID")
+        check("recent: most recent first, deduped",
+              CmuxRouting.recentFolders(adding: "/b", to: ["/a", "/b", "/c"]) == ["/b", "/a", "/c"])
+        check("recent: capped at 8",
+              CmuxRouting.recentFolders(adding: "/n", to: (0..<12).map { "/f\($0)" }).count == 8)
+        let u1 = "0A1B2C3D-4e5f-6789-abcd-ef0123456789"
+        check("isUUID", CmuxRouting.isUUID(u1) && !CmuxRouting.isUUID("workspace:3") && !CmuxRouting.isUUID("")
+              && !CmuxRouting.isUUID(u1 + "0") && !CmuxRouting.isUUID("0A1B2C3D_4e5f-6789-abcd-ef0123456789")
+              && !CmuxRouting.isUUID("0G1B2C3D-4e5f-6789-abcd-ef0123456789"))
+
+        // ── EOF of a card, tab title, folder and branch, socket peer ───────────
+        print("EOF of a young card")
+        check("EOF younger than the late age: answered in the terminal, no marker",
+              !CmuxRouting.eofLeavesDialogOpen(arrivedAt: 100, now: 130)
+              && !CmuxRouting.eofLeavesDialogOpen(arrivedAt: 100, now: 215))
+        check("EOF older than the late age may leave a dialog open",
+              CmuxRouting.eofLeavesDialogOpen(arrivedAt: 100, now: 216))
+
+        print("cleanLabel / tab title")
+        check("clean: format characters (Cf) dropped",
+              CmuxRouting.cleanLabel("a\u{200B}b\u{200E}c\u{200F}d\u{061C}e\u{FEFF}f\u{2060}g\u{E0041}h") == "abcdefgh")
+        check("clean: only format characters gives nil", CmuxRouting.cleanLabel("\u{200B}\u{200E}\u{E0041}") == nil)
+        check("clean: 60 characters of combining marks are cut at 120 scalars",
+              { let t = String(repeating: "e\u{301}\u{302}\u{303}\u{304}", count: 60)
+                guard let r = CmuxRouting.cleanLabel(t) else { return false }
+                return r.unicodeScalars.count <= 120 && r.count <= 60 && r.unicodeScalars.count >= 100 }())
+        check("clean: one cluster of thousands of marks gives nil",
+              CmuxRouting.cleanLabel("e" + String(repeating: "\u{301}", count: 5000)) == nil)
+        check("clean: the 60 character cap still holds", CmuxRouting.cleanLabel(String(repeating: "é", count: 90))?.count == 60)
+        check("title: Cf in a tab title",
+              CmuxRouting.tabTitle(forSurface: "S", inListJSON: #"{"surfaces":[{"id":"S","title":"✳ Pro\u200Beus"}]}"#) == "Proeus")
+        check("title: two live sessions with the same title get the suffix",
+              CmuxRouting.displayName(base: "Proteus", taskId: "b", existing: [(id: "a", name: "Proteus"), (id: "b", name: "x")]) == "Proteus 2"
+              && CmuxRouting.displayName(base: "Proteus", taskId: "c", existing: [(id: "a", name: "Proteus"), (id: "b", name: "Proteus 2")]) == "Proteus 3"
+              && CmuxRouting.displayName(base: "Proteus", taskId: "b", existing: [(id: "a", name: "Proteus"), (id: "b", name: "Proteus 2")]) == "Proteus 2"
+              && CmuxRouting.displayName(base: "Proteus", taskId: "a", existing: [(id: "a", name: "Proteus")]) == "Proteus")
+        check("clean: control characters, trim, nil when empty",
+              CmuxRouting.cleanLabel("  Hera\u{1B}[31m\n(Code)\u{7F}\u{85}  ") == "Hera[31m(Code)"
+              && CmuxRouting.cleanLabel(" \t\n ") == nil && CmuxRouting.cleanLabel("\u{1B}\u{07}") == nil
+              && CmuxRouting.cleanLabel("a\u{202E}b\u{2028}c") == "abc")
+        check("clean: capped at 60",
+              CmuxRouting.cleanLabel(String(repeating: "x", count: 100))?.count == 60)
+        check("glyph prefix stripped",
+              CmuxRouting.stripLeadingGlyphs("◐ Hera (Code Reviewer)") == "Hera (Code Reviewer)"
+              && CmuxRouting.stripLeadingGlyphs("✳ Zeus") == "Zeus"
+              && CmuxRouting.stripLeadingGlyphs("✶  ⠂ Ana") == "Ana"
+              && CmuxRouting.stripLeadingGlyphs("Hera") == "Hera"
+              && CmuxRouting.stripLeadingGlyphs("3rd run") == "3rd run"
+              && CmuxRouting.stripLeadingGlyphs("★ ✦") == "")
+        let sid = "786BDC8E-A27B-4555-83FE-2734DA1721CC"
+        let surfJSON = "{\"surfaces\":[{\"id\":\"11111111-1111-4111-8111-111111111111\",\"title\":\"other\"},{\"id\":\"\(sid)\",\"title\":\"✳ Hera (Code Reviewer) [re-review 2]\",\"focused\":true},{\"id\":\"22222222-2222-4222-8222-222222222222\"}]}"
+        check("title of the matching surface, glyph removed",
+              CmuxRouting.tabTitle(forSurface: sid, inListJSON: surfJSON) == "Hera (Code Reviewer) [re-review 2]")
+        check("surface id matched case insensitively",
+              CmuxRouting.tabTitle(forSurface: sid.lowercased(), inListJSON: surfJSON) == "Hera (Code Reviewer) [re-review 2]")
+        check("title: other surface, missing title, unknown id, empty id, bad JSON all nil",
+              CmuxRouting.tabTitle(forSurface: "22222222-2222-4222-8222-222222222222", inListJSON: surfJSON) == nil
+              && CmuxRouting.tabTitle(forSurface: "33333333-3333-4333-8333-333333333333", inListJSON: surfJSON) == nil
+              && CmuxRouting.tabTitle(forSurface: "", inListJSON: surfJSON) == nil
+              && CmuxRouting.tabTitle(forSurface: sid, inListJSON: "nope") == nil
+              && CmuxRouting.tabTitle(forSurface: sid, inListJSON: "{\"surfaces\":\"x\"}") == nil)
+        check("title that is only glyphs or control characters is nil",
+              CmuxRouting.tabTitle(forSurface: sid, inListJSON: "{\"surfaces\":[{\"id\":\"\(sid)\",\"title\":\"✳ \\u0007\"}]}") == nil)
+        check("title: control characters removed and capped",
+              CmuxRouting.tabTitle(forSurface: sid, inListJSON: "{\"surfaces\":[{\"id\":\"\(sid)\",\"title\":\"A\\u001b[2Jb\\n\(String(repeating: "z", count: 90))\"}]}")?.count == 60
+              && CmuxRouting.tabTitle(forSurface: sid, inListJSON: "{\"surfaces\":[{\"id\":\"\(sid)\",\"title\":\"A\\u001b[2Jb\"}]}") == "A[2Jb")
+        check("title under a result wrapper",
+              CmuxRouting.tabTitle(forSurface: sid, inListJSON: "{\"result\":\(surfJSON)}") == "Hera (Code Reviewer) [re-review 2]")
+        check("surface.list params need a valid workspace id",
+              CmuxRouting.surfaceListParams(workspaceId: "ABC-1")?["workspace_id"] == "ABC-1"
+              && CmuxRouting.surfaceListParams(workspaceId: "") == nil
+              && CmuxRouting.surfaceListParams(workspaceId: "a b") == nil)
+        check("refresh throttled to once per 5 s",
+              CmuxRouting.metaRefreshDue(last: nil, now: 10) && !CmuxRouting.metaRefreshDue(last: 10, now: 14.9)
+              && CmuxRouting.metaRefreshDue(last: 10, now: 15) && CmuxRouting.metaRefreshDue(last: 10, now: 5))
+
+        print("git branch")
+        let hash = "0123456789abcdef0123456789abcdef01234567"
+        check("HEAD: branch ref", CmuxRouting.branchName(fromHEAD: "ref: refs/heads/feat/cmux-integration\n") == "feat/cmux-integration")
+        check("HEAD: detached gives 7 characters", CmuxRouting.branchName(fromHEAD: hash + "\n") == "0123456")
+        check("HEAD: garbage, other ref, short hash, empty are nil",
+              CmuxRouting.branchName(fromHEAD: "banana") == nil && CmuxRouting.branchName(fromHEAD: "ref: refs/tags/v1") == nil
+              && CmuxRouting.branchName(fromHEAD: "0123456") == nil && CmuxRouting.branchName(fromHEAD: "") == nil
+              && CmuxRouting.branchName(fromHEAD: "ref: refs/heads/\n") == nil)
+        check("HEAD: control characters stripped, capped at 60",
+              CmuxRouting.branchName(fromHEAD: "ref: refs/heads/a\u{1B}b") == "ab"
+              && CmuxRouting.branchName(fromHEAD: "ref: refs/heads/" + String(repeating: "q", count: 90))?.count == 60)
+        check("gitdir pointer: absolute, relative, garbage",
+              CmuxRouting.gitDirectory(fromPointer: "gitdir: /r/.git/worktrees/w\n", base: "/x") == "/r/.git/worktrees/w"
+              && CmuxRouting.gitDirectory(fromPointer: "gitdir: ../r/.git/worktrees/w", base: "/x/y") == "/x/y/../r/.git/worktrees/w"
+              && CmuxRouting.gitDirectory(fromPointer: "hello", base: "/x") == nil
+              && CmuxRouting.gitDirectory(fromPointer: "gitdir:", base: "/x") == nil)
+        let fm = FileManager.default
+        let tmp = (NSTemporaryDirectory() as NSString).appendingPathComponent("coucou-git-\(getpid())")
+        try? fm.removeItem(atPath: tmp)
+        func write(_ path: String, _ text: String) {
+            try? fm.createDirectory(atPath: (path as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
+            try? text.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+        write(tmp + "/repo/.git/HEAD", "ref: refs/heads/feat/x\n")
+        try? fm.createDirectory(atPath: tmp + "/repo/a/b/c", withIntermediateDirectories: true)
+        check("branch: walks up from a subfolder", CmuxRouting.gitBranch(cwd: tmp + "/repo/a/b/c") == "feat/x")
+        check("branch: at the repo root", CmuxRouting.gitBranch(cwd: tmp + "/repo") == "feat/x")
+        write(tmp + "/det/.git/HEAD", hash + "\n")
+        check("branch: detached HEAD", CmuxRouting.gitBranch(cwd: tmp + "/det") == "0123456")
+        write(tmp + "/main/.git/worktrees/wt/HEAD", "ref: refs/heads/wt-branch\n")
+        write(tmp + "/wt/.git", "gitdir: " + tmp + "/main/.git/worktrees/wt\n")
+        check("branch: .git file pointing to a worktree gitdir", CmuxRouting.gitBranch(cwd: tmp + "/wt") == "wt-branch")
+        write(tmp + "/relwt/.git", "gitdir: ../main/.git/worktrees/wt\n")
+        check("branch: relative gitdir pointer", CmuxRouting.gitBranch(cwd: tmp + "/relwt") == "wt-branch")
+        write(tmp + "/bad/.git/HEAD", "###\u{1}garbage")
+        check("branch: garbage HEAD is nil", CmuxRouting.gitBranch(cwd: tmp + "/bad") == nil)
+        write(tmp + "/badptr/.git", "not a pointer")
+        check("branch: garbage .git file is nil", CmuxRouting.gitBranch(cwd: tmp + "/badptr") == nil)
+        write(tmp + "/nohead/.git/config", "x")
+        check("branch: .git without HEAD is nil", CmuxRouting.gitBranch(cwd: tmp + "/nohead") == nil)
+        check("branch: not absolute or missing folder is nil",
+              CmuxRouting.gitBranch(cwd: "relative/dir") == nil && CmuxRouting.gitBranch(cwd: "") == nil)
+        check("branch: a pointer is followed once only",
+              { write(tmp + "/loop/.git", "gitdir: " + tmp + "/loop2\n")
+                write(tmp + "/loop2/.git", "gitdir: " + tmp + "/loop\n")
+                return CmuxRouting.gitBranch(cwd: tmp + "/loop") == nil }())
+        // Symlinks, FIFOs and gitdir targets
+        write(tmp + "/real/HEAD", "ref: refs/heads/secret\n")
+        try? fm.createDirectory(atPath: tmp + "/symhead/.git", withIntermediateDirectories: true)
+        symlink(tmp + "/real/HEAD", tmp + "/symhead/.git/HEAD")
+        check("branch: a symlinked HEAD is refused", CmuxRouting.gitBranch(cwd: tmp + "/symhead") == nil)
+        write(tmp + "/ptrtarget/x/.git/HEAD", "ref: refs/heads/linked\n")
+        try? fm.createDirectory(atPath: tmp + "/symptr", withIntermediateDirectories: true)
+        write(tmp + "/ptrreal", "gitdir: " + tmp + "/ptrtarget/x/.git\n")
+        symlink(tmp + "/ptrreal", tmp + "/symptr/.git")
+        check("branch: a symlinked .git pointer file is refused", CmuxRouting.gitBranch(cwd: tmp + "/symptr") == nil)
+        write(tmp + "/odd/target/HEAD", "ref: refs/heads/odd\n")
+        write(tmp + "/oddptr/.git", "gitdir: " + tmp + "/odd/target\n")
+        check("branch: a gitdir that is not a .git folder is refused", CmuxRouting.gitBranch(cwd: tmp + "/oddptr") == nil)
+        write(tmp + "/bare.git/HEAD", "ref: refs/heads/bare\n")
+        write(tmp + "/bareptr/.git", "gitdir: " + tmp + "/bare.git\n")
+        check("branch: a gitdir ending in .git is accepted", CmuxRouting.gitBranch(cwd: tmp + "/bareptr") == "bare")
+        check("gitdir plausibility",
+              CmuxRouting.isPlausibleGitDir("/r/.git") && CmuxRouting.isPlausibleGitDir("/r/.git/worktrees/w")
+              && CmuxRouting.isPlausibleGitDir("/r/x.git") && !CmuxRouting.isPlausibleGitDir("/etc")
+              && !CmuxRouting.isPlausibleGitDir("/r/.git/../etc") && !CmuxRouting.isPlausibleGitDir("/r/.github")
+              && !CmuxRouting.isPlausibleGitDir("/"))
+        try? fm.createDirectory(atPath: tmp + "/fifohead/.git", withIntermediateDirectories: true)
+        mkfifo(tmp + "/fifohead/.git/HEAD", 0o600)
+        let fifoStart = Date()
+        let fifoBranch = CmuxRouting.gitBranch(cwd: tmp + "/fifohead")
+        check("branch: a FIFO named HEAD returns nil, promptly", fifoBranch == nil && Date().timeIntervalSince(fifoStart) < 2)
+        try? fm.createDirectory(atPath: tmp + "/fifoptr", withIntermediateDirectories: true)
+        mkfifo(tmp + "/fifoptr/.git", 0o600)
+        let fifoStart2 = Date()
+        let fifoBranch2 = CmuxRouting.gitBranch(cwd: tmp + "/fifoptr")
+        check("branch: a FIFO named .git returns nil, promptly", fifoBranch2 == nil && Date().timeIntervalSince(fifoStart2) < 2)
+        try? fm.removeItem(atPath: tmp)
+        check("folder line: folder and branch, folder alone, nothing",
+              CmuxRouting.folderLine(cwd: "/Users/x/Dev/coucou", branch: "feat/cmux-integration") == "coucou (feat/cmux-integration)"
+              && CmuxRouting.folderLine(cwd: "/Users/x/Dev/coucou/", branch: nil) == "coucou"
+              && CmuxRouting.folderLine(cwd: "/Users/x/Dev/coucou", branch: "") == "coucou"
+              && CmuxRouting.folderLine(cwd: "", branch: "main") == nil
+              && CmuxRouting.folderLine(cwd: "/", branch: "main") == nil)
+
+        print("socket peer (LOCAL_PEERTOKEN, audit token)")
+        let sockPath = (NSTemporaryDirectory() as NSString).appendingPathComponent("cp\(getpid()).sock")
+        unlink(sockPath)
+        let lfd = socket(AF_UNIX, SOCK_STREAM, 0)
+        var la = sockaddr_un()
+        la.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &la.sun_path) { raw in
+            for (i, b) in Array(sockPath.utf8).enumerated() { raw[i] = b }
+        }
+        let bound = withUnsafePointer(to: &la) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(lfd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+        } == 0 && listen(lfd, 4) == 0
+        if bound && CmuxRouting.isValidSocketPath(sockPath) {
+            let token = CmuxRouting.socketPeerAuditToken(path: sockPath)
+            check("audit token of a local listener is 32 bytes", token?.count == 32)
+            check("audit token names this process", token.flatMap { CmuxRouting.pid(ofAuditToken: $0) } == getpid())
+            check("a listener that is not cmux is refused", !CmuxRouting.socketPeerIsCmux(path: sockPath))
+        } else {
+            print("  - skipped: temp socket path not usable here")
+        }
+        close(lfd)
+        unlink(sockPath)
+        check("peer: missing socket, bad path give no token",
+              CmuxRouting.socketPeerAuditToken(path: "/tmp/does-not-exist-\(getpid()).sock") == nil
+              && CmuxRouting.socketPeerAuditToken(path: "relative.sock") == nil && !CmuxRouting.socketPeerIsCmux(path: ""))
+        check("an unreadable or short audit token fails closed",
+              !CmuxRouting.processIsCmux(auditToken: Data()) && !CmuxRouting.processIsCmux(auditToken: Data(count: 31))
+              && !CmuxRouting.processIsCmux(auditToken: Data(count: 32)) && CmuxRouting.pid(ofAuditToken: Data(count: 5)) == nil)
+        check("verification reuse: fresh inside 60 s, stale after, never after a backwards clock, none without a stamp",
+              CmuxRouting.verificationIsFresh(verifiedAt: 100, now: 100)
+              && CmuxRouting.verificationIsFresh(verifiedAt: 100, now: 159.9)
+              && !CmuxRouting.verificationIsFresh(verifiedAt: 100, now: 160)
+              && !CmuxRouting.verificationIsFresh(verifiedAt: 100, now: 99)
+              && !CmuxRouting.verificationIsFresh(verifiedAt: nil, now: 100))
+        }
 
         print(failures == 0 ? "\nAll cmux routing tests passed." : "\n\(failures) failure(s).")
         exit(failures == 0 ? 0 : 1)

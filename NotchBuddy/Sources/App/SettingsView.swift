@@ -61,6 +61,12 @@ struct SettingsView: View {
     @State private var lmstudioURL:  String = AppState.shared.lmstudioServerURL
     @State private var connectingOllama:    Bool = false
     @State private var connectingLMStudio:  Bool = false
+    // Hermes agent setup form (the key field is never pre-filled from the Keychain)
+    @State private var hermesURL:     String = ""
+    @State private var hermesProfile: String = ""
+    @State private var hermesName:    String = ""
+    @State private var hermesKey:     String = ""
+    @State private var connectingHermes: Bool = false
 
     // Integration keys
     @State private var resendKey: String    = KeychainStore.shared.get("resend-api-key")  ?? ""
@@ -177,6 +183,7 @@ struct SettingsView: View {
         .onAppear {
             #if !APPSTORE
             state.refreshPlanRelayState()
+            cmuxInstalled = CmuxHub.isInstalled()
             #endif
             guard fetchedModels.isEmpty,
                   let key = KeychainStore.shared.get("anthropic-api-key"), !key.isEmpty else { return }
@@ -593,7 +600,103 @@ struct SettingsView: View {
             .padding(6)
         }
         #endif
+
+        #if !APPSTORE
+        if cmuxInstalled { cmuxSettingsGroup }
+        #endif
     }
+
+    #if !APPSTORE
+    @State private var cmuxInstalled = false
+    @State private var cmuxCommandDraft: String = AppState.shared.cmuxLaunchCommand
+    @State private var cmuxPasswordDraft: String = ""
+    @State private var cmuxPasswordSaved: Bool = CmuxControl.hasPassword
+
+    @ViewBuilder private var cmuxSettingsGroup: some View {
+        GroupBox("cmux") {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Start new chats from the notch, in a new cmux workspace.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+
+                HStack(spacing: 8) {
+                    Text("Default folder")
+                        .font(.system(size: 12))
+                    Text(state.cmuxDefaultFolder.isEmpty ? "Not set" : state.cmuxDefaultFolder)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button("Choose…") { chooseCmuxFolder() }
+                        .buttonStyle(.bordered)
+                    if !state.cmuxDefaultFolder.isEmpty {
+                        Button("Clear") { state.cmuxDefaultFolder = "" }
+                            .buttonStyle(.bordered)
+                    }
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Text("Launch command")
+                            .font(.system(size: 12))
+                        TextField("claude", text: $cmuxCommandDraft)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(size: 11, design: .monospaced))
+                    }
+                    if !CmuxRouting.isValidLaunchCommand(cmuxCommandDraft) {
+                        Text("Letters, digits, spaces and _ . / = : - only. Keeping \"\(state.cmuxLaunchCommand)\".")
+                            .font(.system(size: 11))
+                            .foregroundColor(.red)
+                    }
+                }
+                .onChange(of: cmuxCommandDraft) { _, new in
+                    if CmuxRouting.isValidLaunchCommand(new) { state.cmuxLaunchCommand = new }
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        SecureField("Socket password (optional)", text: $cmuxPasswordDraft)
+                            .textFieldStyle(.roundedBorder)
+                        Button("Save") {
+                            CmuxControl.setPassword(cmuxPasswordDraft)
+                            cmuxPasswordDraft = ""
+                            cmuxPasswordSaved = CmuxControl.hasPassword
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(cmuxPasswordDraft.isEmpty)
+                        if cmuxPasswordSaved {
+                            Button("Remove") {
+                                CmuxControl.setPassword("")
+                                cmuxPasswordSaved = false
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                    Text(cmuxPasswordSaved ? "A password is saved in your Keychain." : "No password saved.")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                    Text("Needed only to start a chat when no cmux session is open. In cmux: Settings › Automation › Socket control mode › Password, set a password, then paste it here. It is stored in your Keychain.")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(6)
+        }
+    }
+
+    private func chooseCmuxFolder() {
+        let panel = NSOpenPanel()
+        panel.prompt = "Choose"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url,
+              CmuxRouting.isValidFolder(url.path) else { return }
+        state.cmuxDefaultFolder = url.path
+    }
+    #endif
 
     // MARK: - Chat section
 
@@ -745,6 +848,77 @@ struct SettingsView: View {
                     }
                     .buttonStyle(.bordered)
                 }
+            }
+            .padding(.vertical, 4)
+        }
+
+        GroupBox("Hermes agents") {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Talk to your own Hermes agents from the chat. One entry per profile; each key is stored in the Keychain.")
+                    .font(.system(size: 12))
+                    .foregroundColor(.secondary)
+
+                ForEach(state.hermesAgents, id: \.name) { agent in
+                    HStack(spacing: 8) {
+                        Circle().fill(Color(hex: "#F97316")).frame(width: 8, height: 8)
+                        Text(agent.name).font(.system(size: 12, weight: .semibold))
+                        if state.isHermesAgentBound(agent) {
+                            Text("Connected")
+                                .font(.system(size: 10))
+                                .foregroundColor(Color(hex: "#22C55E"))
+                        } else {
+                            Text("Reconnect needed")
+                                .font(.system(size: 10))
+                                .foregroundColor(Color(hex: "#F97316"))
+                        }
+                    }
+                    Text("\(agent.baseURL) · \(agent.profile.isEmpty ? "default" : agent.profile)")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(.secondary)
+                    if !state.isHermesAgentBound(agent) {
+                        Text("Its key is not tied to this address. Disconnect it and connect it again.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                    }
+                    if HermesChat.sendsKeyUnencryptedToName(agent.baseURL) {
+                        Text("The key is sent unencrypted on your local network to whoever answers this name. Use https:// or an IP address you trust.")
+                            .font(.system(size: 11))
+                            .foregroundColor(Color(hex: "#F97316"))
+                    }
+                    Button("Disconnect") {
+                        state.removeHermesAgent(named: agent.name)
+                        statusMessage = "\(agent.name) disconnected."
+                    }
+                    .buttonStyle(.bordered)
+                    Divider()
+                }
+
+                HStack(spacing: 8) {
+                    Circle().fill(Color(hex: "#F97316")).frame(width: 8, height: 8)
+                    Text("Add an agent").font(.system(size: 12, weight: .semibold))
+                }
+                TextField("https://hermes.example.com", text: $hermesURL)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: hermesURL) { _, url in prefillHermesProfile(from: url) }
+                if case .success(let typed) = HermesChat.normaliseBaseURL(hermesURL),
+                   HermesChat.sendsKeyUnencryptedToName(typed) {
+                    Text("http:// to a name: the key will be sent unencrypted on your local network.")
+                        .font(.system(size: 11))
+                        .foregroundColor(Color(hex: "#F97316"))
+                }
+                TextField("Profile (empty = default)", text: $hermesProfile)
+                    .textFieldStyle(.roundedBorder)
+                TextField("Name in the chat (optional)", text: $hermesName)
+                    .textFieldStyle(.roundedBorder)
+                SecureField("API key (API_SERVER_KEY of this profile)", text: $hermesKey)
+                    .textFieldStyle(.roundedBorder)
+                Button(connectingHermes ? "Connecting…" : "Connect") {
+                    Task { await connectHermes() }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(connectingHermes
+                          || hermesURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                          || hermesKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
             .padding(.vertical, 4)
         }
@@ -955,6 +1129,50 @@ struct SettingsView: View {
             statusMessage = "✓ Connected · \(models.count) model\(models.count == 1 ? "" : "s")"
         case .failure:
             statusMessage = "Couldn't reach \(name) at \(normalised). Is it running?"
+        }
+    }
+
+    /// Validates the form, tests the connection (the only request of the setup, made on this click)
+    /// and stores the agent. Nothing is stored on failure.
+    /// A pasted `.../p/NAME/v1` URL fills the empty Profile field with NAME.
+    private func prefillHermesProfile(from url: String) {
+        guard hermesProfile.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let p = HermesChat.profileInURL(url) else { return }
+        hermesProfile = p
+    }
+
+    private func connectHermes() async {
+        prefillHermesProfile(from: hermesURL)
+        let base: String
+        switch HermesChat.normaliseBaseURL(hermesURL) {
+        case .success(let u): base = u
+        case .failure(let e): statusMessage = e.userMessage; return
+        }
+        let profile = hermesProfile.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard HermesChat.isValidProfile(profile) else {
+            statusMessage = "Profile names use letters, digits, - and _ only."
+            return
+        }
+        let key = hermesKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let typedName = hermesName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = !typedName.isEmpty ? typedName
+                 : !profile.isEmpty ? profile
+                 : (URL(string: base)?.host ?? "hermes")
+        guard !state.hermesAgents.contains(where: { $0.name == name }) else {
+            statusMessage = "An agent named \(name) already exists."
+            return
+        }
+        connectingHermes = true
+        statusMessage = ""
+        let result = await HermesChat.connect(baseURL: base, profile: profile, key: key)
+        connectingHermes = false
+        switch result {
+        case .success(let modelName):
+            state.addHermesAgent(HermesAgent(name: name, baseURL: base, profile: profile, modelName: modelName), key: key)
+            hermesURL = ""; hermesProfile = ""; hermesName = ""; hermesKey = ""
+            statusMessage = "✓ Connected · \(name)"
+        case .failure(let e):
+            statusMessage = e.userMessage
         }
     }
 
@@ -1232,9 +1450,12 @@ struct SettingsView: View {
             if def.id == "agent_gemini"        && !HookServer.geminiHooksInstalled()  { return "Hooks not installed" }
             if def.id == "agent_antigravity"   && !HookServer.agyHooksInstalled()    { return "Hooks not installed" }
             if def.id == "agent_codex"         && !HookServer.codexHooksInstalled()  { return "Hooks not installed" }
+            if def.id == CmuxRouting.hubPillId && !CmuxHub.isInstalled()             { return "Not installed" }
             #endif
             if def.category == .ai {
-                if let provider = ChatProvider(pillID: def.id), provider.isLocal {
+                if def.id == "ai_hermes" {
+                    if state.hermesAgents.isEmpty { return "Not connected" }
+                } else if let provider = ChatProvider(pillID: def.id), provider.isLocal {
                     let url = provider == .ollama ? state.ollamaServerURL : state.lmstudioServerURL
                     if url.isEmpty { return "Not connected" }
                 } else {

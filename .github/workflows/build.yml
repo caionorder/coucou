@@ -27,6 +27,9 @@ jobs:
       - name: Test chat parsing
         run: bash scripts/test-chat-parsing.sh
 
+      - name: Test Hermes chat
+        run: bash scripts/test-hermes-chat.sh
+
       - name: Test plan gauge
         run: bash scripts/test-plan-gauge.sh
 
