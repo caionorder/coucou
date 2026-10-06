@@ -48,27 +48,27 @@ struct ClaudePlanCardView: View {
     }
 
     private var subtitleText: String {
-        guard let usage else { return "Waiting for a Claude Code reply" }
+        guard let usage else { return String(localized: "Waiting for a Claude Code reply") }
         let diff = now.timeIntervalSince(usage.updatedAt)
-        if diff < 60 { return "just now" }
+        if diff < 60 { return String(localized: "just now") }
         let mins = Int(diff / 60)
-        if mins < 60 { return "\(mins) min ago" }
-        return "\(mins / 60) h ago"
+        if mins < 60 { return String(localized: "\(String(mins)) min ago") }
+        return String(localized: "\(String(mins / 60)) h ago")
     }
 }
 
 // MARK: - Gauge Row
 
-// DateFormatter created once, in English, for the weekly reset label
+// DateFormatter created once, in English (or Portuguese when the app is), for the weekly reset label
 private let weeklyResetFormatter: DateFormatter = {
     let fmt = DateFormatter()
-    fmt.locale = Locale(identifier: "en_US_POSIX")
+    fmt.locale = Locale(identifier: AppLanguage.isPortugueseUI ? "pt_BR" : "en_US_POSIX")
     fmt.dateFormat = "EEE H:mm"
     return fmt
 }()
 
 private struct GaugeRowView: View {
-    let label: String
+    let label: LocalizedStringKey
     let window: PlanWindow?
     let now: Date
     var weekly: Bool = false
@@ -115,14 +115,14 @@ private struct GaugeRowView: View {
 
     private func resetLabel(_ w: PlanWindow) -> String {
         let secs = w.resetsAt.timeIntervalSince(now)
-        guard secs > 0 else { return "Resetting…" }
+        guard secs > 0 else { return String(localized: "Resetting…") }
         if weekly {
             return weeklyResetFormatter.string(from: w.resetsAt)
         } else {
             let h = Int(secs / 3600)
             let m = Int((secs.truncatingRemainder(dividingBy: 3600)) / 60)
-            if h > 0 { return "in \(h) h \(m)" }
-            return "in \(m) min"
+            if h > 0 { return String(localized: "in \(String(h)) h \(String(m))") }
+            return String(localized: "in \(String(m)) min")
         }
     }
 }

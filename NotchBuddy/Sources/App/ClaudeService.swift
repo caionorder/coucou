@@ -235,7 +235,7 @@ final class ClaudeService {
             return
         }
         guard let key = apiKey, !key.isEmpty else {
-            await showError("API key missing. Open settings.", state: state)
+            await showError(String(localized: "API key missing. Open settings."), state: state)
             return
         }
 
@@ -299,7 +299,7 @@ final class ClaudeService {
         guard !baseURL.isEmpty else {
             if provider.isLocal {
                 let name = provider == .ollama ? "Ollama" : "LM Studio"
-                await showError("Connect \(name) in Settings → Chat first.", state: state)
+                await showError(String(localized: "Connect \(name) in Settings → Chat first."), state: state)
             }
             return
         }
@@ -311,7 +311,7 @@ final class ClaudeService {
             authHeader = "Bearer ollama"
         } else {
             guard let key = KeychainStore.shared.get(provider.keychainKey), !key.isEmpty else {
-                await showError("\(provider.displayName) API key missing. Configure it in Settings.", state: state)
+                await showError(String(localized: "\(provider.displayName) API key missing. Configure it in Settings."), state: state)
                 return
             }
             authHeader = "Bearer \(key)"
@@ -388,10 +388,10 @@ final class ClaudeService {
                 switch e {
                 case .serverUnreachable:
                     msg = provider == .ollama
-                        ? "Ollama isn't running. Open it, then ask again."
-                        : "Start the local server in LM Studio, then ask again."
+                        ? String(localized: "Ollama isn't running. Open it, then ask again.")
+                        : String(localized: "Start the local server in LM Studio, then ask again.")
                 case .modelNotFound(let m):
-                    msg = "\(m) isn't installed. Pick another model above the chat box."
+                    msg = String(localized: "\(m) isn't installed. Pick another model above the chat box.")
                 case .serverError(let s):
                     msg = s
                 }
@@ -417,7 +417,7 @@ final class ClaudeService {
                       let choices = json["choices"] as? [[String: Any]],
                       let message = choices.first?["message"] as? [String: Any],
                       let content = message["content"] as? String else {
-                    throw NSError(domain: "ChatAPI", code: 0, userInfo: [NSLocalizedDescriptionKey: "Unexpected response format"])
+                    throw NSError(domain: "ChatAPI", code: 0, userInfo: [NSLocalizedDescriptionKey: String(localized: "Unexpected response format")])
                 }
                 let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
                 conversationMessages.append(["role": "assistant", "content": trimmed])
@@ -467,7 +467,7 @@ final class ClaudeService {
 
     func chatHermes(query: String, context: PromptContext?, state: AppState) async {
         guard let agent = state.activeHermesAgent else {
-            await showError("Connect a Hermes agent in Settings → Chat first.", state: state)
+            await showError(String(localized: "Connect a Hermes agent in Settings → Chat first."), state: state)
             return
         }
         let signIn = agent.connection == .signIn
@@ -559,7 +559,7 @@ final class ClaudeService {
             if !conversationMessages.isEmpty { conversationMessages.removeLast() }
             state.chatHistory.removeAll { $0.id == msgId }
             state.stateOverride = nil
-            let msg = (error as? HermesChatError)?.userMessage ?? "Hermes request failed."
+            let msg = (error as? HermesChatError)?.userMessage ?? String(localized: "Hermes request failed.")
             await showError(msg, state: state)
         }
     }
@@ -568,7 +568,7 @@ final class ClaudeService {
 
     func search(query: String, context: PromptContext?, state: AppState) async {
         guard let key = apiKey, !key.isEmpty else {
-            await showError("Anthropic API key missing. Open settings to configure it.", state: state)
+            await showError(String(localized: "Anthropic API key missing. Open settings to configure it."), state: state)
             return
         }
 
@@ -639,12 +639,12 @@ final class ClaudeService {
                     let id = AppState.shared.claudeModel
                     throw NSError(domain: "Claude", code: 0,
                         userInfo: [NSLocalizedDescriptionKey:
-                            "Model not found: \(id). Pick another one in Settings."])
+                            String(localized: "Model not found: \(id). Pick another one in Settings.")])
                 }
                 throw NSError(domain: "Claude", code: 0,
                     userInfo: [NSLocalizedDescriptionKey: errMsg])
             }
-            let msg = String(data: data, encoding: .utf8) ?? "unknown error"
+            let msg = String(data: data, encoding: .utf8) ?? String(localized: "unknown error")
             throw NSError(domain: "Claude", code: 0, userInfo: [NSLocalizedDescriptionKey: msg])
         }
         return data
@@ -655,7 +655,7 @@ final class ClaudeService {
     private func handleChatResult(_ data: Data, state: AppState) async {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let content = json["content"] as? [[String: Any]] else {
-            await showError("Unexpected API response.", state: state)
+            await showError(String(localized: "Unexpected API response."), state: state)
             return
         }
 
@@ -664,7 +664,7 @@ final class ClaudeService {
 
         guard let textBlock = content.first(where: { $0["type"] as? String == "text" }),
               let text = textBlock["text"] as? String, !text.isEmpty else {
-            await showError("No response text.", state: state)
+            await showError(String(localized: "No response text."), state: state)
             return
         }
 
@@ -684,7 +684,7 @@ final class ClaudeService {
               let content = json["content"] as? [[String: Any]],
               let textBlock = content.first(where: { $0["type"] as? String == "text" }),
               let text = textBlock["text"] as? String else {
-            await showError("Unexpected API response.", state: state)
+            await showError(String(localized: "Unexpected API response."), state: state)
             return
         }
 
@@ -699,7 +699,7 @@ final class ClaudeService {
         // Try to parse as our JSON format
         if let resultData = cleanText.data(using: .utf8),
            let parsed = try? JSONSerialization.jsonObject(with: resultData) as? [String: Any] {
-            let title  = parsed["title"] as? String ?? "Result"
+            let title  = parsed["title"] as? String ?? String(localized: "Result")
             let note   = parsed["note"] as? String
             var items: [ResultItem] = []
             if let rawItems = parsed["items"] as? [[String: Any]] {
@@ -716,7 +716,7 @@ final class ClaudeService {
             // Fallback: show raw text in 3-line chunks
             let lines = cleanText.components(separatedBy: "\n").filter { !$0.isEmpty }.prefix(3)
             state.searchResult = SearchResult(
-                title: "Claude's response",
+                title: String(localized: "Claude's response"),
                 items: lines.map { ResultItem(label: $0, detail: "", url: nil) },
                 note: nil
             )

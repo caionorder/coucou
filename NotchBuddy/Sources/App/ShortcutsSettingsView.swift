@@ -91,7 +91,7 @@ struct ShortcutsSettingsView: View {
         .opacity(isEnabled ? 1 : 0.5)
     }
 
-    private func conflictTag(_ text: String, color: Color) -> some View {
+    private func conflictTag(_ text: LocalizedStringKey, color: Color) -> some View {
         Text(text)
             .font(.system(size: 10, weight: .medium))
             .foregroundColor(color)

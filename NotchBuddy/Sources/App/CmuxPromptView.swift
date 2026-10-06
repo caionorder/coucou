@@ -52,9 +52,18 @@ struct CmuxPromptView: View {
 
     private var notice: String? {
         if let n = state.cmuxNotice { return n }
+        return impliedFailure?.message
+    }
+
+    /// The failure the notice stands for: the one stored with it, or the one the session state implies.
+    private var noticeFailure: CmuxControl.Failure? {
+        state.cmuxNotice != nil ? state.cmuxNoticeFailure : impliedFailure
+    }
+
+    private var impliedFailure: CmuxControl.Failure? {
         if isReply, let t = replyTask, !sessionCanReceive {
-            return (HookServer.shared.cmuxDialogMayBeOpen(t.id)
-                    ? CmuxControl.Failure.dialogMayBeOpen : CmuxControl.Failure.blockedByDialog).message
+            return HookServer.shared.cmuxDialogMayBeOpen(t.id)
+                ? CmuxControl.Failure.dialogMayBeOpen : CmuxControl.Failure.blockedByDialog
         }
         return nil
     }
@@ -96,7 +105,7 @@ struct CmuxPromptView: View {
                             .font(.system(size: 11))
                             .foregroundColor(Color(hex: "#8E939C"))
                             .lineLimit(2)
-                        if isReply, let t = replyTask, notice == CmuxControl.Failure.dialogMayBeOpen.message {
+                        if isReply, let t = replyTask, noticeFailure == .dialogMayBeOpen {
                             // Explicit click: the user says the request is gone (answered, then declined, in cmux).
                             Button("Answered") {
                                 HookServer.shared.clearCmuxDialogMark(t.id)
@@ -106,14 +115,13 @@ struct CmuxPromptView: View {
                             .font(.system(size: 11)).foregroundColor(Color(hex: "#7DD3FC").opacity(0.85))
                             .buttonStyle(.plain)
                         }
-                        if notice == CmuxControl.Failure.noCredential.message {
+                        if noticeFailure == .noCredential {
                             Button("Settings…") {
                                 NotificationCenter.default.post(name: .openFullSettings, object: "agents")
                             }
                             .font(.system(size: 11)).foregroundColor(Color(hex: "#8E939C")).buttonStyle(.plain)
                         }
-                        if notice == CmuxControl.Failure.noCredential.message
-                            || notice == CmuxControl.Failure.notRunning.message {
+                        if noticeFailure == .noCredential || noticeFailure == .notRunning {
                             Button("Open cmux") { CmuxHub.openCmux() }
                                 .font(.system(size: 11)).foregroundColor(Color(hex: "#7DD3FC").opacity(0.85))
                                 .buttonStyle(.plain)
@@ -123,7 +131,7 @@ struct CmuxPromptView: View {
                 }
 
                 HStack(spacing: 8) {
-                    TextField(isReply ? "Reply…" : "First prompt…", text: $text)
+                    TextField(isReply ? String(localized: "Reply…") : String(localized: "First prompt…"), text: $text)
                         .textFieldStyle(.plain)
                         .font(.system(size: 13))
                         .focused($focused)
@@ -253,7 +261,7 @@ struct CmuxPromptView: View {
         case .reply(let id):
             CmuxControl.send(text: prompt, to: id) { failure in
                 if let failure {
-                    state.cmuxNotice = failure.message
+                    state.showCmuxFailure(failure)
                     if failure != .enterNotSent { text = prompt } else { text = "" }
                 } else {
                     text = ""
@@ -263,7 +271,7 @@ struct CmuxPromptView: View {
             let chosen = folder
             CmuxControl.newChat(folder: chosen, prompt: prompt) { failure in
                 if let failure {
-                    state.cmuxNotice = failure.message
+                    state.showCmuxFailure(failure)
                     text = prompt
                 } else {
                     text = ""

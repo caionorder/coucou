@@ -1,18 +1,29 @@
 import Foundation
 
 /// Language of the short activity steps shown in the island ticker ("Lit · file.swift").
-/// Portuguese when the first preferred language is Portuguese or the region is Brazil, French otherwise.
+/// Portuguese when the app language is Portuguese. Otherwise (System, or English since there is no
+/// English table) Portuguese when the first preferred language is Portuguese or the region is Brazil,
+/// French otherwise.
 enum StepLanguage {
     case french, portuguese
 
-    static func choose(preferred: [String], regionCode: String?) -> StepLanguage {
+    static func choose(appLanguage: AppLanguage = .system, preferred: [String], regionCode: String?) -> StepLanguage {
+        if appLanguage == .portuguese { return .portuguese }
         if let first = preferred.first, first.lowercased().hasPrefix("pt") { return .portuguese }
         if regionCode?.uppercased() == "BR" { return .portuguese }
         return .french
     }
 
     static var current: StepLanguage {
-        choose(preferred: Locale.preferredLanguages, regionCode: Locale.current.region?.identifier)
+        let app = AppLanguage.launched
+        // With an explicit app language, Locale.preferredLanguages is that choice: read the system's own list.
+        let preferred = app == .system ? Locale.preferredLanguages : systemPreferredLanguages
+        return choose(appLanguage: app, preferred: preferred, regionCode: Locale.current.region?.identifier)
+    }
+
+    private static var systemPreferredLanguages: [String] {
+        UserDefaults.standard.persistentDomain(forName: UserDefaults.globalDomain)?["AppleLanguages"] as? [String]
+            ?? Locale.preferredLanguages
     }
 
     private static let frenchTable: [String: String] = [

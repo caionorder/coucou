@@ -420,7 +420,7 @@ final class HookServer: @unchecked Sendable {
                      ?? "unknown"
         let cwd = payload["cwd"] as? String ?? ""
         let rawName = URL(fileURLWithPath: cwd).lastPathComponent
-        let projectName = aliasProjectName(rawName.isEmpty ? "Session" : rawName)
+        let projectName = aliasProjectName(rawName.isEmpty ? String(localized: "Session") : rawName)
 
         // Determine which pill this event belongs to.
         // coucou_agent must be lowercase, digits and hyphens, ≤ 24 chars.
@@ -505,12 +505,12 @@ final class HookServer: @unchecked Sendable {
         if let pending = state.pendingApproval, agentId == pending.pillId {
             let handledNote: String
             switch pending.pillId {
-            case "agent_cursor": handledNote = "Handled in Cursor."
-            case "agent_codex":  handledNote = "Handled in Codex."
+            case "agent_cursor": handledNote = String(localized: "Handled in Cursor.")
+            case "agent_codex":  handledNote = String(localized: "Handled in Codex.")
             #if !APPSTORE
-            case let id where CmuxRouting.isCmuxTaskId(id): handledNote = "Handled in cmux."
+            case let id where CmuxRouting.isCmuxTaskId(id): handledNote = String(localized: "Handled in cmux.")
             #endif
-            default:             handledNote = "Handled in VS Code."
+            default:             handledNote = String(localized: "Handled in VS Code.")
             }
             var resolved = false
             #if !APPSTORE
@@ -601,7 +601,7 @@ final class HookServer: @unchecked Sendable {
 
         case "PostToolUseFailure":
             state.updateTask(id: agentId, state: .working)
-            appendStep(id: agentId, step: "⚠ failed")
+            appendStep(id: agentId, step: String(localized: "⚠ failed"))
 
         case "Notification":
             let message = payload["message"] as? String ?? ""
@@ -695,10 +695,10 @@ final class HookServer: @unchecked Sendable {
             #endif
 
         case "SubagentStart":
-            appendStep(id: agentId, step: "+ subagent")
+            appendStep(id: agentId, step: String(localized: "+ subagent"))
 
         case "SubagentStop":
-            appendStep(id: agentId, step: "• subagent done")
+            appendStep(id: agentId, step: String(localized: "• subagent done"))
 
         default:
             break
@@ -786,7 +786,7 @@ final class HookServer: @unchecked Sendable {
                      ?? "unknown"
         let cwd       = payload["cwd"]        as? String ?? ""
         let rawName   = URL(fileURLWithPath: cwd).lastPathComponent
-        let projectName = aliasProjectName(rawName.isEmpty ? "Session" : rawName)
+        let projectName = aliasProjectName(rawName.isEmpty ? String(localized: "Session") : rawName)
 
         let rawAgent = payload["coucou_agent"] as? String ?? ""
         let termProgram = payload["term_program"] as? String ?? ""
@@ -922,16 +922,16 @@ final class HookServer: @unchecked Sendable {
             guard let self, self.pendingApprovalFD == fd else { return }
             let note: String
             switch capturedPillId {
-            case "agent_cursor": note = "Handled in Cursor."
-            case "agent_codex":  note = "Handled in Codex."
+            case "agent_cursor": note = String(localized: "Handled in Cursor.")
+            case "agent_codex":  note = String(localized: "Handled in Codex.")
             #if !APPSTORE
             case let id where CmuxRouting.isCmuxTaskId(id):
                 // A card promoted late was closed by the hook's own timeout: nobody handled it.
                 note = CmuxRouting.isLateCard(arrivedAt: self.cmuxShownArrival,
                                               now: Date().timeIntervalSinceReferenceDate)
-                    ? "Still waiting in cmux." : "Handled in cmux."
+                    ? String(localized: "Still waiting in cmux.") : String(localized: "Handled in cmux.")
             #endif
-            default:             note = "Handled in VS Code."
+            default:             note = String(localized: "Handled in VS Code.")
             }
             // A cmux card that reads EOF while still young was answered in the terminal: no dialog is left.
             var answeredInTerminal = false
@@ -954,12 +954,12 @@ final class HookServer: @unchecked Sendable {
             guard let self, self.pendingApprovalFD == captured, self.cardGeneration == gen else { return }
             let note: String
             switch capturedPillId {
-            case "agent_cursor": note = "Still waiting in Cursor."
-            case "agent_codex":  note = "Still waiting in Codex."
+            case "agent_cursor": note = String(localized: "Still waiting in Cursor.")
+            case "agent_codex":  note = String(localized: "Still waiting in Codex.")
             #if !APPSTORE
-            case let id where CmuxRouting.isCmuxTaskId(id): note = "Still waiting in cmux."
+            case let id where CmuxRouting.isCmuxTaskId(id): note = String(localized: "Still waiting in cmux.")
             #endif
-            default:             note = "Still waiting in VS Code."
+            default:             note = String(localized: "Still waiting in VS Code.")
             }
             self.dismissApprovalCard(note: note)
         }
@@ -1032,7 +1032,7 @@ final class HookServer: @unchecked Sendable {
                      ?? "unknown"
         let cwd       = payload["cwd"]        as? String ?? ""
         let rawName   = URL(fileURLWithPath: cwd).lastPathComponent
-        let projectName = aliasProjectName(rawName.isEmpty ? "Session" : rawName)
+        let projectName = aliasProjectName(rawName.isEmpty ? String(localized: "Session") : rawName)
 
         let rawAgent    = payload["coucou_agent"] as? String ?? ""
         let termProgram = payload["term_program"]  as? String ?? ""
@@ -1241,16 +1241,16 @@ final class HookServer: @unchecked Sendable {
         cmuxLaunchGeneration += 1
         let generation = cmuxLaunchGeneration
         let state = AppState.shared
-        state.cmuxNotice = "Starting claude…"
+        state.cmuxNotice = String(localized: "Starting claude…")
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
             guard let self, self.cmuxLaunchGeneration == generation, self.cmuxPendingLaunch != nil else { return }
-            AppState.shared.cmuxNotice = "Waiting for claude. It may be asking to trust the folder."
+            AppState.shared.cmuxNotice = String(localized: "Waiting for claude. It may be asking to trust the folder.")
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + CmuxRouting.launchTimeout) { [weak self] in
             guard let self, self.cmuxLaunchGeneration == generation, let pending = self.cmuxPendingLaunch else { return }
             self.cmuxPendingLaunch = nil
             let state = AppState.shared
-            state.cmuxNotice = "claude did not start in time."
+            state.cmuxNotice = String(localized: "claude did not start in time.")
             state.cmuxDraft = CmuxDraft(mode: .newChat, text: pending.prompt)
         }
     }
@@ -1427,7 +1427,7 @@ final class HookServer: @unchecked Sendable {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             CmuxControl.send(text: prompt, to: agentId) { failure in
                 guard let failure else { return }
-                AppState.shared.cmuxNotice = failure.message
+                AppState.shared.showCmuxFailure(failure)
                 if failure != .enterNotSent {
                     AppState.shared.cmuxDraft = CmuxDraft(mode: .reply(taskId: agentId), text: prompt)
                 }
@@ -1520,7 +1520,7 @@ final class HookServer: @unchecked Sendable {
 
         let cwd = payload["cwd"] as? String ?? ""
         let rawName = URL(fileURLWithPath: cwd).lastPathComponent
-        upsertWorkspaceTask(id: taskId, projectName: aliasProjectName(rawName.isEmpty ? "Session" : rawName), cwd: cwd)
+        upsertWorkspaceTask(id: taskId, projectName: aliasProjectName(rawName.isEmpty ? String(localized: "Session") : rawName), cwd: cwd)
         state.updateTask(id: taskId, state: kind == .approval ? .approval : .question)
         setPillBadge(id: taskId, badge: .approval)
         nbLog("\(kind == .approval ? "PermissionRequest" : "AskUserQuestion") \(tool) [\(taskId)] queued")
@@ -2013,7 +2013,7 @@ final class HookServer: @unchecked Sendable {
             if clCheck.terminationStatus != 0 {
                 throw NSError(domain: "Coucou", code: 1,
                               userInfo: [NSLocalizedDescriptionKey:
-                                  "Command Line Tools are required but not installed. Run: xcode-select --install"])
+                                  String(localized: "Command Line Tools are required but not installed. Run: xcode-select --install")])
             }
 
             if let existing = oldSL,
@@ -2240,7 +2240,7 @@ final class HookServer: @unchecked Sendable {
         let exists = FileManager.default.fileExists(atPath: url.path)
         if !install && !exists {
             throw NSError(domain: "CoucouNoop", code: 0, userInfo: [
-                NSLocalizedDescriptionKey: "No Gemini CLI hooks to remove."
+                NSLocalizedDescriptionKey: String(localized: "No Gemini CLI hooks to remove.")
             ])
         }
         let current = exists ? try Data(contentsOf: url) : Data()
@@ -2256,7 +2256,7 @@ final class HookServer: @unchecked Sendable {
         let current = (try? Data(contentsOf: url)) ?? Data()
         guard sha256Hex(current) == fp else {
             throw NSError(domain: "Coucou", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "~/.gemini/settings.json changed since preview. Refresh and try again."
+                NSLocalizedDescriptionKey: String(localized: "~/.gemini/settings.json changed since preview. Refresh and try again.")
             ])
         }
         try writeJSONFile(data, to: url, suffix: "settings.json")
@@ -2269,7 +2269,7 @@ final class HookServer: @unchecked Sendable {
                                                      label: "~/.gemini/settings.json")
         if let raw = settings["hooks"], !(raw is [String: Any]) {
             throw NSError(domain: "Coucou", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "~/.gemini/settings.json: \"hooks\" has an unexpected type — Coucou has not touched it."
+                NSLocalizedDescriptionKey: String(localized: "~/.gemini/settings.json: \"hooks\" has an unexpected type — Coucou has not touched it.")
             ])
         }
         let base = hookBase()
@@ -2286,7 +2286,7 @@ final class HookServer: @unchecked Sendable {
         for (geminiEvent, normalizedEvent, timeout) in events {
             if let raw = hooks[geminiEvent], !(raw is [[String: Any]]) {
                 throw NSError(domain: "Coucou", code: 2, userInfo: [
-                    NSLocalizedDescriptionKey: "~/.gemini/settings.json: \"hooks\"[\"\(geminiEvent)\"] has an unexpected type — Coucou has not touched it."
+                    NSLocalizedDescriptionKey: String(localized: "~/.gemini/settings.json: \"hooks\"[\"\(geminiEvent)\"] has an unexpected type — Coucou has not touched it.")
                 ])
             }
             var groups = hooks[geminiEvent] as? [[String: Any]] ?? []
@@ -2310,7 +2310,7 @@ final class HookServer: @unchecked Sendable {
                                                      label: "~/.gemini/settings.json")
         if let raw = settings["hooks"], !(raw is [String: Any]) {
             throw NSError(domain: "Coucou", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "~/.gemini/settings.json: \"hooks\" has an unexpected type — Coucou has not touched it."
+                NSLocalizedDescriptionKey: String(localized: "~/.gemini/settings.json: \"hooks\" has an unexpected type — Coucou has not touched it.")
             ])
         }
         if var hooks = settings["hooks"] as? [String: Any] {
@@ -2336,7 +2336,7 @@ final class HookServer: @unchecked Sendable {
         let exists = FileManager.default.fileExists(atPath: url.path)
         if !install && !exists {
             throw NSError(domain: "CoucouNoop", code: 0, userInfo: [
-                NSLocalizedDescriptionKey: "No Antigravity hooks to remove."
+                NSLocalizedDescriptionKey: String(localized: "No Antigravity hooks to remove.")
             ])
         }
         let current = exists ? try Data(contentsOf: url) : Data()
@@ -2352,7 +2352,7 @@ final class HookServer: @unchecked Sendable {
         let current = (try? Data(contentsOf: url)) ?? Data()
         guard sha256Hex(current) == fp else {
             throw NSError(domain: "Coucou", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "~/.gemini/config/hooks.json changed since preview. Refresh and try again."
+                NSLocalizedDescriptionKey: String(localized: "~/.gemini/config/hooks.json changed since preview. Refresh and try again.")
             ])
         }
         try writeJSONFile(data, to: url, suffix: "hooks.json")
@@ -2408,12 +2408,12 @@ final class HookServer: @unchecked Sendable {
         do { data = try Data(contentsOf: url) }
         catch {
             throw NSError(domain: "Coucou", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "\(label) cannot be read — Coucou has not touched it."
+                NSLocalizedDescriptionKey: String(localized: "\(label) cannot be read — Coucou has not touched it.")
             ])
         }
         guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
             throw NSError(domain: "Coucou", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "\(label) is not valid JSON — Coucou has not touched it."
+                NSLocalizedDescriptionKey: String(localized: "\(label) is not valid JSON — Coucou has not touched it.")
             ])
         }
         return obj
@@ -2431,7 +2431,7 @@ final class HookServer: @unchecked Sendable {
             do { try fm.copyItem(at: url, to: backupURL) }
             catch {
                 throw NSError(domain: "Coucou", code: 3, userInfo: [
-                    NSLocalizedDescriptionKey: "Could not back up \(url.lastPathComponent): \(error.localizedDescription)"
+                    NSLocalizedDescriptionKey: String(localized: "Could not back up \(url.lastPathComponent): \(error.localizedDescription)")
                 ])
             }
         }
@@ -2491,7 +2491,7 @@ final class HookServer: @unchecked Sendable {
         let exists = FileManager.default.fileExists(atPath: url.path)
         if !install && !exists {
             throw NSError(domain: "CoucouNoop", code: 0, userInfo: [
-                NSLocalizedDescriptionKey: "No Codex hooks to remove."
+                NSLocalizedDescriptionKey: String(localized: "No Codex hooks to remove.")
             ])
         }
         let current = exists ? try Data(contentsOf: url) : Data()
@@ -2507,7 +2507,7 @@ final class HookServer: @unchecked Sendable {
         let current = (try? Data(contentsOf: url)) ?? Data()
         guard sha256Hex(current) == fp else {
             throw NSError(domain: "Coucou", code: 1, userInfo: [
-                NSLocalizedDescriptionKey: "~/.codex/hooks.json changed since preview. Refresh and try again."
+                NSLocalizedDescriptionKey: String(localized: "~/.codex/hooks.json changed since preview. Refresh and try again.")
             ])
         }
         try writeJSONFile(data, to: url, suffix: "hooks.json")
@@ -2519,7 +2519,7 @@ final class HookServer: @unchecked Sendable {
         var root = try Self.strictReadJSONObject(at: Self.codexHooksURL, label: "~/.codex/hooks.json")
         if let raw = root["hooks"], !(raw is [String: Any]) {
             throw NSError(domain: "Coucou", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "~/.codex/hooks.json: \"hooks\" has an unexpected type — Coucou has not touched it."
+                NSLocalizedDescriptionKey: String(localized: "~/.codex/hooks.json: \"hooks\" has an unexpected type — Coucou has not touched it.")
             ])
         }
         let base = hookBase()
@@ -2541,7 +2541,7 @@ final class HookServer: @unchecked Sendable {
         for (event, timeout, statusMsg) in events {
             if let raw = hooks[event], !(raw is [[String: Any]]) {
                 throw NSError(domain: "Coucou", code: 2, userInfo: [
-                    NSLocalizedDescriptionKey: "~/.codex/hooks.json: \"hooks\"[\"\(event)\"] has an unexpected type — Coucou has not touched it."
+                    NSLocalizedDescriptionKey: String(localized: "~/.codex/hooks.json: \"hooks\"[\"\(event)\"] has an unexpected type — Coucou has not touched it.")
                 ])
             }
             var groups = hooks[event] as? [[String: Any]] ?? []
@@ -2565,7 +2565,7 @@ final class HookServer: @unchecked Sendable {
         var root = try Self.strictReadJSONObject(at: Self.codexHooksURL, label: "~/.codex/hooks.json")
         if let raw = root["hooks"], !(raw is [String: Any]) {
             throw NSError(domain: "Coucou", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "~/.codex/hooks.json: \"hooks\" has an unexpected type — Coucou has not touched it."
+                NSLocalizedDescriptionKey: String(localized: "~/.codex/hooks.json: \"hooks\" has an unexpected type — Coucou has not touched it.")
             ])
         }
         if var hooks = root["hooks"] as? [String: Any] {

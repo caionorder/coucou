@@ -16,15 +16,15 @@ enum CmuxControl {
 
         var message: String {
             switch self {
-            case .notRunning:      return "cmux is not running."
-            case .notVerified:     return "cmux could not be verified."
-            case .noCredential:    return "No open cmux session. Add the socket password in Settings, or start one session in cmux."
-            case .blockedByDialog: return "Answer the pending request first."
-            case .dialogMayBeOpen: return "A request may still be open in cmux. Answer it there first."
-            case .invalidInput:    return "Check the folder / command in Settings."
-            case .busy:            return "Still sending, try again in a moment."
-            case .enterNotSent:    return "Text is in the prompt, press Return in cmux."
-            case .cli(let code):   return "cmux refused the command (code \(code))."
+            case .notRunning:      return String(localized: "cmux is not running.")
+            case .notVerified:     return String(localized: "cmux could not be verified.")
+            case .noCredential:    return String(localized: "No open cmux session. Add the socket password in Settings, or start one session in cmux.")
+            case .blockedByDialog: return String(localized: "Answer the pending request first.")
+            case .dialogMayBeOpen: return String(localized: "A request may still be open in cmux. Answer it there first.")
+            case .invalidInput:    return String(localized: "Check the folder / command in Settings.")
+            case .busy:            return String(localized: "Still sending, try again in a moment.")
+            case .enterNotSent:    return String(localized: "Text is in the prompt, press Return in cmux.")
+            case .cli(let code):   return String(localized: "cmux refused the command (code \(String(code))).")
             }
         }
     }

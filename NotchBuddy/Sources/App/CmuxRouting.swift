@@ -346,8 +346,10 @@ extension CmuxRouting {
 extension CmuxRouting {
     /// Notice of the folder fallback: names the session the draft will go to.
     static func folderDraftNotice(sessionName: String) -> String {
-        let name = cleanLabel(sessionName) ?? "the new session"
-        return "claude started in \(name). Check the prompt and press Send."
+        guard let name = cleanLabel(sessionName) else {
+            return String(localized: "claude started in the new session. Check the prompt and press Send.")
+        }
+        return String(localized: "claude started in \(name). Check the prompt and press Send.")
     }
 
     /// Connected, non-blocking-then-blocking probe socket to the unix socket at `path`. The caller closes it.

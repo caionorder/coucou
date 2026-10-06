@@ -43,16 +43,16 @@ enum HermesChatError: Error, Equatable {
 
     var userMessage: String {
         switch self {
-        case .invalidURL:    return "Enter a URL like https://hermes.example.com."
-        case .insecureURL:   return "Use https:// for this host. http:// is only allowed for localhost and private addresses."
-        case .unauthorized:  return "Hermes refused the API key. Each profile has its own key."
-        case .notFound:      return "Hermes has no such profile at this URL. Check the profile name."
-        case .busy:          return "The agent is busy. Try again in a moment."
-        case .notHermes:     return "This URL doesn't answer like a Hermes API server. Use the API address, not the dashboard."
-        case .unreachable(let host): return "Can't reach Hermes at \(host). Is the gateway running?"
+        case .invalidURL:    return String(localized: "Enter a URL like https://hermes.example.com.")
+        case .insecureURL:   return String(localized: "Use https:// for this host. http:// is only allowed for localhost and private addresses.")
+        case .unauthorized:  return String(localized: "Hermes refused the API key. Each profile has its own key.")
+        case .notFound:      return String(localized: "Hermes has no such profile at this URL. Check the profile name.")
+        case .busy:          return String(localized: "The agent is busy. Try again in a moment.")
+        case .notHermes:     return String(localized: "This URL doesn't answer like a Hermes API server. Use the API address, not the dashboard.")
+        case .unreachable(let host): return String(localized: "Can't reach Hermes at \(host). Is the gateway running?")
         case .server(let m), .agentFailed(let m): return m
-        case .notBound(let name): return "\(name) changed since it was connected, so its key was not sent. Disconnect it and connect it again in Settings → Chat."
-        case .signInNeeded(let name): return "Sign in to \(name) again in Settings → Chat."
+        case .notBound(let name): return String(localized: "\(name) changed since it was connected, so its key was not sent. Disconnect it and connect it again in Settings → Chat.")
+        case .signInNeeded(let name): return String(localized: "Sign in to \(name) again in Settings → Chat.")
         case .signInFailed(let m): return m
         }
     }
@@ -196,7 +196,7 @@ enum HermesChat {
               let reason = choice["finish_reason"] as? String, reason != "stop" else { return nil }
         let err = (json["error"] as? [String: Any]) ?? (choice["error"] as? [String: Any])
         if let m = err?["message"] as? String, !m.isEmpty { return String(m.prefix(200)) }
-        return "The agent stopped with an error."
+        return String(localized: "The agent stopped with an error.")
     }
 
     static func error(status: Int, body: Data) -> HermesChatError {
@@ -292,14 +292,14 @@ enum HermesChat {
         static let standard = Limits()
     }
 
-    static let interruptedNote = "(The answer was interrupted.)"
-    static let tooLongNote = "(The answer was cut: it went over the size limit.)"
-    static let tooSlowNote = "(The answer was cut: it took longer than 15 minutes.)"
+    static let interruptedNote = String(localized: "(The answer was interrupted.)")
+    static let tooLongNote = String(localized: "(The answer was cut: it went over the size limit.)")
+    static let tooSlowNote = String(localized: "(The answer was cut: it took longer than 15 minutes.)")
 
     private static func session() -> URLSession { URLSession(configuration: .ephemeral) }
 
     static func hostLabel(_ baseURL: String) -> String {
-        URL(string: baseURL)?.host ?? "the server"
+        URL(string: baseURL)?.host ?? String(localized: "the server")
     }
 
     /// `GET /v1/models` with the key. The only request made during setup. Returns the model name.
@@ -318,7 +318,7 @@ enum HermesChat {
             for try await b in bytes {
                 data.append(b)
                 if data.count > limits.connectBodyBytes {
-                    return .failure(.server("The server answer is too large for a Hermes API."))
+                    return .failure(.server(String(localized: "The server answer is too large for a Hermes API.")))
                 }
             }
         } catch {
@@ -451,7 +451,7 @@ enum HermesChat {
         let text = LocalChat.filterThinkingBlocks(state.text).trimmingCharacters(in: .whitespacesAndNewlines)
         let capNote: String? = tooSlow ? tooSlowNote : (lineTooLong || state.overLimit) ? tooLongNote : nil
         if text.isEmpty {
-            throw HermesChatError.agentFailed(state.failure ?? capNote ?? "The agent returned no text.")
+            throw HermesChatError.agentFailed(state.failure ?? capNote ?? String(localized: "The agent returned no text."))
         }
         // Some text arrived: keep it, and say so when the stream did not end normally.
         if let capNote { return text + "\n\n" + capNote }

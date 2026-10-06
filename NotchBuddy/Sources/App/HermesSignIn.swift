@@ -57,8 +57,8 @@ enum HermesSignIn {
 
     // MARK: Callback
 
-    static let refusedMessage = "Hermes refused the sign in."
-    static let stateMessage = "Sign in was rejected: the answer did not match this request."
+    static let refusedMessage = String(localized: "Hermes refused the sign in.")
+    static let stateMessage = String(localized: "Sign in was rejected: the answer did not match this request.")
 
     private static func callbackItems(_ requestLine: String) -> [URLQueryItem]? {
         let parts = requestLine.split(separator: " ", omittingEmptySubsequences: true)
@@ -119,7 +119,7 @@ enum HermesSignIn {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let access = json["access_token"] as? String, access.count >= 16, access.count <= 16_384,
               !access.contains(where: { $0.isWhitespace || $0.isNewline }) else {
-            return .failure(.signInFailed("Hermes refused the sign in code. Try again."))
+            return .failure(.signInFailed(String(localized: "Hermes refused the sign in code. Try again.")))
         }
         let newRefresh = (json["refresh_token"] as? String) ?? ""
         var expires = (json["expires_at"] as? NSNumber)?.doubleValue ?? 0
@@ -172,7 +172,7 @@ enum HermesSignIn {
         return h == "127.0.0.1" || h == "localhost" || h == "::1"
     }
 
-    static let httpsOnlyMessage = "Sign in needs https://. Plain http:// is only accepted for localhost."
+    static let httpsOnlyMessage = String(localized: "Sign in needs https://. Plain http:// is only accepted for localhost.")
 
     /// The session is a full dashboard credential: https everywhere, plain http only to loopback
     /// (stricter than the API key rule, which also accepts private addresses and single label names).
@@ -360,8 +360,8 @@ enum HermesSignIn {
 
     // MARK: Turn reducer (no I/O)
 
-    static let approvalNote = "(The agent needed an approval that Coucou cannot give yet. Approve it in the Hermes app.)"
-    static let newSessionNote = "(The previous session was no longer available, so a new one was started.)"
+    static let approvalNote = String(localized: "(The agent needed an approval that Coucou cannot give yet. Approve it in the Hermes app.)")
+    static let newSessionNote = String(localized: "(The previous session was no longer available, so a new one was started.)")
 
     struct Turn {
         /// Runtime session id. Frames for another non-empty session id are ignored; empty = not set yet.
@@ -413,7 +413,7 @@ enum HermesSignIn {
                 guard !other(s), !done, !awaitingStart else { return false }
                 done = true
                 status = "error"
-                failure = m.isEmpty ? "The agent stopped with an error." : m
+                failure = m.isEmpty ? String(localized: "The agent stopped with an error.") : m
                 return false
             case .start(let s):
                 // A turn starts here: whatever came before on this socket belongs to an earlier turn.
@@ -456,7 +456,7 @@ enum HermesSignIn {
             let visible = LocalChat.filterThinkingBlocks(source).trimmingCharacters(in: .whitespacesAndNewlines)
             let capNote: String? = tooSlow ? HermesChat.tooSlowNote : overLimit ? HermesChat.tooLongNote : nil
             if visible.isEmpty {
-                throw HermesChatError.agentFailed(failure ?? capNote ?? "The agent returned no text.")
+                throw HermesChatError.agentFailed(failure ?? capNote ?? String(localized: "The agent returned no text."))
             }
             var notes: [String] = []
             if let capNote { notes.append(capNote) }

@@ -224,7 +224,8 @@ final class HermesLoopback: @unchecked Sendable {
     fileprivate static let response: Data = {
         let body = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Coucou</title></head>"
             + "<body style=\"font-family:-apple-system,sans-serif;text-align:center;margin-top:20vh\">"
-            + "<h2>Back to Coucou</h2><p>You can close this window and return to the app.</p></body></html>"
+            + "<h2>" + String(localized: "Back to Coucou") + "</h2><p>"
+            + String(localized: "You can close this window and return to the app.") + "</p></body></html>"
         let head = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n"
             + "Connection: close\r\nContent-Length: \(body.utf8.count)\r\n\r\n"
         return Data((head + body).utf8)
@@ -309,7 +310,7 @@ enum HermesSignInNet {
             for try await b in bytes {
                 data.append(b)
                 if data.count > HermesChat.Limits.standard.connectBodyBytes {
-                    return .failure(.server("The server answer is too large for a Hermes server."))
+                    return .failure(.server(String(localized: "The server answer is too large for a Hermes server.")))
                 }
             }
         } catch {
@@ -349,7 +350,7 @@ enum HermesSignInNet {
         case .failure(let e): return .failure(e)
         case .success(let (status, body)):
             if HermesSignIn.isSessionExpired(status: status, body: body) {
-                return .failure(.signInFailed("Hermes refused the session. Sign in again."))
+                return .failure(.signInFailed(String(localized: "Hermes refused the session. Sign in again.")))
             }
             guard status == 200 else { return .failure(.server("HTTP \(status)")) }
             return .success(HermesSignIn.parseProfiles(body))
@@ -372,7 +373,7 @@ enum HermesSignInNet {
         let host = HermesChat.hostLabel(baseURL)
         let pkce = HermesSignIn.makePKCE()
         guard let (listener, port) = await HermesLoopback.start(expectedState: pkce.state) else {
-            return .failure(.signInFailed("Coucou could not open a local port for sign in."))
+            return .failure(.signInFailed(String(localized: "Coucou could not open a local port for sign in.")))
         }
         defer { listener.stop() }
         guard let url = HermesSignIn.authorizeURL(baseURL: baseURL, pkce: pkce,
@@ -381,7 +382,7 @@ enum HermesSignInNet {
         }
         await MainActor.run { open(url) }
         guard let line = await listener.waitForCallback(timeout: timeout) else {
-            return .failure(.signInFailed("Sign in timed out. Try again."))
+            return .failure(.signInFailed(String(localized: "Sign in timed out. Try again.")))
         }
         listener.stop()
         let code: String
@@ -394,7 +395,7 @@ enum HermesSignInNet {
         case .failure(let e): return .failure(e)
         case .success(let (status, body)):
             guard status == 200 else {
-                return .failure(.signInFailed("Hermes refused the sign in code. Try again."))
+                return .failure(.signInFailed(String(localized: "Hermes refused the sign in code. Try again.")))
             }
             return HermesSignIn.parseTokenResponse(body, baseURL: baseURL, previous: nil)
         }
@@ -499,7 +500,7 @@ enum HermesSignInNet {
             while let ev = await socket.next() {
                 switch ev {
                 case .text(let t):
-                    if overBudget(bytes: t.utf8.count) { throw HermesChatError.server("Hermes sent more data than Coucou accepts.") }
+                    if overBudget(bytes: t.utf8.count) { throw HermesChatError.server(String(localized: "Hermes sent more data than Coucou accepts.")) }
                     let f = HermesSignIn.decode(t)
                     if case .serverRequest(let sid, _) = f {
                         await socket.sendBestEffort(HermesSignIn.rejection(id: sid), timeout: 2)
@@ -513,9 +514,9 @@ enum HermesSignInNet {
                     default: break
                     }
                 case .binary(let n):
-                    if overBudget(bytes: n) { throw HermesChatError.server("Hermes sent more data than Coucou accepts.") }
+                    if overBudget(bytes: n) { throw HermesChatError.server(String(localized: "Hermes sent more data than Coucou accepts.")) }
                 case .closed: throw HermesChatError.unreachable(host)
-                case .timeout: throw HermesChatError.server("Hermes did not answer in time.")
+                case .timeout: throw HermesChatError.server(String(localized: "Hermes did not answer in time."))
                 case .ping, .deadline: break
                 }
             }
@@ -542,13 +543,13 @@ enum HermesSignInNet {
             p["idempotency_key"] = UUID().uuidString
             switch try await rpc("session.create", p) {
             case .result(_, let m):
-                guard let sid = m["session_id"], !sid.isEmpty else { throw HermesChatError.server("Hermes did not open a session.") }
+                guard let sid = m["session_id"], !sid.isEmpty else { throw HermesChatError.server(String(localized: "Hermes did not open a session.")) }
                 runtimeID = sid
                 storedID = m["stored_session_id"]
             case .failure(_, _, let msg):
-                throw HermesChatError.server(msg.isEmpty ? "Hermes did not open a session." : msg)
+                throw HermesChatError.server(msg.isEmpty ? String(localized: "Hermes did not open a session.") : msg)
             default:
-                throw HermesChatError.server("Hermes did not open a session.")
+                throw HermesChatError.server(String(localized: "Hermes did not open a session."))
             }
         }
         turn.session = runtimeID
@@ -574,9 +575,9 @@ enum HermesSignInNet {
             // run, so never report busy and never drop it. A queued message runs after the live turn, on this socket.
             if m["status"] == "queued" { turn.queuedBehindRunningTurn() }
         case .failure(_, let code, let msg):
-            throw code == 4009 ? HermesChatError.busy : HermesChatError.server(msg.isEmpty ? "Hermes refused the message." : msg)
+            throw code == 4009 ? HermesChatError.busy : HermesChatError.server(msg.isEmpty ? String(localized: "Hermes refused the message.") : msg)
         default:
-            throw HermesChatError.server("Hermes refused the message.")
+            throw HermesChatError.server(String(localized: "Hermes refused the message."))
         }
 
         // Stream until the terminal event. The turn may already be over: the server starts it before it answers.

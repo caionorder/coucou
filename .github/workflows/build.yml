@@ -51,6 +51,12 @@ jobs:
       - name: Wardrobe tests
         run: bash scripts/test-wardrobe.sh
 
+      - name: Step language tests
+        run: bash scripts/test-step-language.sh
+
+      - name: Localization tests
+        run: bash scripts/test-localization.sh
+
       - name: Build
         run: |
           xcodebuild \

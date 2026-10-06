@@ -257,7 +257,7 @@ final class AppState: ObservableObject {
         // Hermes: the picker lists the configured agents (local list, no network call)
         if provider == .hermes {
             if hermesAgents.isEmpty {
-                providerModelFetchError[.hermes] = "Connect a Hermes agent in Settings → Chat first."
+                providerModelFetchError[.hermes] = String(localized: "Connect a Hermes agent in Settings → Chat first.")
             } else {
                 fetchedProviderModels[.hermes] = hermesAgents.map { (id: $0.name, label: $0.name) }
                 providerModelFetchError.removeValue(forKey: .hermes)
@@ -273,8 +273,8 @@ final class AppState: ObservableObject {
             let normalised = LocalChat.normaliseURL(baseURL)
             guard !normalised.isEmpty else {
                 providerModelFetchError[provider] = provider == .ollama
-                    ? "Connect Ollama in Settings → Chat first."
-                    : "Connect LM Studio in Settings → Chat first."
+                    ? String(localized: "Connect Ollama in Settings → Chat first.")
+                    : String(localized: "Connect LM Studio in Settings → Chat first.")
                 return
             }
             loadingProviderModels.insert(provider)
@@ -285,8 +285,8 @@ final class AppState: ObservableObject {
                 switch result {
                 case .success(let models) where models.isEmpty:
                     providerModelFetchError[provider] = provider == .ollama
-                        ? "No models yet. Download one in Ollama first."
-                        : "No models yet. Download one in LM Studio first."
+                        ? String(localized: "No models yet. Download one in Ollama first.")
+                        : String(localized: "No models yet. Download one in LM Studio first.")
                 case .success(let models):
                     fetchedProviderModels[provider] = models
                     let current = provider == .ollama ? ollamaChatModel : lmstudioChatModel
@@ -296,14 +296,14 @@ final class AppState: ObservableObject {
                         else                   { lmstudioChatModel = first }
                     }
                 case .failure:
-                    providerModelFetchError[provider] = "Cannot reach \(normalised). Is the server running?"
+                    providerModelFetchError[provider] = String(localized: "Cannot reach \(normalised). Is the server running?")
                 }
             }
             return
         }
         // Remote providers: require API key
         guard let apiKey = KeychainStore.shared.get(provider.keychainKey), !apiKey.isEmpty else {
-            providerModelFetchError[provider] = "No API key — add it in Settings."
+            providerModelFetchError[provider] = String(localized: "No API key — add it in Settings.")
             return
         }
         loadingProviderModels.insert(provider)
@@ -318,7 +318,7 @@ final class AppState: ObservableObject {
             }
             loadingProviderModels.remove(provider)
             if models.isEmpty {
-                providerModelFetchError[provider] = "Failed to load models. Check your API key."
+                providerModelFetchError[provider] = String(localized: "Failed to load models. Check your API key.")
             } else {
                 fetchedProviderModels[provider] = models
                 switch provider {
@@ -474,7 +474,19 @@ final class AppState: ObservableObject {
     /// True only while `IslandWindowController.openCmuxPrompt` switches to the prompt view.
     var cmuxOpeningPrompt = false
     @Published var cmuxTranscripts: [String: [ChatMessage]] = [:]
-    @Published var cmuxNotice: String? = nil
+    @Published var cmuxNotice: String? = nil {
+        didSet { if !settingCmuxFailure { cmuxNoticeFailure = nil } }
+    }
+    /// Which cmux failure the notice shows, when it is one. The prompt view tells them apart by this case,
+    /// never by comparing the translated text.
+    @Published private(set) var cmuxNoticeFailure: CmuxControl.Failure? = nil
+    private var settingCmuxFailure = false
+    func showCmuxFailure(_ failure: CmuxControl.Failure) {
+        settingCmuxFailure = true
+        cmuxNotice = failure.message
+        cmuxNoticeFailure = failure
+        settingCmuxFailure = false
+    }
     @Published var cmuxBusy = false
     @Published var cmuxDraft: CmuxDraft? = nil
     @Published var cmuxRecentFolders: [String] = UserDefaults.standard.stringArray(forKey: "cmuxRecentFolders") ?? [] {
@@ -890,10 +902,11 @@ struct VercelDeployment: Identifiable {
     let branch: String?
 
     var isSuccess: Bool { state == "READY" }
-    var statusLabel: String { isSuccess ? "Ready" : (state == "CANCELED" ? "Canceled" : "Error") }
+    var statusLabel: String { isSuccess ? String(localized: "Ready") : (state == "CANCELED" ? String(localized: "Canceled") : String(localized: "Error")) }
+    var isJustNow: Bool { Date().timeIntervalSince(createdAt) < 60 }
     var timeAgo: String {
         let diff = Date().timeIntervalSince(createdAt)
-        if diff < 60    { return "just now" }
+        if diff < 60    { return String(localized: "just now") }
         if diff < 3600  { return "\(Int(diff/60))m" }
         if diff < 86400 { return "\(Int(diff/3600))h" }
         return "\(Int(diff/86400))d"
@@ -915,7 +928,7 @@ struct ResendEmail: Identifiable {
     }
     var timeAgo: String {
         let diff = Date().timeIntervalSince(createdAt)
-        if diff < 60    { return "just now" }
+        if diff < 60    { return String(localized: "just now") }
         if diff < 3600  { return "\(Int(diff/60))m" }
         if diff < 86400 { return "\(Int(diff/3600))h" }
         return "\(Int(diff/86400))d"
@@ -944,7 +957,7 @@ struct StripePayment: Identifiable, Equatable {
     var isSuccess: Bool { status == "succeeded" }
     var timeAgo: String {
         let diff = Date().timeIntervalSince(createdAt)
-        if diff < 60    { return "just now" }
+        if diff < 60    { return String(localized: "just now") }
         if diff < 3600  { return "\(Int(diff/60))m" }
         if diff < 86400 { return "\(Int(diff/3600))h" }
         return "\(Int(diff/86400))d"
@@ -991,7 +1004,7 @@ struct NotionPage: Identifiable {
 
     var timeAgo: String {
         let diff = Date().timeIntervalSince(lastEditedAt)
-        if diff < 60 { return "now" }
+        if diff < 60 { return String(localized: "now") }
         if diff < 3600 { return "\(Int(diff/60))m" }
         if diff < 86400 { return "\(Int(diff/3600))h" }
         return "\(Int(diff/86400))d"
