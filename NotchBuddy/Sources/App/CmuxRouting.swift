@@ -158,28 +158,17 @@ extension CmuxRouting {
     static let maxPromptLength = 8000
     static let maxTranscript = 6
     static let maxRecentFolders = 8
-    static let palette = ["#22C55E", "#EAB308", "#60A5FA", "#E879F9", "#F97316", "#2DD4BF", "#F472B6", "#A78BFA"]
+    static let palette = PillLook.palette
     /// Raw values of EyeShape; `pill` means no override.
-    static let eyes = ["pill", "wide", "dot", "happy", "cup"]
+    static let eyes = PillLook.eyes
 
     /// FNV-1a 64 bit. Stable across launches, unlike hashValue.
-    static func fnv1a(_ s: String) -> UInt64 {
-        var h: UInt64 = 0xcbf29ce484222325
-        for b in s.utf8 { h ^= UInt64(b); h = h &* 0x100000001b3 }
-        return h
-    }
+    static func fnv1a(_ s: String) -> UInt64 { PillLook.fnv1a(s) }
 
     /// Colour and eye of a session pill, derived from its surface key. The colour is probed linearly
     /// so two live sessions never share one while fewer than 8 are live.
     static func appearance(key: String, takenColors: Set<String>) -> (color: String, eye: String) {
-        let h = fnv1a(key)
-        let base = Int(h % UInt64(palette.count))
-        var color = palette[base]
-        for i in 0..<palette.count {
-            let c = palette[(base + i) % palette.count]
-            if !takenColors.contains(c) { color = c; break }
-        }
-        return (color, eyes[Int((h >> 16) % UInt64(eyes.count))])
+        PillLook.appearance(key: key, takenColors: takenColors)
     }
 
     /// Control characters become spaces (newline, tab, ESC, Ctrl-C…), trimmed, capped. nil when empty.

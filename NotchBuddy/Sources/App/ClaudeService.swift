@@ -507,6 +507,8 @@ final class ClaudeService {
         let msgId = placeholder.id
         state.chatHistory.append(placeholder)
         state.stateOverride = .thinking
+        state.setHermesPillBusy(agentName: agent.name, true)
+        defer { state.setHermesPillBusy(agentName: agent.name, false) }
         let body: [String: Any] = ["model": agent.modelName, "messages": msgs, "stream": true]
         let encodedBody = signIn ? Data() : ((try? JSONSerialization.data(withJSONObject: body)) ?? Data())
         let generation = conversationGeneration

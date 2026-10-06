@@ -66,10 +66,11 @@ struct OverviewView: View {
                         })
                     } else {
                         // A cmux session shows `folder (branch)` on a second line under its name.
+                        // A Hermes agent shows `Hermes · profile or host` in the same slot.
                         #if !APPSTORE
-                        let cmuxLine: String? = CmuxRouting.isCmuxTaskId(agent.id) ? agent.subtitle : nil
+                        let cmuxLine: String? = (CmuxRouting.isCmuxTaskId(agent.id) || HermesPills.isTaskId(agent.id)) ? agent.subtitle : nil
                         #else
-                        let cmuxLine: String? = nil
+                        let cmuxLine: String? = HermesPills.isTaskId(agent.id) ? agent.subtitle : nil
                         #endif
                         VStack(alignment: .leading, spacing: 0) {
                             HStack(spacing: 6) {
@@ -228,6 +229,7 @@ struct OverviewView: View {
 
     private func openAgentTarget(_ task: AgentTask?) {
         guard let task else { return }
+        if HermesPills.isTaskId(task.id) { openHermesAgentChat(taskId: task.id); return }
         #if !APPSTORE
         if CmuxJump.jump(for: task) { return }
         #endif
@@ -3820,7 +3822,10 @@ struct AgentPill: View {
     }
 
     var body: some View {
-        Button(action: { onTap() }) {
+        Button(action: {
+            onTap()
+            if HermesPills.isTaskId(task.id) { openHermesAgentChat(taskId: task.id) }
+        }) {
             ZStack(alignment: .topTrailing) {
                 ZStack {
                     Capsule()
@@ -4815,6 +4820,16 @@ func switchChatProvider(_ provider: ChatProvider) {
         SoundEngine.shared.play("pop")
     }
     state.view = .prompt
+}
+
+/// A Hermes agent pill: selects the Hermes provider and that agent (the usual clearing rules apply),
+/// then opens the chat prompt so the user can type to it at once.
+@MainActor
+func openHermesAgentChat(taskId: String) {
+    let state = AppState.shared
+    guard let name = HermesPills.agentName(forTaskId: taskId, in: state.hermesAgents.map { $0.name }) else { return }
+    state.selectHermesAgent(name)
+    switchChatProvider(.hermes)
 }
 
 extension Color {

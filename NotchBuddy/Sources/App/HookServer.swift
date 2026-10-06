@@ -1466,6 +1466,7 @@ final class HookServer: @unchecked Sendable {
         } else {
             state.tasks.insert(task, at: 0)
         }
+        state.placeHermesPills()   // Hermes agent pills stay right after the main pill, ahead of sessions
         if state.focusId == nil { state.focusId = id }
         let viewAllowsSteal = state.cmuxPrompt == nil
             && (state.mode != .expanded || state.view == .overview || state.view == .empty)

@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		019C48F59DAC135C328F4C51 /* HermesPills.swift in Sources */ = {isa = PBXBuildFile; fileRef = D93A05993C57DBF01195C08B /* HermesPills.swift */; };
 		0329E76BA4A8FEEA8A6D76E7 /* ClaudeService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A83D5410BD030B243ADDCFF4 /* ClaudeService.swift */; };
 		0393CA5466F52252378F0346 /* ServiceSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84ECC59BE7CDDEE348FC7096 /* ServiceSnapshot.swift */; };
 		0408FE7F86EBEE61CAED32DA /* TurnRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2DFAEAF1DD1CBF03D3C314E /* TurnRecorder.swift */; };
@@ -149,6 +150,7 @@
 		94E0849D13762C6EC8548FEF /* ClaudePlanCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4263B550838CC5614569D13 /* ClaudePlanCardView.swift */; };
 		967B525F7D3837F31D740D18 /* ResendPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 61B5FDDE03F5F711146937E2 /* ResendPoller.swift */; };
 		9728564FCBF0334E68E9E6E7 /* SessionPublisher.swift in Sources */ = {isa = PBXBuildFile; fileRef = 824E56D2255CA86DAC350DBF /* SessionPublisher.swift */; };
+		9925BEAB4121EA9BC9B52169 /* HermesPills.swift in Sources */ = {isa = PBXBuildFile; fileRef = D93A05993C57DBF01195C08B /* HermesPills.swift */; };
 		99A1CF41C797EA7F98F2B5B1 /* MochiActivityState.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE18399D1CD69468CCF57966 /* MochiActivityState.swift */; };
 		9A04B16AEEAB1A344D13CE74 /* InstructionComposer.swift in Sources */ = {isa = PBXBuildFile; fileRef = E18E74B3586BC0861C69E70A /* InstructionComposer.swift */; };
 		9AEFD05D0A39D4AF3C091B3A /* QuestionRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB78996E9F9A2E8A80D45E54 /* QuestionRelay.swift */; };
@@ -383,6 +385,7 @@
 		D8212018F09EA1E96FBD63CD /* IslandStateMachine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IslandStateMachine.swift; sourceTree = "<group>"; };
 		D849B1A27AD17AEE1C7FFD1A /* DenyApprovalIntent.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DenyApprovalIntent.swift; sourceTree = "<group>"; };
 		D8C1BB0DF7770A6B263995E6 /* TeamConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamConfiguration.swift; sourceTree = "<group>"; };
+		D93A05993C57DBF01195C08B /* HermesPills.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HermesPills.swift; sourceTree = "<group>"; };
 		DD426E81DF79CA79888059D9 /* ApprovalRelay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ApprovalRelay.swift; sourceTree = "<group>"; };
 		DDB831F5623E699A2506698E /* NotificationViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationViewController.swift; sourceTree = "<group>"; };
 		DE18399D1CD69468CCF57966 /* MochiActivityState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MochiActivityState.swift; sourceTree = "<group>"; };
@@ -442,6 +445,7 @@
 				F8D3AD61802A32C4833F3EDA /* GitHubPulse.swift */,
 				C581F7B1A9F14B281B60063E /* GreetingCanvasView.swift */,
 				782AD2764A58AE9CC258C4BB /* HermesChat.swift */,
+				D93A05993C57DBF01195C08B /* HermesPills.swift */,
 				159294F851FE97C2E84221DC /* HermesSignIn.swift */,
 				480F129573A8C1E0A43E0573 /* HermesSignInNet.swift */,
 				79D8DD79C3DD9BBC584B3CB2 /* HookServer.swift */,
@@ -821,6 +825,7 @@
 				C808B654C84D9F71DBF8493A /* GithubPoller.swift in Sources */,
 				8C32A0C3EAF536D3836F61D5 /* GreetingCanvasView.swift in Sources */,
 				BA37CBAE83C2BA32A3773EA4 /* HermesChat.swift in Sources */,
+				9925BEAB4121EA9BC9B52169 /* HermesPills.swift in Sources */,
 				472F7A6E388F2D88BD804630 /* HermesSignIn.swift in Sources */,
 				A8DE03387E75846A62B3A3D0 /* HermesSignInNet.swift in Sources */,
 				2C798C3837A63B9BB561A1A0 /* HookServer.swift in Sources */,
@@ -976,6 +981,7 @@
 				C18227D148D99FE6EE3CC51A /* GithubPoller.swift in Sources */,
 				C0E18D0F6F5F6D131E6066B8 /* GreetingCanvasView.swift in Sources */,
 				1B9DC40E30AD7F75AB0B37F4 /* HermesChat.swift in Sources */,
+				019C48F59DAC135C328F4C51 /* HermesPills.swift in Sources */,
 				077152EFBA05F1CB965CD5AB /* HermesSignIn.swift in Sources */,
 				BB61FCFF6EE49433DF821FBC /* HermesSignInNet.swift in Sources */,
 				9DD56C95ECABDDCE23652D50 /* HookServer.swift in Sources */,

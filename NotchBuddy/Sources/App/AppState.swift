@@ -166,6 +166,7 @@ final class AppState: ObservableObject {
         hermesChatAgent = agent.name
         // Only a Hermes conversation is tied to the active agent.
         if chatProvider == .hermes, previous != agent { clearChatConversation() }
+        syncHermesPills()
     }
 
     /// True when the key stored for `agent` is bound to its current URL and profile.
@@ -217,6 +218,7 @@ final class AppState: ObservableObject {
         providerModelFetchError[.hermes] = nil
         hermesChatAgent = signedIn.name
         if chatProvider == .hermes, previous != signedIn { clearChatConversation() }
+        syncHermesPills()
     }
 
     func removeHermesAgent(named name: String) async {
@@ -232,6 +234,7 @@ final class AppState: ObservableObject {
         if hermesChatAgent == name { hermesChatAgent = hermesAgents.first?.name ?? "" }
         if wasActive, chatProvider == .hermes { clearChatConversation() }
         if hermesAgents.isEmpty, chatProvider == .hermes { chatProvider = .anthropic }
+        syncHermesPills()
         // A "Sign in again" stored while the first removal ran: the row is gone now, so the record goes too.
         await HermesSessions.shared.remove(name: name)
     }
@@ -752,8 +755,57 @@ final class AppState: ObservableObject {
             }
         }
         sortTasksByCatalog()
+        syncHermesPills()
         if focusId == nil { focusId = mainPillId }
         syncMode()
+    }
+
+    // MARK: Hermes agent pills (one per connected agent, not in the catalog, not sessions)
+
+    /// Creates the pill of each connected agent, drops the pill of a removed one and puts them right
+    /// after the main pill. Pills are never touched by hook events: their ids match no hook agent.
+    func syncHermesPills() {
+        let plan = HermesPills.reconcile(existingIds: tasks.map { $0.id }, agents: hermesAgents.map { $0.name })
+        for id in plan.remove {
+            tasks.removeAll { $0.id == id }
+            if focusId == id { focusId = mainPillId }
+        }
+        var taken = Set(tasks.filter { HermesPills.isTaskId($0.id) }.map { $0.color })
+        for entry in plan.add {
+            let look = PillLook.appearance(key: String(entry.id.dropFirst(HermesPills.taskPrefix.count)), takenColors: taken)
+            taken.insert(look.color)
+            var task = AgentTask(id: entry.id, name: entry.name, color: look.color, state: .idle, steps: [], source: .agent)
+            if look.eye != "pill" { task.miniEye = EyeShape(rawValue: look.eye) }
+            tasks.append(task)
+        }
+        let ids = HermesPills.taskIds(for: hermesAgents.map { $0.name })
+        for agent in hermesAgents {
+            guard let id = ids[agent.name], let i = tasks.firstIndex(where: { $0.id == id }) else { continue }
+            let line = HermesPills.subtitle(profile: agent.profile, baseURL: agent.baseURL)
+            if tasks[i].subtitle != line { tasks[i].subtitle = line }
+        }
+        placeHermesPills()
+        syncMode()
+        syncView()
+    }
+
+    /// Keeps the Hermes pills (in connection order) right after the main pill, ahead of cmux sessions.
+    func placeHermesPills() {
+        let ids = HermesPills.taskIds(for: hermesAgents.map { $0.name })
+        let hermes = hermesAgents.compactMap { a in ids[a.name].flatMap { id in tasks.first { $0.id == id } } }
+        guard !hermes.isEmpty else { return }
+        var rest = tasks.filter { !HermesPills.isTaskId($0.id) }
+        let at = (rest.firstIndex { $0.id == mainPillId }).map { $0 + 1 } ?? 0
+        rest.insert(contentsOf: hermes, at: at)
+        if rest.map({ $0.id }) != tasks.map({ $0.id }) { tasks = rest }
+    }
+
+    /// Pill state of an agent while a chat turn runs (thinking) and when it ends (idle).
+    func setHermesPillBusy(agentName: String, _ busy: Bool) {
+        guard let id = HermesPills.taskIds(for: hermesAgents.map { $0.name })[agentName],
+              let i = tasks.firstIndex(where: { $0.id == id }) else { return }
+        let target: BotState = busy ? .thinking : .idle
+        if tasks[i].state != target { tasks[i].state = target }
     }
 
     /// Toggle a catalog pill on/off.
