@@ -174,18 +174,66 @@ final class AppState: ObservableObject {
         return false
     }
 
-    func removeHermesAgent(named name: String) {
+    // MARK: Hermes sign in sessions (Keychain item "hermes-agent-sessions", one record per agent name)
+    // Reads happen here; every write goes through `HermesSessions.shared`, the single owner of the item.
+
+    private func hermesSessions() -> [String: HermesSignIn.SessionRecord] {
+        HermesSignIn.decodeSessions(KeychainStore.shared.get("hermes-agent-sessions") ?? "")
+    }
+
+    /// "Signed in as <label>" text for a sign in agent, or nil when it has no usable session
+    /// (no record, a record for another address, or an expired one that cannot be refreshed).
+    func hermesSessionLabel(_ agent: HermesAgent) -> String? {
+        guard case .success(let r) = HermesSignIn.boundSession(for: agent, in: hermesSessions()),
+              HermesSignIn.tokenAction(r, now: Date().timeIntervalSince1970) != .signInAgain else { return nil }
+        return r.label.isEmpty ? r.userID : r.label
+    }
+
+    /// Keeps a session obtained by "Sign in again", only while the agent still exists with the same address and
+    /// kind; otherwise the result is dropped (false). The check and the store call happen with no suspension in
+    /// between, and `removeHermesAgent` removes the record again after the row, so no record outlives its agent.
+    func storeHermesSession(_ record: HermesSignIn.SessionRecord, for agent: HermesAgent) async -> Bool {
+        guard hermesAgents.contains(where: { $0.name == agent.name && $0.baseURL == agent.baseURL && $0.connection == .signIn }) else { return false }
+        await HermesSessions.shared.store(record, name: agent.name)
+        if activeHermesAgent?.name == agent.name, chatProvider == .hermes { clearChatConversation() }
+        return true
+    }
+
+    /// Drops the session of an agent, keeps the row.
+    func signOutHermesAgent(named name: String) async {
+        await HermesSessions.shared.remove(name: name)
+        if activeHermesAgent?.name == name, chatProvider == .hermes { clearChatConversation() }
+    }
+
+    /// Adds a signed-in agent and stores its session (Keychain only), then selects it.
+    func addHermesSignedInAgent(_ agent: HermesAgent, record: HermesSignIn.SessionRecord) async {
+        var signedIn = agent
+        signedIn.connection = .signIn
+        await HermesSessions.shared.store(record, name: signedIn.name)
+        let previous = activeHermesAgent
+        hermesAgents.removeAll { $0.name == signedIn.name }
+        hermesAgents.append(signedIn)
+        fetchedProviderModels[.hermes] = nil
+        providerModelFetchError[.hermes] = nil
+        hermesChatAgent = signedIn.name
+        if chatProvider == .hermes, previous != signedIn { clearChatConversation() }
+    }
+
+    func removeHermesAgent(named name: String) async {
         let wasActive = activeHermesAgent?.name == name
         var keys = HermesChat.decodeKeys(KeychainStore.shared.get("hermes-agent-keys") ?? "")
         keys[name] = nil
         if keys.isEmpty { KeychainStore.shared.remove("hermes-agent-keys") }
         else { KeychainStore.shared.set("hermes-agent-keys", value: HermesChat.encodeKeys(keys)) }
+        await HermesSessions.shared.remove(name: name)
         hermesAgents.removeAll { $0.name == name }
         fetchedProviderModels[.hermes] = nil
         providerModelFetchError[.hermes] = nil
         if hermesChatAgent == name { hermesChatAgent = hermesAgents.first?.name ?? "" }
         if wasActive, chatProvider == .hermes { clearChatConversation() }
         if hermesAgents.isEmpty, chatProvider == .hermes { chatProvider = .anthropic }
+        // A "Sign in again" stored while the first removal ran: the row is gone now, so the record goes too.
+        await HermesSessions.shared.remove(name: name)
     }
 
     // The always-on workspace pill (default: VS Code). Persisted.
@@ -906,4 +954,14 @@ struct ChatMessage: Identifiable, Equatable {
     let id = UUID()
     let role: ChatRole
     var content: String   // var for streaming updates
+}
+
+/// The one sign in session store of the app, over the Keychain item "hermes-agent-sessions".
+extension HermesSessions {
+    static let shared = HermesSessions(storage: HermesSessionStorage(
+        load: { KeychainStore.shared.get("hermes-agent-sessions") ?? "" },
+        save: { value in
+            if value.isEmpty { KeychainStore.shared.remove("hermes-agent-sessions") }
+            else { KeychainStore.shared.set("hermes-agent-sessions", value: value) }
+        }))
 }

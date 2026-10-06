@@ -72,6 +72,7 @@ final class KeychainStore: @unchecked Sendable {
         "calcom-api-key",
         "notion-api-key",
         "hermes-agent-keys",
+        "hermes-agent-sessions",
     ]
 
     private init() {
@@ -190,9 +191,12 @@ final class ClaudeService {
     /// Bumped on every clear: a request that started before a clear must not touch the new conversation.
     private var conversationGeneration = 0
     private var hermesTask: Task<String, Error>?
+    /// Stored server session of the current conversation with a signed-in Hermes agent (nil = none yet).
+    private var hermesServerSession: String?
 
     func clearConversation() {
         conversationMessages = []
+        hermesServerSession = nil
         conversationGeneration += 1
         hermesTask?.cancel()
         hermesTask = nil
@@ -466,13 +470,22 @@ final class ClaudeService {
             await showError("Connect a Hermes agent in Settings → Chat first.", state: state)
             return
         }
-        let key: String
-        switch HermesChat.boundKey(for: agent, in: HermesChat.decodeKeys(KeychainStore.shared.get("hermes-agent-keys") ?? "")) {
-        case .success(let k): key = k
-        case .failure(let e):
-            // The key is never sent: the stored agent does not match what the key was connected to.
-            await showError(e.userMessage, state: state)
-            return
+        let signIn = agent.connection == .signIn
+        var key = ""
+        if signIn {
+            // No session for this agent (or for this address): nothing is sent.
+            if case .failure(let e) = HermesSignIn.boundSession(for: agent, in: HermesSignIn.decodeSessions(KeychainStore.shared.get("hermes-agent-sessions") ?? "")) {
+                await showError(e.userMessage, state: state)
+                return
+            }
+        } else {
+            switch HermesChat.boundKey(for: agent, in: HermesChat.decodeKeys(KeychainStore.shared.get("hermes-agent-keys") ?? "")) {
+            case .success(let k): key = k
+            case .failure(let e):
+                // The key is never sent: the stored agent does not match what the key was connected to.
+                await showError(e.userMessage, state: state)
+                return
+            }
         }
 
         // No system message: Hermes layers it over the agent's own prompt.
@@ -495,10 +508,11 @@ final class ClaudeService {
         state.chatHistory.append(placeholder)
         state.stateOverride = .thinking
         let body: [String: Any] = ["model": agent.modelName, "messages": msgs, "stream": true]
-        let encodedBody = (try? JSONSerialization.data(withJSONObject: body)) ?? Data()
+        let encodedBody = signIn ? Data() : ((try? JSONSerialization.data(withJSONObject: body)) ?? Data())
         let generation = conversationGeneration
+        let storedSession = hermesServerSession
         let task = Task { [state, msgId] () async throws -> String in
-            try await HermesChat.streamChat(agent: agent, key: key, encodedBody: encodedBody) { visible in
+            let onToken: @MainActor (String) -> Void = { visible in
                 if !visible.isEmpty, state.stateOverride == .thinking {
                     state.stateOverride = nil   // hide typing dots on first visible text
                 }
@@ -506,6 +520,16 @@ final class ClaudeService {
                     state.chatHistory[idx].content = visible
                 }
             }
+            if signIn {
+                // The server keeps the history: only the new text is sent, the session is resumed by id.
+                return try await HermesSignInNet.streamTurn(
+                    agent: agent, sessions: HermesSessions.shared, storedSession: storedSession, text: userText,
+                    onSession: { id in
+                        if generation == self.conversationGeneration { self.hermesServerSession = id.isEmpty ? nil : id }
+                    },
+                    onToken: onToken)
+            }
+            return try await HermesChat.streamChat(agent: agent, key: key, encodedBody: encodedBody, onToken: onToken)
         }
         hermesTask = task
         do {

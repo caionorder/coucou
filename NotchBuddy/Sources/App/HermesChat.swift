@@ -2,7 +2,14 @@ import Foundation
 
 // MARK: - Hermes agents (self-hosted, OpenAI-compatible API server)
 
-/// One configured Hermes agent. The API key is NOT part of this struct: it lives only in the Keychain.
+/// How an agent is reached: with the profile's API key (OpenAI-compatible server) or by signing in
+/// with the Hermes server (dashboard gateway). A stored agent without the field reads as `apiKey`.
+enum HermesConnection: String, Codable, Sendable {
+    case apiKey
+    case signIn
+}
+
+/// One configured Hermes agent. The API key (or sign-in session) is NOT part of this struct: it lives only in the Keychain.
 struct HermesAgent: Codable, Equatable, Sendable {
     /// Unique id and label, e.g. "mark".
     var name: String
@@ -12,6 +19,8 @@ struct HermesAgent: Codable, Equatable, Sendable {
     var profile: String
     /// Id returned by `GET /v1/models` at connect time, fallback "hermes-agent".
     var modelName: String
+    /// `nil` reads as `.apiKey` (agents stored before the sign-in kind existed).
+    var connection: HermesConnection?
 }
 
 enum HermesChatError: Error, Equatable {
@@ -27,6 +36,10 @@ enum HermesChatError: Error, Equatable {
     case agentFailed(String)
     /// The stored agent no longer matches the destination its key was bound to. Associated value is the agent name.
     case notBound(String)
+    /// No usable sign-in session for this agent. Associated value is the agent name.
+    case signInNeeded(String)
+    /// Associated value is a message that is safe to show (never a server text, token or URL).
+    case signInFailed(String)
 
     var userMessage: String {
         switch self {
@@ -39,13 +52,15 @@ enum HermesChatError: Error, Equatable {
         case .unreachable(let host): return "Can't reach Hermes at \(host). Is the gateway running?"
         case .server(let m), .agentFailed(let m): return m
         case .notBound(let name): return "\(name) changed since it was connected, so its key was not sent. Disconnect it and connect it again in Settings → Chat."
+        case .signInNeeded(let name): return "Sign in to \(name) again in Settings → Chat."
+        case .signInFailed(let m): return m
         }
     }
 }
 
 /// Refuses every redirect: the Authorization header must never follow a 30x to another host,
 /// and an SSO redirect means "not the API address" anyway.
-private final class HermesNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
+final class HermesNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
     func urlSession(_ session: URLSession, task: URLSessionTask,
                     willPerformHTTPRedirection response: HTTPURLResponse,
                     newRequest request: URLRequest,
@@ -265,6 +280,15 @@ enum HermesChat {
         var lineBytes = 256 * 1024
         var textChars = 200_000
         var duration: TimeInterval = 15 * 60
+        // Sign-in transport only (HermesSignInNet).
+        /// Retry once with the ticket in the query when the subprotocol form is refused.
+        var allowQueryTicketFallback = true
+        var readyTimeout: TimeInterval = 15
+        var rpcTimeout: TimeInterval = 30
+        var pingInterval: TimeInterval = 15
+        /// Per turn budget of text frames and bytes (ignored frames count); over it the turn ends like the text cap.
+        var maxFrames = 100_000
+        var maxBytes = 64 * 1024 * 1024
         static let standard = Limits()
     }
 
@@ -274,7 +298,7 @@ enum HermesChat {
 
     private static func session() -> URLSession { URLSession(configuration: .ephemeral) }
 
-    private static func hostLabel(_ baseURL: String) -> String {
+    static func hostLabel(_ baseURL: String) -> String {
         URL(string: baseURL)?.host ?? "the server"
     }
 

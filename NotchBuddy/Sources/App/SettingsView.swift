@@ -67,6 +67,16 @@ struct SettingsView: View {
     @State private var hermesName:    String = ""
     @State private var hermesKey:     String = ""
     @State private var connectingHermes: Bool = false
+    #if !APPSTORE
+    // Hermes sign in (direct build only)
+    @State private var hermesKind: HermesConnection = .apiKey
+    @State private var signingInHermes: Bool = false
+    @State private var hermesPending: HermesPendingSignIn?
+    @State private var hermesPickedProfile: String = ""
+    @State private var hermesSignInTask: Task<Void, Never>?
+    /// The running sign in belongs to the "Add an agent" form (not to a row's "Sign in again").
+    @State private var hermesSignInFromForm: Bool = false
+    #endif
 
     // Integration keys
     @State private var resendKey: String    = KeychainStore.shared.get("resend-api-key")  ?? ""
@@ -179,6 +189,11 @@ struct SettingsView: View {
                         .padding(.vertical, 8)
                 }
             }
+        }
+        .onDisappear { closeHermesSignIn() }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { note in
+            // Closing the window does not remove the hosted view: end a waiting sign in and drop an unconfirmed one here.
+            if (note.object as? NSWindow)?.title.hasPrefix("Settings") == true { closeHermesSignIn() }
         }
         .onAppear {
             #if !APPSTORE
@@ -862,7 +877,17 @@ struct SettingsView: View {
                     HStack(spacing: 8) {
                         Circle().fill(Color(hex: "#F97316")).frame(width: 8, height: 8)
                         Text(agent.name).font(.system(size: 12, weight: .semibold))
-                        if state.isHermesAgentBound(agent) {
+                        if isSignInAgent(agent) {
+                            if let label = state.hermesSessionLabel(agent) {
+                                Text("Signed in as \(label)")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(Color(hex: "#22C55E"))
+                            } else {
+                                Text("Sign in again")
+                                    .font(.system(size: 10))
+                                    .foregroundColor(Color(hex: "#F97316"))
+                            }
+                        } else if state.isHermesAgentBound(agent) {
                             Text("Connected")
                                 .font(.system(size: 10))
                                 .foregroundColor(Color(hex: "#22C55E"))
@@ -875,19 +900,39 @@ struct SettingsView: View {
                     Text("\(agent.baseURL) · \(agent.profile.isEmpty ? "default" : agent.profile)")
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundColor(.secondary)
-                    if !state.isHermesAgentBound(agent) {
+                    if !isSignInAgent(agent), !state.isHermesAgentBound(agent) {
                         Text("Its key is not tied to this address. Disconnect it and connect it again.")
                             .font(.system(size: 11))
                             .foregroundColor(.secondary)
                     }
-                    if HermesChat.sendsKeyUnencryptedToName(agent.baseURL) {
+                    if !isSignInAgent(agent), HermesChat.sendsKeyUnencryptedToName(agent.baseURL) {
                         Text("The key is sent unencrypted on your local network to whoever answers this name. Use https:// or an IP address you trust.")
                             .font(.system(size: 11))
                             .foregroundColor(Color(hex: "#F97316"))
                     }
+                    #if !APPSTORE
+                    if isSignInAgent(agent) {
+                        HStack(spacing: 8) {
+                            Button(signingInHermes ? "Waiting for the browser… (click to cancel)" : "Sign in again") {
+                                if signingInHermes { hermesSignInTask?.cancel() }
+                                else { startHermesSignIn(fromForm: false) { await resignInHermes(agent) } }
+                            }
+                            .buttonStyle(.bordered)
+                            Button("Sign out") {
+                                Task {
+                                    await state.signOutHermesAgent(named: agent.name)
+                                    statusMessage = "Signed out of \(agent.name)."
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+                    #endif
                     Button("Disconnect") {
-                        state.removeHermesAgent(named: agent.name)
-                        statusMessage = "\(agent.name) disconnected."
+                        Task {
+                            await state.removeHermesAgent(named: agent.name)
+                            statusMessage = "\(agent.name) disconnected."
+                        }
                     }
                     .buttonStyle(.bordered)
                     Divider()
@@ -897,28 +942,56 @@ struct SettingsView: View {
                     Circle().fill(Color(hex: "#F97316")).frame(width: 8, height: 8)
                     Text("Add an agent").font(.system(size: 12, weight: .semibold))
                 }
+                #if !APPSTORE
+                Picker("", selection: $hermesKind) {
+                    Text("API key").tag(HermesConnection.apiKey)
+                    Text("Sign in").tag(HermesConnection.signIn)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .onChange(of: hermesKind) { _, kind in
+                    hermesPending = nil
+                    // The form (and its cancel button) is hidden for API key: end the waiting sign in with it.
+                    if kind != .signIn, hermesSignInFromForm { hermesSignInTask?.cancel() }
+                }
+                #endif
                 TextField("https://hermes.example.com", text: $hermesURL)
                     .textFieldStyle(.roundedBorder)
-                    .onChange(of: hermesURL) { _, url in prefillHermesProfile(from: url) }
-                if case .success(let typed) = HermesChat.normaliseBaseURL(hermesURL),
+                    .onChange(of: hermesURL) { _, url in
+                        prefillHermesProfile(from: url)
+                        #if !APPSTORE
+                        hermesPending = nil   // a pending sign in belongs to the address it was made for
+                        #endif
+                    }
+                if hermesKindIsAPIKey,
+                   case .success(let typed) = HermesChat.normaliseBaseURL(hermesURL),
                    HermesChat.sendsKeyUnencryptedToName(typed) {
                     Text("http:// to a name: the key will be sent unencrypted on your local network.")
                         .font(.system(size: 11))
                         .foregroundColor(Color(hex: "#F97316"))
                 }
-                TextField("Profile (empty = default)", text: $hermesProfile)
-                    .textFieldStyle(.roundedBorder)
+                if hermesKindIsAPIKey {
+                    TextField("Profile (empty = default)", text: $hermesProfile)
+                        .textFieldStyle(.roundedBorder)
+                }
                 TextField("Name in the chat (optional)", text: $hermesName)
                     .textFieldStyle(.roundedBorder)
-                SecureField("API key (API_SERVER_KEY of this profile)", text: $hermesKey)
-                    .textFieldStyle(.roundedBorder)
-                Button(connectingHermes ? "Connecting…" : "Connect") {
-                    Task { await connectHermes() }
+                if hermesKindIsAPIKey {
+                    SecureField("API key (API_SERVER_KEY of this profile)", text: $hermesKey)
+                        .textFieldStyle(.roundedBorder)
+                    Button(connectingHermes ? "Connecting…" : "Connect") {
+                        Task { await connectHermes() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(connectingHermes
+                              || hermesURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                              || hermesKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(connectingHermes
-                          || hermesURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                          || hermesKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                #if !APPSTORE
+                if hermesKind == .signIn {
+                    hermesSignInForm   // an unconfirmed session is dropped by `closeHermesSignIn`, not by this branch
+                }
+                #endif
             }
             .padding(.vertical, 4)
         }
@@ -1131,6 +1204,160 @@ struct SettingsView: View {
             statusMessage = "Couldn't reach \(name) at \(normalised). Is it running?"
         }
     }
+
+    /// The API key form is the only form in the App Store build; the direct build adds "Sign in".
+    /// A sign in agent row exists only in the direct build.
+    private func isSignInAgent(_ agent: HermesAgent) -> Bool {
+        #if APPSTORE
+        return false
+        #else
+        return agent.connection == .signIn
+        #endif
+    }
+
+    /// Settings is going away: end a waiting sign in and drop one that was never confirmed.
+    private func closeHermesSignIn() {
+        #if !APPSTORE
+        hermesSignInTask?.cancel()
+        hermesSignInTask = nil
+        hermesPending = nil
+        #endif
+    }
+
+    private var hermesKindIsAPIKey: Bool {
+        #if APPSTORE
+        return true
+        #else
+        return hermesKind == .apiKey
+        #endif
+    }
+
+    #if !APPSTORE
+    private struct HermesPendingSignIn: Equatable {
+        var record: HermesSignIn.SessionRecord
+        var label: String
+        var profiles: [HermesSignIn.Profile]
+        var baseURL: String
+    }
+
+    /// "Sign in…", then (once signed in) the profile picker and "Add". Nothing is stored before "Add".
+    @ViewBuilder private var hermesSignInForm: some View {
+        if let pending = hermesPending {
+            Text("Signed in as \(pending.label)")
+                .font(.system(size: 12))
+                .foregroundColor(Color(hex: "#22C55E"))
+            if pending.profiles.isEmpty {
+                TextField("Profile (empty = default)", text: $hermesPickedProfile)
+                    .textFieldStyle(.roundedBorder)
+            } else {
+                Picker("Profile", selection: $hermesPickedProfile) {
+                    ForEach(pending.profiles, id: \.name) { p in
+                        Text(p.title).tag(p.name)
+                    }
+                }
+                .font(.system(size: 12))
+            }
+            Button("Add") { addSignedInHermes(pending) }
+                .buttonStyle(.borderedProminent)
+        } else {
+            Text("Opens your browser to sign in with the server. Coucou keeps the session in the Keychain.")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+            Button(signingInHermes ? "Waiting for the browser… (click to cancel)" : "Sign in…") {
+                if signingInHermes { hermesSignInTask?.cancel() }
+                else { startHermesSignIn(fromForm: true) { await signInHermes() } }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(!signingInHermes && hermesURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        }
+    }
+
+    /// Starts a sign in task. `signingInHermes` is raised before the task exists, so a second click cannot start another.
+    private func startHermesSignIn(fromForm: Bool, _ work: @escaping () async -> Void) {
+        guard !signingInHermes else { return }
+        signingInHermes = true
+        hermesSignInFromForm = fromForm
+        hermesSignInTask = Task {
+            await work()
+            signingInHermes = false
+            hermesSignInFromForm = false
+        }
+    }
+
+    /// The only place a browser opens for a sign in: the click on "Sign in…" or "Sign in again".
+    private func runHermesSignIn(base: String) async -> HermesPendingSignIn? {
+        statusMessage = ""
+        let result = await HermesSignInNet.signIn(baseURL: base) { url in NSWorkspace.shared.open(url) }
+        if Task.isCancelled {
+            statusMessage = "Sign in cancelled."
+            return nil
+        }
+        switch result {
+        case .failure(let e):
+            statusMessage = e.userMessage
+            return nil
+        case .success(var record):
+            let label = await HermesSignInNet.me(baseURL: base, token: record.accessToken) ?? record.userID
+            record.label = label
+            var profiles: [HermesSignIn.Profile] = []
+            if case .success(let p) = await HermesSignInNet.profiles(baseURL: base, token: record.accessToken) { profiles = p }
+            if Task.isCancelled {
+                statusMessage = "Sign in cancelled."
+                return nil
+            }
+            return HermesPendingSignIn(record: record, label: label.isEmpty ? "your account" : label, profiles: profiles, baseURL: base)
+        }
+    }
+
+    private func signInHermes() async {
+        let base: String
+        switch HermesChat.normaliseBaseURL(hermesURL) {
+        case .success(let u): base = u
+        case .failure(let e): statusMessage = e.userMessage; return
+        }
+        guard let pending = await runHermesSignIn(base: base) else { return }
+        // The address or the kind was edited while the browser was open: this session belongs to the old address.
+        guard hermesKind == .signIn, case .success(let current) = HermesChat.normaliseBaseURL(hermesURL),
+              current == pending.baseURL else {
+            statusMessage = "The address changed while you signed in. Sign in again."
+            return
+        }
+        hermesPickedProfile = pending.profiles.first(where: { $0.isDefault })?.name ?? pending.profiles.first?.name ?? ""
+        hermesPending = pending
+    }
+
+    private func addSignedInHermes(_ pending: HermesPendingSignIn) {
+        let profile = hermesPickedProfile.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard HermesChat.isValidProfile(profile) else {
+            statusMessage = "Profile names use letters, digits, - and _ only."
+            return
+        }
+        let typedName = hermesName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = !typedName.isEmpty ? typedName
+                 : !profile.isEmpty ? profile
+                 : (URL(string: pending.baseURL)?.host ?? "hermes")
+        guard !state.hermesAgents.contains(where: { $0.name == name }) else {
+            statusMessage = "An agent named \(name) already exists."
+            return
+        }
+        hermesPending = nil
+        hermesURL = ""; hermesProfile = ""; hermesName = ""; hermesPickedProfile = ""
+        statusMessage = "✓ Signed in · \(name)"
+        let agent = HermesAgent(name: name, baseURL: pending.baseURL, profile: profile, modelName: "", connection: .signIn)
+        Task { await state.addHermesSignedInAgent(agent, record: pending.record) }
+    }
+
+    /// "Sign in again" for an existing agent: same address, same profile, new session.
+    private func resignInHermes(_ agent: HermesAgent) async {
+        guard let pending = await runHermesSignIn(base: agent.baseURL) else { return }
+        // The agent may have been disconnected or re-pointed while the browser was open: then drop the session.
+        guard await state.storeHermesSession(pending.record, for: agent) else {
+            statusMessage = "\(agent.name) changed or was removed while you signed in. Nothing was saved."
+            return
+        }
+        statusMessage = "✓ Signed in · \(agent.name)"
+    }
+    #endif
 
     /// Validates the form, tests the connection (the only request of the setup, made on this click)
     /// and stores the agent. Nothing is stored on failure.

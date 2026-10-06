@@ -1,0 +1,775 @@
+import Foundation
+import Network
+
+// MARK: - Hermes sign in: session store, loopback listener, REST calls, one chat turn over the dashboard WebSocket.
+// Nothing here logs. Tokens go only to HermesSignIn.endpoint(agent.baseURL, …) and into the Keychain through `HermesSessionStorage`.
+
+struct HermesSessionStorage: Sendable {
+    var load: @Sendable () -> String
+    /// An empty string means "remove the item".
+    var save: @Sendable (String) -> Void
+}
+
+/// The sign in sessions of all agents (one record per agent name, each bound to its base URL).
+/// The only writer of the Keychain item: sign in, sign out, disconnect and refresh all go through here, so
+/// their read-modify-write steps never interleave. Reads the storage on every call.
+actor HermesSessions {
+    enum RefreshOutcome: Sendable {
+        case refreshed(HermesSignIn.SessionRecord)
+        /// The server said the session is over (401).
+        case expired
+        /// Server busy, provider unreachable, network error: the tokens are kept.
+        case unavailable
+        /// The record was removed or replaced (sign out, disconnect, sign in again) while the request was in
+        /// flight: the answer no longer applies and is neither stored nor used to remove anything.
+        case superseded
+    }
+
+    private let storage: HermesSessionStorage
+    private let now: @Sendable () -> Double
+    private var inflight: [String: Task<RefreshOutcome, Never>] = [:]
+
+    init(storage: HermesSessionStorage, now: @escaping @Sendable () -> Double = { Date().timeIntervalSince1970 }) {
+        self.storage = storage
+        self.now = now
+    }
+
+    private func all() -> [String: HermesSignIn.SessionRecord] { HermesSignIn.decodeSessions(storage.load()) }
+
+    func record(for agent: HermesAgent) -> Result<HermesSignIn.SessionRecord, HermesChatError> {
+        HermesSignIn.boundSession(for: agent, in: all())
+    }
+
+    func store(_ r: HermesSignIn.SessionRecord, name: String) {
+        var a = all()
+        a[name] = r
+        storage.save(HermesSignIn.encodeSessions(a))
+    }
+
+    /// Removes the record only while it still holds `accessToken` (the one that was refused): a newer sign in stays.
+    func remove(name: String, ifAccessToken accessToken: String) {
+        guard all()[name]?.accessToken == accessToken else { return }
+        remove(name: name)
+    }
+
+    func remove(name: String) {
+        var a = all()
+        guard a[name] != nil else { return }
+        a[name] = nil
+        storage.save(a.isEmpty ? "" : HermesSignIn.encodeSessions(a))
+    }
+
+    /// One refresh per agent at a time. The rotated record is saved before any caller gets the new token.
+    private func refreshOutcome(name: String, record: HermesSignIn.SessionRecord) async -> RefreshOutcome {
+        if let t = inflight[name] { return await t.value }
+        let t = Task { () -> RefreshOutcome in
+            var out = await HermesSignInNet.refresh(record: record)
+            // Only a record that still exists and still holds the refresh token this request was made with may
+            // be rotated or removed by its answer.
+            if self.all()[name]?.refreshToken != record.refreshToken { out = .superseded }
+            switch out {
+            case .refreshed(let r): self.store(r, name: name)
+            case .expired: self.remove(name: name)
+            case .unavailable, .superseded: break
+            }
+            self.inflight[name] = nil
+            return out
+        }
+        inflight[name] = t
+        return await t.value
+    }
+
+    /// An access token that is fresh enough to use, refreshing first when needed.
+    /// `forceRefresh` is for a token the server just refused.
+    func validToken(for agent: HermesAgent, forceRefresh: Bool = false) async throws -> String {
+        let rec: HermesSignIn.SessionRecord
+        switch record(for: agent) {
+        case .success(let r): rec = r
+        case .failure(let e): throw e
+        }
+        let action: HermesSignIn.TokenAction
+        if forceRefresh { action = rec.refreshToken.isEmpty ? .signInAgain : .refresh }
+        else { action = HermesSignIn.tokenAction(rec, now: now()) }
+        switch action {
+        case .use:
+            return rec.accessToken
+        case .signInAgain:
+            if forceRefresh { remove(name: agent.name) }
+            throw HermesChatError.signInNeeded(agent.name)
+        case .refresh:
+            switch await refreshOutcome(name: agent.name, record: rec) {
+            case .refreshed(let r): return r.accessToken
+            case .expired: throw HermesChatError.signInNeeded(agent.name)
+            case .superseded:
+                // Whatever is stored now (a new sign in) wins; nothing stored means signed out.
+                switch record(for: agent) {
+                case .success(let r): return r.accessToken
+                case .failure(let e): throw e
+                }
+            case .unavailable:
+                if !forceRefresh, rec.expiresAt <= 0 || now() < rec.expiresAt { return rec.accessToken }
+                throw HermesChatError.busy
+            }
+        }
+    }
+}
+
+// MARK: - Loopback listener (sign in callback)
+
+#if !APPSTORE
+/// One shot HTTP listener on 127.0.0.1 for the browser redirect. Accepts a single callback, always answers a
+/// static page, and is torn down on every outcome (callback, timeout, cancellation, `stop`).
+final class HermesLoopback: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "fr.louisraille.coucou.hermes-loopback")
+    private let listener: NWListener
+    private let lock = NSLock()
+    private var cont: CheckedContinuation<String?, Never>?
+    private var started: CheckedContinuation<UInt16?, Never>?
+    private var settled = false
+    private var line: String?
+    private let expectedState: String
+    private var boundPort: UInt16 = 0
+
+    private init(_ l: NWListener, expectedState: String) { listener = l; self.expectedState = expectedState }
+
+    /// Binds 127.0.0.1 on an ephemeral port and waits until the listener is ready. Nil when it cannot bind.
+    /// Only a request that carries `expectedState` (and `Host: 127.0.0.1:<port>`) ends the wait.
+    static func start(expectedState: String) async -> (HermesLoopback, UInt16)? {
+        let params = NWParameters.tcp
+        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: .ipv4(.loopback), port: .any)
+        params.acceptLocalOnly = true
+        guard let l = try? NWListener(using: params) else { return nil }
+        let lb = HermesLoopback(l, expectedState: expectedState)
+        guard let port = await lb.begin() else { lb.stop(); return nil }
+        lb.lock.withLock { lb.boundPort = port }
+        return (lb, port)
+    }
+
+    private func begin() async -> UInt16? {
+        await withCheckedContinuation { (c: CheckedContinuation<UInt16?, Never>) in
+            lock.withLock { started = c }
+            listener.stateUpdateHandler = { [self] state in
+                switch state {
+                case .ready: finishStart(listener.port?.rawValue)
+                case .failed, .cancelled: finishStart(nil)
+                default: break
+                }
+            }
+            listener.newConnectionHandler = { [self] conn in accept(conn) }
+            listener.start(queue: queue)
+            queue.asyncAfter(deadline: .now() + 5) { [self] in finishStart(nil) }
+        }
+    }
+
+    private func finishStart(_ port: UInt16?) {
+        let c = lock.withLock { () -> CheckedContinuation<UInt16?, Never>? in
+            let c = started
+            started = nil
+            return c
+        }
+        c?.resume(returning: port)
+    }
+
+    /// The `GET /callback?…` request line, or nil on timeout or cancellation.
+    func waitForCallback(timeout: TimeInterval) async -> String? {
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { (c: CheckedContinuation<String?, Never>) in
+                let ready = lock.withLock { () -> (Bool, String?) in
+                    if settled { return (true, line) }
+                    cont = c
+                    return (false, nil)
+                }
+                if ready.0 { c.resume(returning: ready.1); return }
+                queue.asyncAfter(deadline: .now() + timeout) { [self] in settle(nil) }
+            }
+        } onCancel: {
+            settle(nil)
+        }
+    }
+
+    /// Ends the wait once (first outcome wins) and stops accepting connections.
+    private func settle(_ requestLine: String?) {
+        let c = lock.withLock { () -> CheckedContinuation<String?, Never>? in
+            guard !settled else { return nil }
+            settled = true
+            line = requestLine
+            let c = cont
+            cont = nil
+            return c
+        }
+        listener.cancel()
+        c?.resume(returning: requestLine)
+    }
+
+    func stop() { settle(nil) }
+
+    private var isSettled: Bool { lock.withLock { settled } }
+
+    private func accept(_ conn: NWConnection) {
+        if isSettled { conn.cancel(); return }
+        let peer = Peer(conn: conn, owner: self)
+        peer.start(queue: queue)
+    }
+
+    /// Settles only on a callback whose state matches, addressed to this listener (a web page cannot make the
+    /// browser send another Host). Anything else is answered with the static page and ignored.
+    fileprivate func requestSeen(_ requestLine: String, host: String?) {
+        let port = lock.withLock { boundPort }
+        guard port != 0, host == "127.0.0.1:\(port)",
+              HermesSignIn.isCallback(requestLine: requestLine, expectedState: expectedState) else { return }
+        settle(requestLine)
+    }
+
+    /// A static page, no script, nothing taken from the request.
+    fileprivate static let response: Data = {
+        let body = "<!doctype html><html><head><meta charset=\"utf-8\"><title>Coucou</title></head>"
+            + "<body style=\"font-family:-apple-system,sans-serif;text-align:center;margin-top:20vh\">"
+            + "<h2>Back to Coucou</h2><p>You can close this window and return to the app.</p></body></html>"
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n"
+            + "Connection: close\r\nContent-Length: \(body.utf8.count)\r\n\r\n"
+        return Data((head + body).utf8)
+    }()
+
+    /// One accepted connection. Everything runs on the listener queue.
+    private final class Peer: @unchecked Sendable {
+        let conn: NWConnection
+        weak var owner: HermesLoopback?
+        var buf = Data()
+        var answered = false
+
+        init(conn: NWConnection, owner: HermesLoopback) { self.conn = conn; self.owner = owner }
+
+        func start(queue: DispatchQueue) {
+            conn.start(queue: queue)
+            queue.asyncAfter(deadline: .now() + 5) { [self] in conn.cancel() }
+            pump()
+        }
+
+        func pump() {
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 4096) { [self] data, _, isComplete, error in
+                if let data { buf.append(data) }
+                let end = buf.range(of: Data("\r\n\r\n".utf8)) != nil
+                if end || buf.count >= 8192 || isComplete || error != nil {
+                    finish()
+                } else {
+                    pump()
+                }
+            }
+        }
+
+        func finish() {
+            guard !answered else { return }
+            answered = true
+            let head = buf.prefix(8192)
+            let lines = String(decoding: head, as: UTF8.self).components(separatedBy: "\r\n")
+            if let firstLine = lines.first, !firstLine.isEmpty {
+                let host = lines.dropFirst().first { $0.lowercased().hasPrefix("host:") }
+                    .map { $0.dropFirst(5).trimmingCharacters(in: .whitespaces) }
+                owner?.requestSeen(firstLine, host: host)
+            }
+            conn.send(content: HermesLoopback.response, contentContext: .finalMessage, isComplete: true,
+                      completion: .contentProcessed { [self] _ in conn.cancel() })
+        }
+    }
+}
+#endif
+
+// MARK: - Network
+
+enum HermesSignInNet {
+
+    // MARK: REST
+
+    private static func config() -> URLSessionConfiguration {
+        let c = URLSessionConfiguration.ephemeral
+        c.httpShouldSetCookies = false
+        c.httpCookieStorage = nil
+        c.urlCache = nil
+        return c
+    }
+
+    /// One request, no redirect followed (the Authorization header never leaves the stored origin), body capped.
+    private static func call(_ method: String, _ url: URL, bearer: String?, json: [String: Any]?,
+                             host: String, timeout: TimeInterval = 15) async -> Result<(Int, Data), HermesChatError> {
+        var req = URLRequest(url: url, timeoutInterval: timeout)
+        req.httpMethod = method
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let bearer { req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization") }
+        if let json {
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: json)
+        }
+        let s = URLSession(configuration: config())
+        defer { s.finishTasksAndInvalidate() }
+        var data = Data()
+        let response: URLResponse
+        do {
+            let (bytes, r) = try await s.bytes(for: req, delegate: HermesNoRedirect())
+            response = r
+            for try await b in bytes {
+                data.append(b)
+                if data.count > HermesChat.Limits.standard.connectBodyBytes {
+                    return .failure(.server("The server answer is too large for a Hermes server."))
+                }
+            }
+        } catch {
+            return .failure(.unreachable(host))
+        }
+        return .success(((response as? HTTPURLResponse)?.statusCode ?? 0, data))
+    }
+
+    /// `POST /auth/native/refresh`. Never throws; the caller decides what each outcome means.
+    static func refresh(record: HermesSignIn.SessionRecord) async -> HermesSessions.RefreshOutcome {
+        guard !record.refreshToken.isEmpty,
+              let url = HermesSignIn.endpoint(record.baseURL, "/auth/native/refresh") else { return .unavailable }
+        let r = await call("POST", url, bearer: nil,
+                           json: ["refresh_token": record.refreshToken, "provider": record.provider],
+                           host: HermesChat.hostLabel(record.baseURL))
+        guard case .success(let (status, body)) = r else { return .unavailable }
+        if status == 401 { return .expired }
+        guard status == 200,
+              case .success(let rotated) = HermesSignIn.parseTokenResponse(body, baseURL: record.baseURL, previous: record) else {
+            return .unavailable
+        }
+        return .refreshed(rotated)
+    }
+
+    /// Label for Settings (`GET /api/auth/me`); nil on any failure.
+    static func me(baseURL: String, token: String) async -> String? {
+        guard let url = HermesSignIn.endpoint(baseURL, "/api/auth/me"),
+              case .success(let (status, body)) = await call("GET", url, bearer: token, json: nil,
+                                                               host: HermesChat.hostLabel(baseURL)),
+              status == 200 else { return nil }
+        return HermesSignIn.parseMe(body)
+    }
+
+    static func profiles(baseURL: String, token: String) async -> Result<[HermesSignIn.Profile], HermesChatError> {
+        guard let url = HermesSignIn.endpoint(baseURL, "/api/profiles") else { return .failure(.invalidURL) }
+        switch await call("GET", url, bearer: token, json: nil, host: HermesChat.hostLabel(baseURL)) {
+        case .failure(let e): return .failure(e)
+        case .success(let (status, body)):
+            if HermesSignIn.isSessionExpired(status: status, body: body) {
+                return .failure(.signInFailed("Hermes refused the session. Sign in again."))
+            }
+            guard status == 200 else { return .failure(.server("HTTP \(status)")) }
+            return .success(HermesSignIn.parseProfiles(body))
+        }
+    }
+
+    // MARK: Sign in
+
+    #if !APPSTORE
+    /// The whole browser flow. `open` is called once, after the listener is ready; it is the only place a browser opens.
+    /// Nothing is stored here: the caller stores the record when the user confirms.
+    static func signIn(baseURL: String, timeout: TimeInterval = 300,
+                       open: @MainActor @escaping (URL) -> Void) async -> Result<HermesSignIn.SessionRecord, HermesChatError> {
+        guard case .success(let normalised) = HermesChat.normaliseBaseURL(baseURL), normalised == baseURL else {
+            return .failure(.invalidURL)
+        }
+        guard HermesSignIn.isAllowedSignInBase(baseURL) else {
+            return .failure(.signInFailed(HermesSignIn.httpsOnlyMessage))
+        }
+        let host = HermesChat.hostLabel(baseURL)
+        let pkce = HermesSignIn.makePKCE()
+        guard let (listener, port) = await HermesLoopback.start(expectedState: pkce.state) else {
+            return .failure(.signInFailed("Coucou could not open a local port for sign in."))
+        }
+        defer { listener.stop() }
+        guard let url = HermesSignIn.authorizeURL(baseURL: baseURL, pkce: pkce,
+                                                  redirectURI: HermesSignIn.redirectURI(port: port), provider: nil) else {
+            return .failure(.invalidURL)
+        }
+        await MainActor.run { open(url) }
+        guard let line = await listener.waitForCallback(timeout: timeout) else {
+            return .failure(.signInFailed("Sign in timed out. Try again."))
+        }
+        listener.stop()
+        let code: String
+        switch HermesSignIn.parseCallback(requestLine: line, expectedState: pkce.state) {
+        case .success(let c): code = c
+        case .failure(let e): return .failure(e)
+        }
+        guard let tokenURL = HermesSignIn.endpoint(baseURL, "/auth/native/token") else { return .failure(.invalidURL) }
+        switch await call("POST", tokenURL, bearer: nil, json: ["code": code, "code_verifier": pkce.verifier], host: host) {
+        case .failure(let e): return .failure(e)
+        case .success(let (status, body)):
+            guard status == 200 else {
+                return .failure(.signInFailed("Hermes refused the sign in code. Try again."))
+            }
+            return HermesSignIn.parseTokenResponse(body, baseURL: baseURL, previous: nil)
+        }
+    }
+    #endif
+
+    // MARK: Ticket
+
+    /// A fresh single use ticket. A refused token is refreshed once; a second refusal ends the session.
+    private static func mintTicket(agent: HermesAgent, sessions: HermesSessions, host: String) async throws -> String {
+        guard let url = HermesSignIn.endpoint(agent.baseURL, "/api/auth/ws-ticket") else { throw HermesChatError.invalidURL }
+        var token = try await sessions.validToken(for: agent)
+        for attempt in 0..<2 {
+            switch await call("POST", url, bearer: token, json: [:], host: host) {
+            case .failure(let e): throw e
+            case .success(let (status, body)):
+                if HermesSignIn.isSessionExpired(status: status, body: body) {
+                    if attempt == 0 { token = try await sessions.validToken(for: agent, forceRefresh: true); continue }
+                    await sessions.remove(name: agent.name, ifAccessToken: token)
+                    throw HermesChatError.signInNeeded(agent.name)
+                }
+                guard status == 200 else {
+                    throw (status == 429 || status == 503) ? HermesChatError.busy : HermesChatError.server("HTTP \(status)")
+                }
+                guard let t = HermesSignIn.parseTicket(body) else { throw HermesChatError.notHermes }
+                return t
+            }
+        }
+        throw HermesChatError.signInNeeded(agent.name)
+    }
+
+    // MARK: Chat turn
+
+    /// One chat turn on its own socket: ticket, handshake, create or resume, submit, stream, close.
+    /// Returns the final text. `onSession` gets the stored session id to resume on the next turn.
+    static func streamTurn(
+        agent: HermesAgent,
+        sessions: HermesSessions,
+        storedSession: String?,
+        text: String,
+        limits: HermesChat.Limits = .standard,
+        onSession: @MainActor @escaping (String) -> Void,
+        onToken: @MainActor @escaping (String) -> Void
+    ) async throws -> String {
+        guard agent.connection == .signIn, HermesChat.isValidAgent(agent) else { throw HermesChatError.invalidURL }
+        let host = HermesChat.hostLabel(agent.baseURL)
+
+        // Handshake: ticket in the subprotocol; once, the query form when that form is refused.
+        // The socket is registered for closing the moment it exists, so a cancellation anywhere below cannot leak it.
+        var opened: HermesSocket?
+        defer { opened?.close() }
+        for queryForm in [false, true] {
+            if queryForm && !limits.allowQueryTicketFallback { break }
+            try Task.checkCancellation()
+            let ticket = try await mintTicket(agent: agent, sessions: sessions, host: host)
+            guard let url = HermesSignIn.socketURL(baseURL: agent.baseURL, queryTicket: queryForm ? ticket : nil) else {
+                if queryForm { break }   // no query ticket for a target that is not wss (or loopback)
+                throw HermesChatError.invalidURL
+            }
+            let protocols = queryForm ? [] : (HermesSignIn.ticketProtocols(ticket) ?? [])
+            // The request timeout is not an idle limit here: the ready, rpc and turn timers below are.
+            let s = HermesSocket(url: url, protocols: protocols,
+                                 requestTimeout: limits.duration + limits.readyTimeout + 60)
+            opened = s
+            s.start()
+            if await s.waitReady(timeout: limits.readyTimeout) { break }
+            s.close()
+            opened = nil
+        }
+        try Task.checkCancellation()
+        guard let socket = opened else { throw HermesChatError.unreachable(host) }
+
+        var turn = HermesSignIn.Turn()
+        var nextID = 1
+        var resumedFresh = false
+        var submitSent = false
+        // Per turn budget: every text frame counts, ignored ones too.
+        var frames = 0
+        var bytes = 0
+        func overBudget(bytes n: Int) -> Bool {
+            frames += 1
+            bytes += n
+            return frames > limits.maxFrames || bytes > limits.maxBytes
+        }
+
+        func profileParams() -> [String: Any] {
+            (agent.profile.isEmpty || agent.profile == "default") ? [:] : ["profile": agent.profile]
+        }
+
+        /// Sends a request and waits for its answer. Server requests are refused, never answered.
+        func rpc(_ method: String, _ params: [String: Any]) async throws -> HermesSignIn.Frame {
+            let id = nextID
+            nextID += 1
+            if method == "prompt.submit" { submitSent = true }   // from here on the server may run the turn
+            do { try await socket.sendText(HermesSignIn.request(id: id, method: method, params: params)) }
+            catch {
+                if Task.isCancelled { throw CancellationError() }
+                throw HermesChatError.unreachable(host)
+            }
+            let timer = socket.arm(limits.rpcTimeout, .timeout)
+            defer { timer.cancel() }
+            while let ev = await socket.next() {
+                switch ev {
+                case .text(let t):
+                    if overBudget(bytes: t.utf8.count) { throw HermesChatError.server("Hermes sent more data than Coucou accepts.") }
+                    let f = HermesSignIn.decode(t)
+                    if case .serverRequest(let sid, _) = f {
+                        await socket.sendBestEffort(HermesSignIn.rejection(id: sid), timeout: 2)
+                        _ = turn.ingest(f, maxChars: limits.textChars)
+                    } else if !turn.session.isEmpty {
+                        _ = turn.ingest(f, maxChars: limits.textChars)
+                    }
+                    switch f {
+                    case .result(let rid, _) where rid == id: return f
+                    case .failure(let rid, _, _) where rid == id: return f
+                    default: break
+                    }
+                case .binary(let n):
+                    if overBudget(bytes: n) { throw HermesChatError.server("Hermes sent more data than Coucou accepts.") }
+                case .closed: throw HermesChatError.unreachable(host)
+                case .timeout: throw HermesChatError.server("Hermes did not answer in time.")
+                case .ping, .deadline: break
+                }
+            }
+            if Task.isCancelled { throw CancellationError() }
+            throw HermesChatError.unreachable(host)
+        }
+
+        // Session: resume the stored one, else create (also when the resume failed: the server may have lost it).
+        var runtimeID = ""
+        var storedID: String?
+        if let stored = storedSession {
+            var p = profileParams()
+            p["session_id"] = stored
+            p["omit_messages"] = true
+            if case .result(_, let m) = try await rpc("session.resume", p), let sid = m["session_id"], !sid.isEmpty {
+                runtimeID = sid
+                storedID = m["resumed"] ?? stored
+            } else {
+                resumedFresh = true
+            }
+        }
+        if runtimeID.isEmpty {
+            var p = profileParams()
+            p["idempotency_key"] = UUID().uuidString
+            switch try await rpc("session.create", p) {
+            case .result(_, let m):
+                guard let sid = m["session_id"], !sid.isEmpty else { throw HermesChatError.server("Hermes did not open a session.") }
+                runtimeID = sid
+                storedID = m["stored_session_id"]
+            case .failure(_, _, let msg):
+                throw HermesChatError.server(msg.isEmpty ? "Hermes did not open a session." : msg)
+            default:
+                throw HermesChatError.server("Hermes did not open a session.")
+            }
+        }
+        turn.session = runtimeID
+        if let storedID, !storedID.isEmpty { await MainActor.run { onSession(storedID) } }
+        else if resumedFresh { await MainActor.run { onSession("") } }   // the old id is gone: forget it
+
+        func interruptFrame() -> String {
+            let id = nextID
+            nextID += 1
+            return HermesSignIn.request(id: id, method: "session.interrupt", params: ["session_id": runtimeID])
+        }
+
+        let submitAnswer: HermesSignIn.Frame
+        do { submitAnswer = try await rpc("prompt.submit", ["session_id": runtimeID, "text": text]) }
+        catch is CancellationError {
+            // The server may already be running the turn nobody will read.
+            if submitSent { await socket.sendBestEffort(interruptFrame(), timeout: 2) }
+            throw CancellationError()
+        }
+        switch submitAnswer {
+        case .result(_, let m):
+            // `streaming`, `steered`, `redirected` and `queued` all mean the server accepted the message: it will
+            // run, so never report busy and never drop it. A queued message runs after the live turn, on this socket.
+            if m["status"] == "queued" { turn.queuedBehindRunningTurn() }
+        case .failure(_, let code, let msg):
+            throw code == 4009 ? HermesChatError.busy : HermesChatError.server(msg.isEmpty ? "Hermes refused the message." : msg)
+        default:
+            throw HermesChatError.server("Hermes refused the message.")
+        }
+
+        // Stream until the terminal event. The turn may already be over: the server starts it before it answers.
+        var tooSlow = false
+        var closed = false
+        var lastUpdate = Date.distantPast
+        let minInterval: TimeInterval = 1.0 / 15.0
+        var pingTimer = socket.arm(limits.pingInterval, .ping)
+        let deadlineTimer = socket.arm(limits.duration, .deadline)
+        defer { pingTimer.cancel(); deadlineTimer.cancel() }
+
+        loop: while !(turn.done || turn.overLimit), let ev = await socket.next() {
+            switch ev {
+            case .text(let t):
+                if overBudget(bytes: t.utf8.count) { turn.overLimit = true; break loop }   // ends the turn like the text cap
+                let f = HermesSignIn.decode(t)
+                if case .serverRequest(let sid, _) = f { await socket.sendBestEffort(HermesSignIn.rejection(id: sid), timeout: 2) }
+                if turn.ingest(f, maxChars: limits.textChars) {
+                    let now = Date()
+                    if now.timeIntervalSince(lastUpdate) >= minInterval {
+                        lastUpdate = now
+                        let visible = LocalChat.progressiveFilter(turn.visibleSource)
+                        await MainActor.run { onToken(visible) }
+                    }
+                }
+            case .binary(let n):
+                if overBudget(bytes: n) { turn.overLimit = true; break loop }
+            case .ping:
+                let id = nextID
+                nextID += 1
+                await socket.sendBestEffort(HermesSignIn.request(id: id, method: "gateway.ping", params: [:]), timeout: 2)
+                pingTimer = socket.arm(limits.pingInterval, .ping)
+            case .deadline:
+                tooSlow = true
+                break loop
+            case .closed:
+                closed = true
+                break loop
+            case .timeout:
+                break
+            }
+        }
+        let cancelled = Task.isCancelled
+        if !cancelled, !turn.done, !tooSlow, !turn.overLimit { closed = true }
+
+        // A cap or a cancellation stops the agent too (best effort), unless the server already ended the turn.
+        if !turn.done, !closed, cancelled || tooSlow || turn.overLimit {
+            await socket.sendBestEffort(interruptFrame(), timeout: 2)
+        }
+        if cancelled { throw CancellationError() }
+        if closed, !turn.done, turn.visibleSource.isEmpty { throw HermesChatError.unreachable(host) }
+
+        let visible = LocalChat.progressiveFilter(turn.visibleSource)
+        await MainActor.run { onToken(visible) }
+        return try turn.finalText(tooSlow: tooSlow, closedEarly: closed, resumedFresh: resumedFresh)
+    }
+}
+
+// MARK: - WebSocket (one per turn)
+
+/// A `URLSessionWebSocketTask` that turns frames and timers into one event stream with a single consumer.
+/// No cookies, no Origin, no Authorization header, no redirects: the ticket is the only credential.
+/// Frames are read one at a time: the next `receive()` starts only after the consumer handled the previous text
+/// frame and asked for more, so a flood of frames waits in the network stack, not in memory.
+final class HermesSocket: @unchecked Sendable {
+    enum Event: Sendable {
+        case text(String)
+        /// A non text frame (its size): never decoded, but it counts against the turn budget.
+        case binary(Int)
+        case closed
+        case ping
+        case deadline
+        case timeout
+    }
+
+    private let session: URLSession
+    private let task: URLSessionWebSocketTask
+    private let continuation: AsyncStream<Event>.Continuation
+    private var iterator: AsyncStream<Event>.Iterator
+    private let credit: AsyncStream<Void>.Continuation
+    private let creditStream: AsyncStream<Void>
+    private var owed = false
+    private var reader: Task<Void, Never>?
+
+    /// `requestTimeout` is URLSession's request timeout, which can behave as an idle limit on a WebSocket:
+    /// callers pass a value that covers the whole turn. Ready, rpc and turn timers are explicit (`arm`).
+    init(url: URL, protocols: [String], requestTimeout: TimeInterval) {
+        let c = URLSessionConfiguration.ephemeral
+        c.httpShouldSetCookies = false
+        c.httpCookieStorage = nil
+        c.urlCache = nil
+        c.timeoutIntervalForRequest = requestTimeout
+        session = URLSession(configuration: c, delegate: HermesNoRedirect(), delegateQueue: nil)
+        task = protocols.isEmpty ? session.webSocketTask(with: url) : session.webSocketTask(with: url, protocols: protocols)
+        task.maximumMessageSize = 4 * 1024 * 1024
+        let (stream, cont) = AsyncStream.makeStream(of: Event.self, bufferingPolicy: .unbounded)
+        continuation = cont
+        iterator = stream.makeAsyncIterator()
+        let (cStream, cCont) = AsyncStream.makeStream(of: Void.self, bufferingPolicy: .unbounded)
+        creditStream = cStream
+        credit = cCont
+        cCont.yield(())   // one frame may be read ahead
+    }
+
+    func start() {
+        task.resume()
+        reader = Task.detached { [task, continuation, creditStream] in
+            for await _ in creditStream {
+                // One credit pays for one text frame; non text frames are reported and the reader keeps going.
+                receiving: while true {
+                    do {
+                        switch try await task.receive() {
+                        case .string(let s):
+                            continuation.yield(.text(s))
+                            break receiving
+                        case .data(let d):
+                            continuation.yield(.binary(d.count))
+                        @unknown default:
+                            continuation.yield(.binary(0))
+                        }
+                    } catch {
+                        continuation.yield(.closed)
+                        continuation.finish()
+                        return
+                    }
+                }
+            }
+        }
+    }
+
+    func next() async -> Event? {
+        if owed { owed = false; credit.yield(()) }   // the previous text frame is handled: read the next one
+        let ev = await iterator.next()
+        if case .text? = ev { owed = true }
+        return ev
+    }
+
+    /// True when `gateway.ready` arrives in time; false on handshake failure, close or timeout.
+    func waitReady(timeout: TimeInterval, maxBinaryFrames: Int = HermesChat.Limits.standard.maxFrames) async -> Bool {
+        let timer = arm(timeout, .timeout)
+        defer { timer.cancel() }
+        var binary = 0
+        while let ev = await next() {
+            switch ev {
+            case .text(let t): if HermesSignIn.decode(t) == .ready { return true }
+            case .binary:
+                binary += 1
+                if binary > maxBinaryFrames { return false }
+            case .closed, .timeout: return false
+            case .ping, .deadline: break
+            }
+        }
+        return false
+    }
+
+    func arm(_ seconds: TimeInterval, _ event: Event) -> Task<Void, Never> {
+        Task { [continuation] in
+            try? await Task.sleep(for: .seconds(seconds))
+            if !Task.isCancelled { continuation.yield(event) }
+        }
+    }
+
+    func sendText(_ text: String) async throws { try await task.send(.string(text)) }
+
+    /// Sends and returns when the frame was handed to the network or after `timeout`; never throws.
+    /// Not tied to task cancellation, so a cancelled turn can still say goodbye.
+    func sendBestEffort(_ text: String, timeout: TimeInterval) async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            let once = Once(c)
+            task.send(.string(text)) { _ in once.fire() }
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { once.fire() }
+        }
+    }
+
+    func close() {
+        task.cancel(with: .normalClosure, reason: nil)
+        continuation.finish()
+        credit.finish()
+        reader?.cancel()
+        session.invalidateAndCancel()
+    }
+
+    private final class Once: @unchecked Sendable {
+        private let lock = NSLock()
+        private var c: CheckedContinuation<Void, Never>?
+        init(_ c: CheckedContinuation<Void, Never>) { self.c = c }
+        func fire() {
+            let taken = lock.withLock { () -> CheckedContinuation<Void, Never>? in
+                let t = c
+                c = nil
+                return t
+            }
+            taken?.resume()
+        }
+    }
+}
