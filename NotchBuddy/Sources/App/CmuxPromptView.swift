@@ -15,6 +15,8 @@ struct CmuxPromptView: View {
     @ObservedObject var state: AppState
     @State private var text = ""
     @State private var folder = ""
+    /// Claude every time the view opens: the last choice is not remembered.
+    @State private var launcherId: CmuxLauncher.Id = .claude
     @State private var launching = false
     /// Folder lookups hit the file system: done on appear and when the lists change, not per render.
     @State private var folders: [String] = []
@@ -26,6 +28,8 @@ struct CmuxPromptView: View {
         if case .reply(let id) = mode { return state.tasks.first { $0.id == id } }
         return nil
     }
+
+    private var launcher: CmuxLauncher { CmuxLauncher.launcher(launcherId) }
 
     private var isReply: Bool { if case .reply = mode { return true } else { return false } }
 
@@ -121,7 +125,7 @@ struct CmuxPromptView: View {
                             }
                             .font(.system(size: 11)).foregroundColor(Color(hex: "#8E939C")).buttonStyle(.plain)
                         }
-                        if noticeFailure == .noCredential || noticeFailure == .notRunning {
+                        if noticeFailure == .noCredential || noticeFailure == .notRunning || state.cmuxNoticeOffersCmux {
                             Button("Open cmux") { CmuxHub.openCmux() }
                                 .font(.system(size: 11)).foregroundColor(Color(hex: "#7DD3FC").opacity(0.85))
                                 .buttonStyle(.plain)
@@ -158,10 +162,12 @@ struct CmuxPromptView: View {
         .padding(.bottom, 10)
         .onAppear {
             focused = true
+            launcherId = .claude
             launching = HookServer.shared.cmuxPendingLaunch != nil
             loadFolders()
             takeDraft()
         }
+        .onChange(of: state.cmuxPrompt) { _, _ in launcherId = .claude }
         .onChange(of: state.cmuxDefaultFolder) { _, _ in loadFolders() }
         .onChange(of: state.cmuxRecentFolders) { _, _ in loadFolders() }
         .onChange(of: state.cmuxDraft) { _, _ in takeDraft() }
@@ -219,27 +225,38 @@ struct CmuxPromptView: View {
             ChipFlowLayout(spacing: 6) {
                 ForEach(Array(folders.enumerated()), id: \.element) { i, f in
                     let selected = f == folder
-                    Button { folder = f } label: {
-                        Text(labels[i])
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundColor(selected ? Color(hex: "#0B0C0E") : Color(hex: "#C5C8CD"))
-                            .lineLimit(1)
-                            .padding(.horizontal, 9).padding(.vertical, 4)
-                            .background(selected ? Color(hex: "#F5F6F8") : Color.white.opacity(0.08))
-                            .clipShape(Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .help(f)
+                    Button { folder = f } label: { chipLabel(labels[i], selected: selected) }
+                        .buttonStyle(.plain)
+                        .help(f)
                 }
             }
             .padding(.horizontal, 10)
-            Text("Runs: \(state.cmuxLaunchCommand)")
+            ChipFlowLayout(spacing: 6) {
+                ForEach(CmuxLauncher.all) { l in
+                    Button { launcherId = l.id } label: { chipLabel(l.name, selected: l.id == launcherId) }
+                        .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 10)
+            Text("Runs: \(state.cmuxCommand(for: launcher))")
                 .font(.system(size: 10.5))
                 .foregroundColor(Color(hex: "#8E939C"))
-                .lineLimit(1)
+                .lineLimit(2)
+                .truncationMode(.middle)
                 .padding(.horizontal, 10)
             Spacer()
         }
+    }
+
+    /// One chip, for the folders and for the launchers.
+    private func chipLabel(_ title: String, selected: Bool) -> some View {
+        Text(verbatim: title)
+            .font(.system(size: 11, weight: .medium))
+            .foregroundColor(selected ? Color(hex: "#0B0C0E") : Color(hex: "#C5C8CD"))
+            .lineLimit(1)
+            .padding(.horizontal, 9).padding(.vertical, 4)
+            .background(selected ? Color(hex: "#F5F6F8") : Color.white.opacity(0.08))
+            .clipShape(Capsule())
     }
 
     // MARK: actions
@@ -269,13 +286,15 @@ struct CmuxPromptView: View {
             }
         case .newChat:
             let chosen = folder
-            CmuxControl.newChat(folder: chosen, prompt: prompt) { failure in
+            let chosenLauncher = launcher
+            CmuxControl.newChat(folder: chosen, prompt: prompt, launcher: chosenLauncher) { failure in
                 if let failure {
                     state.showCmuxFailure(failure)
                     text = prompt
                 } else {
                     text = ""
-                    launching = true
+                    // Only Claude reports its start; the others have no pending launch to wait for.
+                    launching = chosenLauncher.reportsSessionStart
                 }
             }
         }

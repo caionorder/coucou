@@ -341,6 +341,193 @@ extension CmuxRouting {
     }
 }
 
+// MARK: launchers (which agent a new chat starts)
+
+/// An agent the New chat view can start in a new cmux workspace. The command is the only part of the
+/// launch line the user types (validated by `isValidLaunchCommand`); the prompt of a launcher that
+/// does not report back to Coucou travels in a private file, see `CmuxLaunchFiles`.
+struct CmuxLauncher: Equatable, Identifiable, Sendable {
+    enum Id: String, CaseIterable, Sendable { case claude, codex, grok, agy }
+
+    let id: Id
+    let name: String
+    let defaultCommand: String
+    /// Flag that introduces the first prompt on the command line, "" when it is a positional argument.
+    let promptFlag: String
+    /// True for the launcher whose SessionStart hook reports the new surface: its prompt is typed
+    /// afterwards. The others get the prompt on the command line and nothing is awaited.
+    let reportsSessionStart: Bool
+    /// Prompts that a positional prompt slot would read as a subcommand of the CLI (exact match).
+    let reservedPrompts: Set<String>
+
+    /// Claude, the default, then the command line launchers. Names are product names, not translated.
+    static let all: [CmuxLauncher] = [
+        CmuxLauncher(id: .claude, name: "Claude", defaultCommand: "claude --dangerously-skip-permissions",
+                     promptFlag: "", reportsSessionStart: true, reservedPrompts: []),
+        // codex-cli 0.155.1 `codex --help`: `codex [OPTIONS] [PROMPT]`, [PROMPT] "Optional user prompt to start the session".
+        CmuxLauncher(id: .codex, name: "Codex", defaultCommand: "codex",
+                     promptFlag: "", reportsSessionStart: false,
+                     reservedPrompts: ["agents", "exec", "e", "review", "login", "logout", "mcp", "plugin", "app-server",
+                                       "remote-control", "app", "completion", "update", "doctor", "sandbox", "debug",
+                                       "apply", "a", "resume", "queue", "archive", "delete", "migrate-rollouts",
+                                       "unarchive", "fork", "cloud", "exec-server", "features", "help"]),
+        // grok 1.0.46 `grok --help`: `grok [OPTIONS] [PROMPT] [COMMAND]`, [PROMPT] "Initial prompt for the interactive session".
+        CmuxLauncher(id: .grok, name: "Grok", defaultCommand: "grok",
+                     promptFlag: "", reportsSessionStart: false,
+                     reservedPrompts: ["agent", "clone", "completions", "cursor-worker", "dashboard", "doctor", "du",
+                                       "disk-usage", "export", "help", "inspect", "leader", "login", "logout", "mcp",
+                                       "memory", "models", "plugin", "sessions", "setup", "trace", "update", "usage",
+                                       "version", "v", "worktree", "wrap"]),
+        // `agy --help`: `-i`, alias of `--prompt-interactive`: "Run an initial prompt interactively and continue the session".
+        CmuxLauncher(id: .agy, name: "Agy", defaultCommand: "agy",
+                     promptFlag: "-i", reportsSessionStart: false, reservedPrompts: []),
+    ]
+
+    static let claude = all[0]
+
+    static func launcher(_ id: Id) -> CmuxLauncher { all.first { $0.id == id } ?? claude }
+
+    /// UserDefaults key of this launcher's command. The old single key is read for migration only.
+    var defaultsKey: String { "cmuxLaunchCommand.\(id.rawValue)" }
+    static let legacyDefaultsKey = "cmuxLaunchCommand"
+
+    /// The command to use from what is stored. A stored valid value wins, `claude` included. Claude with
+    /// nothing stored takes the legacy single command when it is valid, else the new default: only a user who
+    /// never stored a command gets `--dangerously-skip-permissions`.
+    func resolvedCommand(stored: String?, legacy: String?) -> String {
+        if let stored, CmuxRouting.isValidLaunchCommand(stored) { return stored }
+        if id == .claude, let legacy, CmuxRouting.isValidLaunchCommand(legacy) { return legacy }
+        return defaultCommand
+    }
+
+    /// False for a prompt a command line launcher would read as an option (a leading dash, tested on the
+    /// first byte: none of the three helps documents `--`) or as a subcommand (the whole prompt is a
+    /// subcommand name). The prompt is still one argv word for the CLI, see `CmuxLaunchFiles.wrapperScript`.
+    func acceptsPrompt(_ prompt: String) -> Bool {
+        guard !reportsSessionStart else { return true }
+        return prompt.utf8.first != 0x2D && !reservedPrompts.contains(prompt)
+    }
+
+    /// The line the terminal types for a launcher that takes its prompt on the command line: `/bin/sh`, the
+    /// wrapper, the prompt file, the validated command, then the prompt flag when there is one. It holds no
+    /// user text, only the charset of `isValidLaunchCommand`, so sh, bash, zsh and fish read it the same way.
+    /// nil for an invalid command or path, or for Claude.
+    func launchLine(command: String, wrapperPath: String, promptFile: String) -> String? {
+        guard !reportsSessionStart, CmuxRouting.isValidLaunchCommand(command),
+              CmuxLaunchFiles.isSafePath(wrapperPath), CmuxLaunchFiles.isSafePath(promptFile)
+        else { return nil }
+        return "/bin/sh " + wrapperPath + " " + promptFile + " " + command + (promptFlag.isEmpty ? "" : " " + promptFlag)
+    }
+}
+
+// MARK: private launch files (the prompt never travels in the typed line)
+
+/// The prompt of Codex, Grok and Agy goes through a file in a private per user directory, read and removed by
+/// a fixed `/bin/sh` wrapper that the app owns, which then `exec`s the agent with the prompt as ONE argument.
+enum CmuxLaunchFiles {
+    static let directoryName = "coucou-launch"
+    static let wrapperName = "launch.sh"
+    static let staleAfter: TimeInterval = 600
+
+    /// POSIX sh. `$1` is the prompt file, the rest is the agent command. The `x` guard keeps trailing
+    /// newlines through the command substitution. All expansions are quoted, nothing is evaluated.
+    static let wrapperScript = """
+    #!/bin/sh
+    # Coucou launch wrapper. Usage: launch.sh PROMPT_FILE COMMAND [ARG...]
+    f=$1
+    [ $# -ge 2 ] && [ -f "$f" ] || exit 1
+    shift
+    p=$(cat -- "$f" && printf x) || exit 1
+    rm -f -- "$f"
+    p=${p%x}
+    exec "$@" "$p"
+
+    """
+
+    /// Absolute path of at most 400 bytes made only of `A-Z a-z 0-9 _ . / = : -`, no `..` component.
+    /// No space, so it is one word in every shell.
+    static func isSafePath(_ s: String) -> Bool {
+        let u = Array(s.utf8)
+        guard (2...400).contains(u.count), u[0] == 0x2F else { return false }
+        let ok = u.allSatisfy {
+            ($0 >= 0x41 && $0 <= 0x5A) || ($0 >= 0x61 && $0 <= 0x7A) || ($0 >= 0x30 && $0 <= 0x39)
+                || [0x5F, 0x2E, 0x2F, 0x3D, 0x3A, 0x2D].contains($0)
+        }
+        return ok && !s.split(separator: "/").contains("..")
+    }
+
+    struct Prepared: Equatable { let wrapperPath: String; let promptFile: String }
+
+    /// Creates (or checks) the private directory, drops stale files, writes the wrapper and the prompt file.
+    /// nil, with nothing left behind, when anything is off: the directory is not ours and private, a path is
+    /// not safe, a write fails. `baseDirectory` is the per user temporary directory.
+    static func prepare(prompt: String, baseDirectory: URL = FileManager.default.temporaryDirectory,
+                        now: Date = Date()) -> Prepared? {
+        guard !prompt.isEmpty, let dir = privateDirectory(under: baseDirectory) else { return nil }
+        removeStale(in: dir, now: now)
+        let wrapper = dir + "/" + wrapperName
+        let file = dir + "/prompt-" + randomHex(16) + ".txt"
+        guard isSafePath(wrapper), isSafePath(file),
+              writeAtomically(Array(wrapperScript.utf8), to: wrapper, dir: dir, mode: 0o700),
+              writeNew(Array(prompt.utf8), to: file, mode: 0o600) else { return nil }
+        return Prepared(wrapperPath: wrapper, promptFile: file)
+    }
+
+    static func discard(_ promptFile: String) { unlink(promptFile) }
+
+    /// `<base>/coucou-launch`, mode 0700, a real directory owned by this user with no group or other
+    /// permission (lstat: a symlink fails). nil otherwise.
+    static func privateDirectory(under base: URL) -> String? {
+        let path = base.standardizedFileURL.path + "/" + directoryName
+        guard isSafePath(path) else { return nil }
+        if mkdir(path, 0o700) != 0 && errno != EEXIST { return nil }
+        var st = stat()
+        guard lstat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFDIR,
+              st.st_uid == getuid(), (st.st_mode & 0o077) == 0 else { return nil }
+        return path
+    }
+
+    /// Deletes regular files older than `staleAfter` (by modification time). Never follows a link.
+    static func removeStale(in dir: String, now: Date) {
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { return }
+        for name in names {
+            let path = dir + "/" + name
+            var st = stat()
+            guard lstat(path, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG else { continue }
+            if now.timeIntervalSince1970 - TimeInterval(st.st_mtimespec.tv_sec) > staleAfter { unlink(path) }
+        }
+    }
+
+    private static func randomHex(_ bytes: Int) -> String {
+        var b = [UInt8](repeating: 0, count: bytes)
+        if SecRandomCopyBytes(kSecRandomDefault, bytes, &b) != errSecSuccess { b = b.map { _ in UInt8.random(in: 0...255) } }
+        return b.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// O_CREAT | O_EXCL | O_NOFOLLOW, then the exact bytes. The file is removed again on a short write.
+    private static func writeNew(_ bytes: [UInt8], to path: String, mode: mode_t) -> Bool {
+        let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode)
+        guard fd >= 0 else { return false }
+        var ok = fchmod(fd, mode) == 0
+        var written = 0
+        while ok && written < bytes.count {
+            let n = bytes[written...].withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+            if n <= 0 { ok = false } else { written += n }
+        }
+        if close(fd) != 0 { ok = false }
+        if !ok { unlink(path) }
+        return ok
+    }
+
+    /// A new random file next to the target, then rename over it.
+    private static func writeAtomically(_ bytes: [UInt8], to path: String, dir: String, mode: mode_t) -> Bool {
+        let tmp = dir + "/tmp-" + randomHex(8)
+        guard writeNew(bytes, to: tmp, mode: mode) else { return false }
+        if rename(tmp, path) != 0 { unlink(tmp); return false }
+        return true
+    }
+}
+
 // MARK: draft notice and socket peer check
 
 extension CmuxRouting {

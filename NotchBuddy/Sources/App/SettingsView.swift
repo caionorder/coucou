@@ -657,9 +657,19 @@ struct SettingsView: View {
 
     #if !APPSTORE
     @State private var cmuxInstalled = false
-    @State private var cmuxCommandDraft: String = AppState.shared.cmuxLaunchCommand
+    @State private var cmuxCommandDrafts: [String: String] = AppState.shared.cmuxLaunchCommands
     @State private var cmuxPasswordDraft: String = ""
     @State private var cmuxPasswordSaved: Bool = CmuxControl.hasPassword
+
+    /// Typing edits the draft; a valid draft is also saved as the launcher's command.
+    private func cmuxCommandBinding(_ launcher: CmuxLauncher) -> Binding<String> {
+        Binding(
+            get: { cmuxCommandDrafts[launcher.id.rawValue] ?? "" },
+            set: { new in
+                cmuxCommandDrafts[launcher.id.rawValue] = new
+                state.setCmuxCommand(new, for: launcher)
+            })
+    }
 
     @ViewBuilder private var cmuxSettingsGroup: some View {
         GroupBox("cmux") {
@@ -686,21 +696,24 @@ struct SettingsView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 4) {
-                    HStack(spacing: 8) {
-                        Text("Launch command")
-                            .font(.system(size: 12))
-                        TextField("claude", text: $cmuxCommandDraft)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.system(size: 11, design: .monospaced))
+                    Text("Launch command")
+                        .font(.system(size: 12))
+                    ForEach(CmuxLauncher.all) { launcher in
+                        let draft = cmuxCommandDrafts[launcher.id.rawValue] ?? ""
+                        HStack(spacing: 8) {
+                            Text(verbatim: launcher.name)
+                                .font(.system(size: 12))
+                                .frame(width: 52, alignment: .leading)
+                            TextField(launcher.defaultCommand, text: cmuxCommandBinding(launcher))
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(size: 11, design: .monospaced))
+                        }
+                        if !CmuxRouting.isValidLaunchCommand(draft) {
+                            Text("Letters, digits, spaces and _ . / = : - only. Keeping \"\(state.cmuxCommand(for: launcher))\".")
+                                .font(.system(size: 11))
+                                .foregroundColor(.red)
+                        }
                     }
-                    if !CmuxRouting.isValidLaunchCommand(cmuxCommandDraft) {
-                        Text("Letters, digits, spaces and _ . / = : - only. Keeping \"\(state.cmuxLaunchCommand)\".")
-                            .font(.system(size: 11))
-                            .foregroundColor(.red)
-                    }
-                }
-                .onChange(of: cmuxCommandDraft) { _, new in
-                    if CmuxRouting.isValidLaunchCommand(new) { state.cmuxLaunchCommand = new }
                 }
 
                 VStack(alignment: .leading, spacing: 4) {

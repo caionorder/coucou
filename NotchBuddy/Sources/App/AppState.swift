@@ -475,7 +475,13 @@ final class AppState: ObservableObject {
     var cmuxOpeningPrompt = false
     @Published var cmuxTranscripts: [String: [ChatMessage]] = [:]
     @Published var cmuxNotice: String? = nil {
-        didSet { if !settingCmuxFailure { cmuxNoticeFailure = nil } }
+        didSet { if !settingCmuxFailure { cmuxNoticeFailure = nil; cmuxNoticeOffersCmux = false } }
+    }
+    /// The notice is the "started in cmux" one of a command line launcher: it offers the Open cmux action.
+    @Published private(set) var cmuxNoticeOffersCmux = false
+    func showCmuxStarted(_ text: String) {
+        cmuxNotice = text
+        cmuxNoticeOffersCmux = true
     }
     /// Which cmux failure the notice shows, when it is one. The prompt view tells them apart by this case,
     /// never by comparing the translated text.
@@ -485,6 +491,7 @@ final class AppState: ObservableObject {
         settingCmuxFailure = true
         cmuxNotice = failure.message
         cmuxNoticeFailure = failure
+        cmuxNoticeOffersCmux = false
         settingCmuxFailure = false
     }
     @Published var cmuxBusy = false
@@ -495,8 +502,29 @@ final class AppState: ObservableObject {
     @Published var cmuxDefaultFolder: String = UserDefaults.standard.string(forKey: "cmuxDefaultFolder") ?? "" {
         didSet { UserDefaults.standard.set(cmuxDefaultFolder, forKey: "cmuxDefaultFolder") }
     }
-    @Published var cmuxLaunchCommand: String = UserDefaults.standard.string(forKey: "cmuxLaunchCommand") ?? "claude" {
-        didSet { UserDefaults.standard.set(cmuxLaunchCommand, forKey: "cmuxLaunchCommand") }
+    /// Launch command per launcher, by `CmuxLauncher.Id` raw value. Loaded once, with the migration of the
+    /// old single command (see `CmuxLauncher.resolvedCommand`). Nothing is written at load: a value is
+    /// stored only when the user edits it (`setCmuxCommand`).
+    @Published var cmuxLaunchCommands: [String: String] = {
+        let defaults = UserDefaults.standard
+        var out: [String: String] = [:]
+        for l in CmuxLauncher.all {
+            let value = l.resolvedCommand(stored: defaults.string(forKey: l.defaultsKey),
+                                          legacy: defaults.string(forKey: CmuxLauncher.legacyDefaultsKey))
+            out[l.id.rawValue] = value
+        }
+        return out
+    }()
+
+    /// A valid command typed by the user: kept in memory and stored under the launcher's own key.
+    func setCmuxCommand(_ value: String, for launcher: CmuxLauncher) {
+        guard CmuxRouting.isValidLaunchCommand(value) else { return }
+        cmuxLaunchCommands[launcher.id.rawValue] = value
+        UserDefaults.standard.set(value, forKey: launcher.defaultsKey)
+    }
+
+    func cmuxCommand(for launcher: CmuxLauncher) -> String {
+        cmuxLaunchCommands[launcher.id.rawValue] ?? launcher.defaultCommand
     }
 
     /// Closes the cmux prompt (reply / new chat) and its notice and draft.

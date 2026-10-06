@@ -188,6 +188,17 @@
         }
       }
     },
+    "%@ started in cmux. Its session won't appear as a pill here." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O %@ iniciou no cmux. A sessão dele não aparece como pílula aqui."
+          }
+        }
+      }
+    },
     "%@ · %@ failing" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -1315,6 +1326,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "O Coucou não conseguiu abrir uma porta local para a entrada."
+          }
+        }
+      }
+    },
+    "Coucou couldn't prepare a private folder for this launch. Nothing was started." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O Coucou não conseguiu preparar uma pasta privada para este início. Nada foi iniciado."
           }
         }
       }
@@ -4222,6 +4244,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Esta URL não responde como um servidor de API Hermes. Use o endereço da API, não o do painel."
+          }
+        }
+      }
+    },
+    "This agent can't take a first prompt that starts with \"-\" or is only a command name. Reword it." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Este agente não aceita um primeiro prompt que comece com \"-\" ou seja só um nome de comando. Reescreva-o."
           }
         }
       }

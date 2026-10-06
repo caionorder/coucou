@@ -11,7 +11,7 @@ enum CmuxControl {
     static let passwordKey = "cmux-socket-password"
 
     enum Failure: Error, Equatable {
-        case notRunning, notVerified, noCredential, blockedByDialog, dialogMayBeOpen, invalidInput, enterNotSent, busy
+        case notRunning, notVerified, noCredential, blockedByDialog, dialogMayBeOpen, invalidInput, enterNotSent, busy, promptNotAccepted, launchFilesUnavailable
         case cli(Int32)
 
         var message: String {
@@ -22,6 +22,8 @@ enum CmuxControl {
             case .blockedByDialog: return String(localized: "Answer the pending request first.")
             case .dialogMayBeOpen: return String(localized: "A request may still be open in cmux. Answer it there first.")
             case .invalidInput:    return String(localized: "Check the folder / command in Settings.")
+            case .promptNotAccepted: return String(localized: "This agent can't take a first prompt that starts with \"-\" or is only a command name. Reword it.")
+            case .launchFilesUnavailable: return String(localized: "Coucou couldn't prepare a private folder for this launch. Nothing was started.")
             case .busy:            return String(localized: "Still sending, try again in a moment.")
             case .enterNotSent:    return String(localized: "Text is in the prompt, press Return in cmux.")
             case .cli(let code):   return String(localized: "cmux refused the command (code \(String(code))).")
@@ -258,26 +260,48 @@ enum CmuxControl {
 
     // MARK: - new chat
 
-    /// Creates a workspace in `folder` that runs the launch command. The prompt is not part of the
-    /// command: it is kept in memory and typed when the SessionStart of the new surface arrives.
+    /// Creates a workspace in `folder` that runs the launcher's command. Claude: the prompt is not part of
+    /// the command, it is kept in memory and typed when the SessionStart of the new surface arrives.
+    /// Codex, Grok and Agy never report a start: their prompt is written to a private file that a fixed
+    /// wrapper reads (`CmuxLaunchFiles`), the typed line carries no user text, and nothing is awaited or
+    /// typed afterwards.
     /// The password is used only here, and only when no session token exists.
     @MainActor
-    static func newChat(folder: String, prompt: String, completion: @escaping @MainActor (Failure?) -> Void) {
+    static func newChat(folder: String, prompt: String, launcher: CmuxLauncher = .claude,
+                        completion: @escaping @MainActor (Failure?) -> Void) {
         let state = AppState.shared
         guard !state.cmuxBusy else { completion(.busy); return }
         guard let prepared = CmuxRouting.preparePrompt(prompt),
               CmuxRouting.isExistingFolder(folder),
-              CmuxRouting.isValidLaunchCommand(state.cmuxLaunchCommand) else {
+              CmuxRouting.isValidLaunchCommand(state.cmuxCommand(for: launcher)) else {
             completion(.invalidInput); return
         }
-        let command = state.cmuxLaunchCommand
+        guard launcher.acceptsPrompt(prepared) else { completion(.promptNotAccepted); return }
+        let launcherCommand = state.cmuxCommand(for: launcher)
         let credential = HookServer.shared.cmuxCredential(for: nil, hasPassword: hasPassword)
         guard credential != CmuxCredential.none else { completion(.noCredential); return }
         let (running, bundles) = candidateBundles()
         guard running else { completion(.notRunning); return }
         state.cmuxBusy = true
         queue.async {
-            let outcome = create(bundles: bundles, credential: credential, folder: folder, command: command)
+            let outcome: Result<Created, Failure> = {
+                var command = launcherCommand
+                var promptFile: String?
+                if !launcher.reportsSessionStart {
+                    // The prompt goes in a private file, the typed line holds only paths and the command.
+                    guard let files = CmuxLaunchFiles.prepare(prompt: prepared) else { return .failure(.launchFilesUnavailable) }
+                    guard let line = launcher.launchLine(command: launcherCommand, wrapperPath: files.wrapperPath,
+                                                         promptFile: files.promptFile) else {
+                        CmuxLaunchFiles.discard(files.promptFile)
+                        return .failure(.launchFilesUnavailable)
+                    }
+                    command = line
+                    promptFile = files.promptFile
+                }
+                let created = create(bundles: bundles, credential: credential, folder: folder, command: command)
+                if case .failure = created, let promptFile { CmuxLaunchFiles.discard(promptFile) }
+                return created
+            }()
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
                     let state = AppState.shared
@@ -288,10 +312,14 @@ enum CmuxControl {
                         completion(f)
                     case .success(let created):
                         state.cmuxRecentFolders = CmuxRouting.recentFolders(adding: folder, to: state.cmuxRecentFolders)
-                        HookServer.shared.setCmuxPendingLaunch(
-                            CmuxPendingLaunch(workspaceId: created.workspaceId, socketPath: created.socketPath,
-                                              cwd: folder, prompt: prepared,
-                                              createdAt: Date().timeIntervalSinceReferenceDate))
+                        if launcher.reportsSessionStart {
+                            HookServer.shared.setCmuxPendingLaunch(
+                                CmuxPendingLaunch(workspaceId: created.workspaceId, socketPath: created.socketPath,
+                                                  cwd: folder, prompt: prepared,
+                                                  createdAt: Date().timeIntervalSinceReferenceDate))
+                        } else {
+                            state.showCmuxStarted(String(localized: "\(launcher.name) started in cmux. Its session won't appear as a pill here."))
+                        }
                         completion(nil)
                     }
                 }

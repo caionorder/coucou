@@ -859,6 +859,237 @@ enum CmuxRoutingTests {
               && !CmuxRouting.verificationIsFresh(verifiedAt: nil, now: 100))
         }
 
+        // ── launchers ──────────────────────────────────────────────────────────
+        print("CmuxLauncher")
+        check("four launchers in order: Claude, Codex, Grok, Agy",
+              CmuxLauncher.all.map { $0.name } == ["Claude", "Codex", "Grok", "Agy"]
+              && CmuxLauncher.all.map { $0.id.rawValue } == ["claude", "codex", "grok", "agy"])
+        check("default commands",
+              CmuxLauncher.all.map { $0.defaultCommand }
+                == ["claude --dangerously-skip-permissions", "codex", "grok", "agy"])
+        check("every default command passes the launch command validation",
+              CmuxLauncher.all.allSatisfy { CmuxRouting.isValidLaunchCommand($0.defaultCommand) })
+        check("prompt flags: only Agy has one (-i)",
+              CmuxLauncher.all.map { $0.promptFlag } == ["", "", "", "-i"])
+        check("only Claude reports its session start",
+              CmuxLauncher.all.map { $0.reportsSessionStart } == [true, false, false, false])
+        check("defaults keys are distinct, the legacy key is not one of them",
+              Set(CmuxLauncher.all.map { $0.defaultsKey }).count == 4
+              && !CmuxLauncher.all.map { $0.defaultsKey }.contains(CmuxLauncher.legacyDefaultsKey))
+        check("launcher(id) finds each one", CmuxLauncher.Id.allCases.allSatisfy { CmuxLauncher.launcher($0).id == $0 })
+
+        print("CmuxLauncher.resolvedCommand (migration)")
+        let claude = CmuxLauncher.claude
+        check("nothing stored → new Claude default", claude.resolvedCommand(stored: nil, legacy: nil) == "claude --dangerously-skip-permissions")
+        check("an explicitly stored old `claude` stays `claude` (no silent permission skipping)",
+              claude.resolvedCommand(stored: nil, legacy: "claude") == "claude"
+              && claude.resolvedCommand(stored: "claude", legacy: nil) == "claude"
+              && claude.resolvedCommand(stored: "claude", legacy: "claude --model=opus") == "claude")
+        check("any other old value is kept as the Claude command",
+              claude.resolvedCommand(stored: nil, legacy: "claude --model=opus") == "claude --model=opus"
+              && claude.resolvedCommand(stored: nil, legacy: "Claude") == "Claude"
+              && claude.resolvedCommand(stored: nil, legacy: "/opt/bin/claude") == "/opt/bin/claude")
+        check("an invalid old value is not kept", claude.resolvedCommand(stored: nil, legacy: "claude; rm -rf /") == claude.defaultCommand)
+        check("a stored new value wins over the legacy one",
+              claude.resolvedCommand(stored: "claude -x", legacy: "claude --model=opus") == "claude -x")
+        check("a stored invalid new value falls back", claude.resolvedCommand(stored: "a;b", legacy: nil) == claude.defaultCommand)
+        let codex = CmuxLauncher.launcher(.codex)
+        check("the legacy command never reaches another launcher",
+              codex.resolvedCommand(stored: nil, legacy: "claude --model=opus") == "codex"
+              && codex.resolvedCommand(stored: "codex --x", legacy: nil) == "codex --x")
+
+        print("CmuxLauncher.acceptsPrompt / launchLine")
+        let agy = CmuxLauncher.launcher(.agy)
+        let grok = CmuxLauncher.launcher(.grok)
+        let W = "/var/folders/ab/cd_ef-1234/T/coucou-launch/launch.sh"
+        let P = "/var/folders/ab/cd_ef-1234/T/coucou-launch/prompt-0123456789abcdef0123456789abcdef.txt"
+        check("launch line: /bin/sh, wrapper, prompt file, command; Agy adds -i last",
+              codex.launchLine(command: "codex", wrapperPath: W, promptFile: P) == "/bin/sh \(W) \(P) codex"
+              && grok.launchLine(command: "grok", wrapperPath: W, promptFile: P) == "/bin/sh \(W) \(P) grok"
+              && agy.launchLine(command: "agy", wrapperPath: W, promptFile: P) == "/bin/sh \(W) \(P) agy -i"
+              && codex.launchLine(command: "/opt/bin/codex --model=x", wrapperPath: W, promptFile: P)
+                == "/bin/sh \(W) \(P) /opt/bin/codex --model=x")
+        let lines = [codex, grok, agy].compactMap { $0.launchLine(command: $0.defaultCommand, wrapperPath: W, promptFile: P) }
+        check("every launch line stays in the launch command charset (same meaning in sh, bash, zsh, fish)",
+              lines.count == 3 && lines.allSatisfy { l in
+                  l.utf8.allSatisfy { c in
+                      (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A) || (c >= 0x30 && c <= 0x39)
+                          || [0x20, 0x5F, 0x2E, 0x2F, 0x3D, 0x3A, 0x2D].contains(c)
+                  }
+              })
+        check("an invalid command produces no line",
+              codex.launchLine(command: "codex; id", wrapperPath: W, promptFile: P) == nil
+              && codex.launchLine(command: "", wrapperPath: W, promptFile: P) == nil
+              && codex.launchLine(command: "A=b codex", wrapperPath: W, promptFile: P) == nil)
+        check("an unsafe wrapper or prompt path produces no line",
+              codex.launchLine(command: "codex", wrapperPath: "/tmp/a b/launch.sh", promptFile: P) == nil
+              && codex.launchLine(command: "codex", wrapperPath: W, promptFile: "/tmp/it's") == nil
+              && codex.launchLine(command: "codex", wrapperPath: W, promptFile: "relative/p.txt") == nil)
+        check("Claude never gets a launch line (its prompt is typed after SessionStart)",
+              claude.launchLine(command: "claude", wrapperPath: W, promptFile: P) == nil)
+        check("isSafePath: charset, absolute, no space, no .., bounded",
+              CmuxLaunchFiles.isSafePath(W) && CmuxLaunchFiles.isSafePath("/a")
+              && !CmuxLaunchFiles.isSafePath("") && !CmuxLaunchFiles.isSafePath("a/b")
+              && !CmuxLaunchFiles.isSafePath("/a b") && !CmuxLaunchFiles.isSafePath("/a/../b")
+              && !CmuxLaunchFiles.isSafePath("/a'b") && !CmuxLaunchFiles.isSafePath("/a\\b")
+              && !CmuxLaunchFiles.isSafePath("/a$b") && !CmuxLaunchFiles.isSafePath("/a\nb")
+              && !CmuxLaunchFiles.isSafePath("/ação")
+              && !CmuxLaunchFiles.isSafePath("/" + String(repeating: "a", count: 400)))
+        check("a prompt starting with a dash is refused by every command line launcher",
+              !codex.acceptsPrompt("-x") && !grok.acceptsPrompt("--help") && !agy.acceptsPrompt("-p hi")
+              && !codex.acceptsPrompt("-\u{0301}x"))
+        check("a dash inside the prompt is fine", codex.acceptsPrompt("fix a - b") && agy.acceptsPrompt("x-y"))
+        check("a prompt that is a whole subcommand name is refused for codex and grok, not when longer",
+              !codex.acceptsPrompt("exec") && !codex.acceptsPrompt("resume") && !grok.acceptsPrompt("login")
+              && !grok.acceptsPrompt("update") && codex.acceptsPrompt("exec the tests") && grok.acceptsPrompt("login page")
+              && codex.acceptsPrompt("Exec") && agy.acceptsPrompt("exec"))
+        check("Claude accepts any prompt (it is typed, not parsed)", claude.acceptsPrompt("-x") && claude.acceptsPrompt("exec"))
+
+        print("CmuxLaunchFiles (private directory, files, wrapper)")
+        func runProcess(_ exe: String, _ args: [String]) -> (status: Int32, out: [UInt8])? {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: exe)
+            p.arguments = args
+            let pipe = Pipe()
+            p.standardOutput = pipe
+            p.standardError = FileHandle.nullDevice
+            p.standardInput = FileHandle.nullDevice
+            guard (try? p.run()) != nil else { return nil }
+            let out = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            return (p.terminationStatus, Array(out))
+        }
+        func modeOf(_ path: String) -> UInt16? {
+            var st = stat()
+            return lstat(path, &st) == 0 ? st.st_mode & 0o7777 : nil
+        }
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("coucou-launch-test-\(getpid())-\(UInt32.random(in: 0...UInt32.max))")
+        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: base) }
+        print("  real per user temporary directory: \(FileManager.default.temporaryDirectory.path)")
+        check("the per user temporary directory passes the path check",
+              CmuxLaunchFiles.isSafePath(FileManager.default.temporaryDirectory.standardizedFileURL.path + "/coucou-launch/launch.sh"))
+        if let prep = CmuxLaunchFiles.prepare(prompt: "hello", baseDirectory: base) {
+            let dir = (prep.wrapperPath as NSString).deletingLastPathComponent
+            check("directory is named coucou-launch with mode 0700", dir.hasSuffix("/coucou-launch") && modeOf(dir) == 0o700)
+            check("wrapper has mode 0700 and the exact script text",
+                  modeOf(prep.wrapperPath) == 0o700
+                  && (try? String(contentsOfFile: prep.wrapperPath, encoding: .utf8)) == CmuxLaunchFiles.wrapperScript)
+            check("prompt file has mode 0600, a random name, and the exact prompt",
+                  modeOf(prep.promptFile) == 0o600 && prep.promptFile.hasPrefix(dir + "/prompt-")
+                  && (try? String(contentsOfFile: prep.promptFile, encoding: .utf8)) == "hello")
+            let second = CmuxLaunchFiles.prepare(prompt: "hello", baseDirectory: base)
+            check("a second launch gets another prompt file and the same wrapper",
+                  second != nil && second!.promptFile != prep.promptFile && second!.wrapperPath == prep.wrapperPath)
+            // Stale files: older than 10 minutes go at the next launch, fresh ones stay.
+            let old = dir + "/old.txt", fresh = dir + "/fresh.txt"
+            FileManager.default.createFile(atPath: old, contents: Data("x".utf8))
+            FileManager.default.createFile(atPath: fresh, contents: Data("x".utf8))
+            try? FileManager.default.setAttributes([.modificationDate: Date().addingTimeInterval(-700)], ofItemAtPath: old)
+            _ = CmuxLaunchFiles.prepare(prompt: "again", baseDirectory: base)
+            check("files older than 10 minutes are deleted at the next launch, fresh ones are kept",
+                  !FileManager.default.fileExists(atPath: old) && FileManager.default.fileExists(atPath: fresh)
+                  && FileManager.default.fileExists(atPath: prep.promptFile))
+            CmuxLaunchFiles.discard(prep.promptFile)
+            check("discard removes the prompt file", !FileManager.default.fileExists(atPath: prep.promptFile))
+        } else { check("prepare works in a private base directory", false) }
+        check("an empty prompt prepares nothing", CmuxLaunchFiles.prepare(prompt: "", baseDirectory: base) == nil)
+        // Fail closed: a directory with group/other permission, a symlink, a base path with a space.
+        let loose = base.appendingPathComponent("loose")
+        try? FileManager.default.createDirectory(at: loose.appendingPathComponent("coucou-launch"), withIntermediateDirectories: true)
+        chmod(loose.path + "/coucou-launch", 0o755)
+        check("a coucou-launch directory with group/other permission fails closed",
+              CmuxLaunchFiles.prepare(prompt: "x", baseDirectory: loose) == nil)
+        let linkBase = base.appendingPathComponent("linked")
+        try? FileManager.default.createDirectory(at: linkBase, withIntermediateDirectories: true)
+        try? FileManager.default.createSymbolicLink(atPath: linkBase.path + "/coucou-launch", withDestinationPath: base.path)
+        check("a coucou-launch symlink fails closed", CmuxLaunchFiles.prepare(prompt: "x", baseDirectory: linkBase) == nil)
+        let spaced = base.appendingPathComponent("with space")
+        try? FileManager.default.createDirectory(at: spaced, withIntermediateDirectories: true)
+        check("a temporary directory path with a space fails closed",
+              CmuxLaunchFiles.prepare(prompt: "x", baseDirectory: spaced) == nil
+              && !FileManager.default.fileExists(atPath: spaced.path + "/coucou-launch"))
+
+        // The real wrapper under /bin/sh, with a stub agent that writes its argv (NUL separated) to argv.bin next to itself.
+        print("CmuxLaunchFiles.wrapperScript (real /bin/sh, stub agent)")
+        let stubDir = base.appendingPathComponent("stub")
+        try? FileManager.default.createDirectory(at: stubDir, withIntermediateDirectories: true)
+        let stub = stubDir.path + "/agent"
+        let outFile = stubDir.path + "/argv.bin"
+        FileManager.default.createFile(atPath: stub, contents: Data("#!/bin/sh\nprintf '%s\\0' \"$@\" > \"$(dirname \"$0\")/argv.bin\"\n".utf8),
+                                       attributes: [.posixPermissions: 0o700])
+        let promptCases: [(String, String)] = [
+            ("plain", "fix the login bug"),
+            ("quotes", "don't \"x\" ''' ` '"),
+            ("backslashes", "a\\b \\\\ \\n \\' \\\""),
+            ("dollar parens", "$(touch \(stubDir.path)/PWNED) $HOME ${PATH} $((1+1))"),
+            ("backticks", "`touch \(stubDir.path)/PWNED2` ``"),
+            ("trailing backslash", "ends with a backslash \\"),
+            ("leading space", "  leading spaces"),
+            ("shell syntax", "a; b | c && d > e < f & # g * ? [a-z] ~ !! {a,b}"),
+            ("looks like an option", "x --dangerously-skip-permissions -i"),
+            ("unicode", "olá, ação ✓ 日本語 🙂 e\u{0301} \u{00E1}"),
+            ("embedded newline", "line one\nline two"),
+            ("trailing newlines", "text\n\n"),
+            ("only a quote", "'"),
+            ("8000 characters", String(String(repeating: "word 'q' \\ $x ", count: 800).prefix(CmuxRouting.maxPromptLength))),
+        ]
+        var wrapperOK = true
+        var wrapperFirstBad = ""
+        for (label, text) in promptCases {
+            // Newlines are stripped upstream by preparePrompt; the file is written raw here to show it holds anyway.
+            guard let prep = CmuxLaunchFiles.prepare(prompt: "seed", baseDirectory: base),
+                  (try? Data(text.utf8).write(to: URL(fileURLWithPath: prep.promptFile))) != nil else {
+                wrapperOK = false; wrapperFirstBad = label; break
+            }
+            try? FileManager.default.removeItem(atPath: outFile)
+            guard let r = runProcess("/bin/sh", [prep.wrapperPath, prep.promptFile, stub, "-i"]) else {
+                wrapperOK = false; wrapperFirstBad = label; break
+            }
+            let got = (try? Data(contentsOf: URL(fileURLWithPath: outFile))).map { Array($0) } ?? []
+            let want = Array("-i".utf8) + [0] + Array(text.utf8) + [0]
+            if r.status != 0 || got != want || FileManager.default.fileExists(atPath: prep.promptFile) {
+                wrapperOK = false; wrapperFirstBad = label; break
+            }
+        }
+        check("wrapper under /bin/sh passes each prompt as ONE last argument, byte for byte, and removes the file"
+              + " (\(promptCases.count) cases)" + (wrapperOK ? "" : " (first mismatch: \(wrapperFirstBad))"), wrapperOK)
+        check("no command was executed by the dollar paren and backtick prompts",
+              !FileManager.default.fileExists(atPath: stubDir.path + "/PWNED")
+              && !FileManager.default.fileExists(atPath: stubDir.path + "/PWNED2"))
+        try? FileManager.default.removeItem(atPath: outFile)
+        if let missing = runProcess("/bin/sh", [W, "/nonexistent/prompt.txt", stub]) {
+            check("a missing prompt file: the wrapper exits and starts nothing", missing.status != 0 && !FileManager.default.fileExists(atPath: outFile))
+        }
+        if let wrapper = CmuxLaunchFiles.prepare(prompt: "seed", baseDirectory: base)?.wrapperPath,
+           let missing = runProcess("/bin/sh", [wrapper, "/nonexistent/prompt.txt", stub]) {
+            check("the real wrapper with a missing prompt file exits 1 and starts nothing",
+                  missing.status == 1 && !FileManager.default.fileExists(atPath: outFile))
+        }
+        // The typed line, read by each shell with -c: hostile prompt, delivered as one argument.
+        func lineRun(_ shell: String, _ args: [String]) -> Bool {
+            guard let prep = CmuxLaunchFiles.prepare(prompt: "seed", baseDirectory: base) else { return false }
+            let text = "it's $(id) `id` \\' \\\\ ; & | > done \\"
+            guard (try? Data(text.utf8).write(to: URL(fileURLWithPath: prep.promptFile))) != nil else { return false }
+            let command = stub
+            guard let line = CmuxLauncher.launcher(.agy).launchLine(command: command, wrapperPath: prep.wrapperPath, promptFile: prep.promptFile)
+            else { return false }
+            try? FileManager.default.removeItem(atPath: outFile)
+            guard let r = runProcess(shell, args + [line]), r.status == 0 else { return false }
+            let got = (try? Data(contentsOf: URL(fileURLWithPath: outFile))).map { Array($0) } ?? []
+            return got == Array("-i".utf8) + [0] + Array(text.utf8) + [0] && !FileManager.default.fileExists(atPath: prep.promptFile)
+        }
+        for (shell, args) in [("/bin/zsh", ["-f", "-c"]), ("/bin/bash", ["-c"]), ("/bin/sh", ["-c"])] {
+            guard FileManager.default.isExecutableFile(atPath: shell) else { print("  - skipped: \(shell) not installed"); continue }
+            check("the typed line run by \(shell) -c delivers the hostile prompt as one argument", lineRun(shell, args))
+        }
+        if let fish = ["/opt/homebrew/bin/fish", "/usr/local/bin/fish"].first(where: { FileManager.default.isExecutableFile(atPath: $0) }) {
+            check("the typed line run by \(fish) -c delivers the hostile prompt as one argument", lineRun(fish, ["-c"]))
+        } else {
+            print("  - fish NOT RUN: neither /opt/homebrew/bin/fish nor /usr/local/bin/fish exists on this machine")
+        }
+
         print(failures == 0 ? "\nAll cmux routing tests passed." : "\n\(failures) failure(s).")
         exit(failures == 0 ? 0 : 1)
     }
