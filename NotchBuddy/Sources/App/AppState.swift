@@ -699,11 +699,13 @@ final class AppState: ObservableObject {
 
     private func resetSessionDiffTimer(for pillId: String) {
         sessionDiffTimers[pillId]?.cancel()
+        // The work item is main actor isolated (it is created here): it must run on the main queue.
+        // On a global queue the Swift 6 isolation check traps when it fires, an hour after the last diff.
         let work = DispatchWorkItem { [weak self] in
-            DispatchQueue.main.async { self?.clearSessionDiffs(for: pillId) }
+            self?.clearSessionDiffs(for: pillId)
         }
         sessionDiffTimers[pillId] = work
-        DispatchQueue.global().asyncAfter(deadline: .now() + 3600, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3600, execute: work)
     }
 
     #if !APPSTORE
