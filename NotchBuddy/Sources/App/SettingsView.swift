@@ -281,7 +281,6 @@ struct SettingsView: View {
 
     // MARK: - General section
 
-
     @ViewBuilder private var generalSection: some View {
         GroupBox(String(localized: "demo.groupbox.title")) {
             VStack(alignment: .leading, spacing: 8) {
