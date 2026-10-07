@@ -21,6 +21,18 @@ struct HermesAgent: Codable, Equatable, Sendable {
     var modelName: String
     /// `nil` reads as `.apiKey` (agents stored before the sign-in kind existed).
     var connection: HermesConnection?
+    /// What the user reads instead of `name` (pill, chat, Settings). `nil` = the identity name. Not a secret; it never
+    /// takes part in the Keychain binding, the pill id or the conversation, so renaming never disconnects an agent.
+    var displayName: String?
+
+    /// The name shown everywhere the agent appears.
+    var shownName: String { displayName ?? name }
+
+    /// Same agent at the same destination: ignores the display name, which is only a label.
+    func sameDestination(as other: HermesAgent) -> Bool {
+        name == other.name && baseURL == other.baseURL && profile == other.profile
+            && modelName == other.modelName && connection == other.connection
+    }
 }
 
 enum HermesChatError: Error, Equatable {
@@ -256,7 +268,7 @@ enum HermesChat {
         guard isValidAgent(agent),
               let r = keys[agent.name], !r.key.isEmpty,
               !r.baseURL.isEmpty, r.baseURL == agent.baseURL, r.profile == agent.profile else {
-            return .failure(.notBound(agent.name))
+            return .failure(.notBound(agent.shownName))
         }
         return .success(r.key)
     }

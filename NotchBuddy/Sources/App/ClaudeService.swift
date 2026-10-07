@@ -185,26 +185,57 @@ final class ClaudeService {
 
     var apiKey: String? { KeychainStore.shared.get("anthropic-api-key") }
 
-    // Multi-turn conversation messages (for API)
-    private var conversationMessages: [[String: Any]] = []
-
-    /// Bumped on every clear: a request that started before a clear must not touch the new conversation.
-    private var conversationGeneration = 0
     /// Hermes turns in flight, by id. A second message may start while the first still runs.
     private struct HermesTurn {
         var task: Task<String, Error>?
         var hasText = false
     }
-    private var hermesTurns: [UUID: HermesTurn] = [:]
-    /// Stored server session of the current conversation with a signed-in Hermes agent (nil = none yet).
-    private var hermesServerSession: String?
 
-    func clearConversation() {
-        conversationMessages = []
-        hermesServerSession = nil
-        conversationGeneration += 1
-        for turn in hermesTurns.values { turn.task?.cancel() }
-        hermesTurns = [:]
+    /// What the service keeps per conversation (see `ConversationID`): the messages sent to the server, the turns in
+    /// flight and, for a signed-in Hermes agent, the stored server session. Memory only.
+    private struct Conversation {
+        /// Taken from `generationCounter` on every clear: a request that started before a clear must not touch the
+        /// new conversation (nor one recreated after a drop).
+        var generation: Int
+        var messages: [[String: Any]] = []
+        var turns: [UUID: HermesTurn] = [:]
+        var serverSession: String?
+    }
+    private var conversations = ConversationStore<Conversation>(empty: Conversation(generation: -1))
+    private var generationCounter = 0
+
+    /// The conversation exists with the given generation (a cleared or dropped one no longer does).
+    private func isCurrent(_ id: ConversationID, generation: Int) -> Bool {
+        conversations.contains(id) && conversations[id].generation == generation
+    }
+
+    /// Creates the conversation if it has none yet and returns its generation.
+    @discardableResult
+    private func ensureConversation(_ id: ConversationID) -> Int {
+        if !conversations.contains(id) {
+            generationCounter += 1
+            conversations.set(id, Conversation(generation: generationCounter))
+        }
+        return conversations[id].generation
+    }
+
+    /// Messages of the conversation shared by the non Hermes providers.
+    private var conversationMessages: [[String: Any]] {
+        get { conversations[.shared].messages }
+        set { ensureConversation(.shared); conversations.mutate(.shared) { $0.messages = newValue } }
+    }
+
+    /// Empties one conversation (messages, server session) and cancels its running turns. The others are untouched.
+    func clearConversation(_ id: ConversationID) {
+        for turn in conversations[id].turns.values { turn.task?.cancel() }
+        generationCounter += 1
+        conversations.set(id, Conversation(generation: generationCounter))
+    }
+
+    /// Forgets one conversation for good (its agent was removed) and cancels its running turns.
+    func dropConversation(_ id: ConversationID) {
+        for turn in conversations[id].turns.values { turn.task?.cancel() }
+        conversations.remove(id)
     }
 
     /// The typing dots show while a running turn has not produced text yet. Every override this code sets (dots, or
@@ -217,7 +248,7 @@ final class ClaudeService {
         case .some(.error): current = .error
         default: current = .other
         }
-        let next = HermesAnnounce.typingOverride(current: current, anyTurnWaiting: hermesTurns.values.contains { !$0.hasText })
+        let next = HermesAnnounce.typingOverride(current: current, anyTurnWaiting: conversations.values.contains { $0.turns.values.contains { !$0.hasText } })
         guard next != current else { return }
         switch next {
         case .none: state.stateOverride = nil
@@ -352,7 +383,7 @@ final class ClaudeService {
             }
             msgs.append(simplified)
         }
-        let userText = openAIUserText(query: query, context: context, inlineFiles: provider.isLocal)
+        let userText = openAIUserText(query: query, context: context, inlineFiles: provider.isLocal, firstTurn: conversationMessages.isEmpty)
         msgs.append(["role": "user", "content": userText])
         conversationMessages.append(["role": "user", "content": userText])
 
@@ -374,7 +405,7 @@ final class ClaudeService {
             // Add placeholder (hidden until first token via ChatBubble empty-content guard)
             let placeholder = ChatMessage(role: .assistant, content: "")
             let msgId = placeholder.id
-            state.chatHistory.append(placeholder)
+            state.updateChat(.shared) { $0.append(placeholder) }
             state.stateOverride = .thinking
             let modelCopy = state.activeChatModel
             let streamBody: [String: Any] = [
@@ -393,20 +424,20 @@ final class ClaudeService {
                     if !visible.isEmpty, state.stateOverride == .thinking {
                         state.stateOverride = nil   // hide typing dots on first visible text
                     }
-                    if let idx = state.chatHistory.firstIndex(where: { $0.id == msgId }) {
-                        state.chatHistory[idx].content = visible
+                    state.updateChat(.shared) { h in
+                        if let idx = h.firstIndex(where: { $0.id == msgId }) { h[idx].content = visible }
                     }
                 }
                 conversationMessages.append(["role": "assistant", "content": final])
-                if let idx = state.chatHistory.firstIndex(where: { $0.id == msgId }) {
-                    state.chatHistory[idx].content = final
+                state.updateChat(.shared) { h in
+                    if let idx = h.firstIndex(where: { $0.id == msgId }) { h[idx].content = final }
                 }
                 state.stateOverride = nil
                 state.view = .prompt
                 NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
             } catch let e as LocalChatError {
                 if !conversationMessages.isEmpty { conversationMessages.removeLast() }
-                state.chatHistory.removeAll { $0.id == msgId }
+                state.updateChat(.shared) { $0.removeAll { $0.id == msgId } }
                 state.stateOverride = nil
                 let msg: String
                 switch e {
@@ -422,7 +453,7 @@ final class ClaudeService {
                 await showError(msg, state: state)
             } catch {
                 if !conversationMessages.isEmpty { conversationMessages.removeLast() }
-                state.chatHistory.removeAll { $0.id == msgId }
+                state.updateChat(.shared) { $0.removeAll { $0.id == msgId } }
                 state.stateOverride = nil
                 await showError(error.localizedDescription, state: state)
             }
@@ -445,7 +476,7 @@ final class ClaudeService {
                 }
                 let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
                 conversationMessages.append(["role": "assistant", "content": trimmed])
-                state.chatHistory.append(ChatMessage(role: .assistant, content: trimmed))
+                state.updateChat(.shared) { $0.append(ChatMessage(role: .assistant, content: trimmed)) }
                 state.stateOverride = nil
                 state.view = .prompt
                 NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
@@ -458,9 +489,9 @@ final class ClaudeService {
 
     /// User text for the first turn of an OpenAI-style chat: window/file context prepended to the query.
     /// `inlineFiles` inlines text files (up to 24 000 chars); otherwise only the file name is sent.
-    private func openAIUserText(query: String, context: PromptContext?, inlineFiles: Bool) -> String {
+    private func openAIUserText(query: String, context: PromptContext?, inlineFiles: Bool, firstTurn: Bool) -> String {
         var userText = query
-        if conversationMessages.isEmpty, let ctx = context {
+        if firstTurn, let ctx = context {
             switch ctx {
             case .window(let app, let title, let url):
                 var prefix = "Context — App: \(app), Window: \(title)"
@@ -512,9 +543,12 @@ final class ClaudeService {
             }
         }
 
+        // This agent's own conversation: nothing of another agent or provider is ever read or sent here.
+        let id = ConversationID.hermes(agent.name)
+        let generation = ensureConversation(id)
         // No system message: Hermes layers it over the agent's own prompt.
         var msgs: [[String: Any]] = []
-        for m in conversationMessages {
+        for m in conversations[id].messages {
             var simplified = m
             if let content = m["content"] as? [[String: Any]],
                let textBlock = content.first(where: { ($0["type"] as? String) == "text" }),
@@ -523,15 +557,15 @@ final class ClaudeService {
             }
             msgs.append(simplified)
         }
-        let userText = openAIUserText(query: query, context: context, inlineFiles: true)
+        let userText = openAIUserText(query: query, context: context, inlineFiles: true, firstTurn: conversations[id].messages.isEmpty)
         msgs.append(["role": "user", "content": userText])
-        conversationMessages.append(["role": "user", "content": userText])
+        conversations.mutate(id) { $0.messages.append(["role": "user", "content": userText]) }
 
         let placeholder = ChatMessage(role: .assistant, content: "")
         let msgId = placeholder.id
-        state.chatHistory.append(placeholder)
+        state.updateChat(id) { $0.append(placeholder) }
         let turnId = UUID()
-        hermesTurns[turnId] = HermesTurn(task: nil, hasText: false)
+        conversations.mutate(id) { $0.turns[turnId] = HermesTurn(task: nil, hasText: false) }
         refreshHermesTyping(state)
         state.setHermesPillBusy(agentName: agent.name, true)
         defer { state.setHermesPillBusy(agentName: agent.name, false) }
@@ -539,51 +573,53 @@ final class ClaudeService {
         appendAppLog("nb.log", "hermes turn started signIn=\(signIn)")
         let body: [String: Any] = ["model": agent.modelName, "messages": msgs, "stream": true]
         let encodedBody = signIn ? Data() : ((try? JSONSerialization.data(withJSONObject: body)) ?? Data())
-        let generation = conversationGeneration
-        let storedSession = hermesServerSession
+        let storedSession = conversations[id].serverSession
         let task = Task { [state, msgId] () async throws -> String in
             let onToken: @MainActor (String) -> Void = { visible in
-                if !visible.isEmpty, self.hermesTurns[turnId]?.hasText == false {
-                    self.hermesTurns[turnId]?.hasText = true   // hide typing dots once no turn waits for text
+                if !visible.isEmpty, self.conversations[id].turns[turnId]?.hasText == false {
+                    // hide typing dots once no turn waits for text
+                    self.conversations.mutate(id) { $0.turns[turnId]?.hasText = true }
                     appendAppLog("nb.log", "hermes turn first text after=\(Self.seconds(since: startedAt))s")
                     self.refreshHermesTyping(state)
                 }
-                if let idx = state.chatHistory.firstIndex(where: { $0.id == msgId }) {
-                    state.chatHistory[idx].content = visible
+                state.updateChat(id) { h in
+                    if let idx = h.firstIndex(where: { $0.id == msgId }) { h[idx].content = visible }
                 }
             }
             if signIn {
                 // The server keeps the history: only the new text is sent, the session is resumed by id.
                 return try await HermesSignInNet.streamTurn(
                     agent: agent, sessions: HermesSessions.shared, storedSession: storedSession, text: userText,
-                    onSession: { id in
-                        if generation == self.conversationGeneration { self.hermesServerSession = id.isEmpty ? nil : id }
+                    onSession: { sessionId in
+                        if self.isCurrent(id, generation: generation) {
+                            self.conversations.mutate(id) { $0.serverSession = sessionId.isEmpty ? nil : sessionId }
+                        }
                     },
                     onToken: onToken)
             }
             return try await HermesChat.streamChat(agent: agent, key: key, encodedBody: encodedBody, onToken: onToken)
         }
-        hermesTurns[turnId]?.task = task
+        conversations.mutate(id) { $0.turns[turnId]?.task = task }
         do {
             let final = try await task.value
-            hermesTurns[turnId] = nil
-            guard generation == conversationGeneration else {
+            conversations.mutate(id) { $0.turns[turnId] = nil }
+            guard isCurrent(id, generation: generation) else {
                 appendAppLog("nb.log", "hermes turn discarded (conversation cleared) after=\(Self.seconds(since: startedAt))s")
                 refreshHermesTyping(state)
                 return
             }
-            conversationMessages.append(["role": "assistant", "content": final])
-            if let idx = state.chatHistory.firstIndex(where: { $0.id == msgId }) {
-                state.chatHistory[idx].content = final
+            conversations.mutate(id) { $0.messages.append(["role": "assistant", "content": final]) }
+            state.updateChat(id) { h in
+                if let idx = h.firstIndex(where: { $0.id == msgId }) { h[idx].content = final }
             }
             refreshHermesTyping(state)
             appendAppLog("nb.log", "hermes turn finished duration=\(Self.seconds(since: startedAt))s chars=\(final.count)")
-            // Chat on screen: nothing changes. Otherwise sound, badge and back to the chat.
+            // This agent's chat on screen: nothing changes. Otherwise sound, badge and back to the chat.
             state.announceHermesTurn(agentName: agent.name, failed: false, view: .prompt)
             NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
         } catch {
-            hermesTurns[turnId] = nil
-            guard generation == conversationGeneration else {
+            conversations.mutate(id) { $0.turns[turnId] = nil }
+            guard isCurrent(id, generation: generation) else {
                 // Cleared meanwhile: leave the new conversation alone, only stop the typing dots
                 // when no newer Hermes request is still waiting for its first text.
                 appendAppLog("nb.log", "hermes turn discarded (conversation cleared) after=\(Self.seconds(since: startedAt))s")
@@ -591,18 +627,20 @@ final class ClaudeService {
                 return
             }
             // Remove this turn's own message: a sibling turn may have added its own after it.
-            if let own = conversationMessages.lastIndex(where: { ($0["role"] as? String) == "user" && ($0["content"] as? String) == userText }) {
-                conversationMessages.remove(at: own)
+            conversations.mutate(id) { c in
+                if let own = c.messages.lastIndex(where: { ($0["role"] as? String) == "user" && ($0["content"] as? String) == userText }) {
+                    c.messages.remove(at: own)
+                }
             }
-            state.chatHistory.removeAll { $0.id == msgId }
+            state.updateChat(id) { $0.removeAll { $0.id == msgId } }
             refreshHermesTyping(state)
             let msg = (error as? HermesChatError)?.userMessage ?? String(localized: "Hermes request failed.")
             appendAppLog("nb.log", "hermes turn failed after=\(Self.seconds(since: startedAt))s error=\(Self.errorCaseName(error))")
             let outcome = state.announceHermesTurn(agentName: agent.name, failed: true, view: .note)
             // A card on screen keeps the screen: the error is only signalled by the sound and the pill badge.
             if outcome == .badgeOnly {
-                // The text waits in the chat for when it is next shown.
-                state.chatHistory.append(ChatMessage(role: .assistant, content: msg))
+                // The text waits in the chat of this agent for when it is next shown.
+                state.updateChat(id) { $0.append(ChatMessage(role: .assistant, content: msg)) }
             } else { await showError(msg, state: state) }
         }
     }
@@ -721,7 +759,8 @@ final class ClaudeService {
         }
 
         // Add to display history
-        state.chatHistory.append(ChatMessage(role: .assistant, content: text.trimmingCharacters(in: .whitespacesAndNewlines)))
+        let answer = ChatMessage(role: .assistant, content: text.trimmingCharacters(in: .whitespacesAndNewlines))
+        state.updateChat(.shared) { $0.append(answer) }
 
         state.stateOverride = nil
         state.view = .prompt

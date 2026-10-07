@@ -102,11 +102,11 @@ actor HermesSessions {
             return rec.accessToken
         case .signInAgain:
             if forceRefresh { remove(name: agent.name) }
-            throw HermesChatError.signInNeeded(agent.name)
+            throw HermesChatError.signInNeeded(agent.shownName)
         case .refresh:
             switch await refreshOutcome(name: agent.name, record: rec, deadline: deadline) {
             case .refreshed(let r): return r.accessToken
-            case .expired: throw HermesChatError.signInNeeded(agent.name)
+            case .expired: throw HermesChatError.signInNeeded(agent.shownName)
             case .superseded:
                 // Whatever is stored now (a new sign in) wins; nothing stored means signed out.
                 switch record(for: agent) {
@@ -442,7 +442,7 @@ enum HermesSignInNet {
                 if HermesSignIn.isSessionExpired(status: status, body: body) {
                     if attempt == 0 { token = try await sessions.validToken(for: agent, forceRefresh: true, deadline: deadline); turnToken = token; continue }
                     await sessions.remove(name: agent.name, ifAccessToken: token)
-                    throw HermesChatError.signInNeeded(agent.name)
+                    throw HermesChatError.signInNeeded(agent.shownName)
                 }
                 guard status == 200 else {
                     throw (status == 429 || status == 503) ? HermesChatError.busy : HermesChatError.server("HTTP \(status)")
@@ -451,7 +451,7 @@ enum HermesSignInNet {
                 return t
             }
         }
-        throw HermesChatError.signInNeeded(agent.name)
+        throw HermesChatError.signInNeeded(agent.shownName)
     }
 
     // MARK: Chat turn

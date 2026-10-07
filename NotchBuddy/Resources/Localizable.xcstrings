@@ -596,6 +596,17 @@
         }
       }
     },
+    "Another agent is already called %@." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Outro agente já se chama %@."
+          }
+        }
+      }
+    },
     "Answer the pending request first." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -3393,6 +3404,17 @@
         }
       }
     },
+    "Rename" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Renomear"
+          }
+        }
+      }
+    },
     "Reply" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -5333,6 +5355,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "✓ Chave da OpenAI salva."
+          }
+        }
+      }
+    },
+    "✓ Shown as %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "✓ Exibido como %@"
           }
         }
       }

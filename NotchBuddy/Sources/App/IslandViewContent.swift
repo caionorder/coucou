@@ -1263,7 +1263,7 @@ struct PromptView: View {
                             Circle()
                                 .fill(Color(hex: state.chatProvider.accentHex))
                                 .frame(width: 6, height: 6)
-                            Text(state.activeChatModel)
+                            Text(state.activeChatModelLabel)
                                 .font(.system(size: 10.5, weight: .medium))
                                 .foregroundColor(Color(hex: "#7B8089"))
                             Image(systemName: "chevron.up.chevron.down")
@@ -1328,8 +1328,7 @@ struct PromptView: View {
         .onReceive(NotificationCenter.default.publisher(for: .islandNewConversation)) { _ in
             guard state.view == .prompt else { return }
             text = ""
-            state.chatHistory = []
-            ClaudeService.shared.clearConversation()
+            state.clearActiveConversation()
             focused = true
         }
     }
@@ -1844,7 +1843,7 @@ struct IntegrationCardView: View {
             if isAI {
                 let provider = ChatProvider(pillID: task.id)!
                 if provider == .hermes {
-                    return String(localized: "Connected · \(appState.activeHermesAgent?.name ?? "")")
+                    return String(localized: "Connected · \(appState.activeHermesAgent?.shownName ?? "")")
                 }
                 if provider.isLocal {
                     let model = provider == .ollama ? appState.ollamaChatModel : appState.lmstudioChatModel
@@ -4854,7 +4853,7 @@ func switchChatProvider(_ provider: ChatProvider) {
     state.view = .prompt
 }
 
-/// A Hermes agent pill: selects the Hermes provider and that agent (the usual clearing rules apply),
+/// A Hermes agent pill: selects the Hermes provider and that agent (each agent keeps its own conversation),
 /// then opens the chat prompt so the user can type to it at once.
 @MainActor
 func openHermesAgentChat(taskId: String) {

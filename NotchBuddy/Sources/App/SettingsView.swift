@@ -923,7 +923,7 @@ struct SettingsView: View {
                 ForEach(state.hermesAgents, id: \.name) { agent in
                     HStack(spacing: 8) {
                         Circle().fill(Color(hex: "#F97316")).frame(width: 8, height: 8)
-                        Text(agent.name).font(.system(size: 12, weight: .semibold))
+                        Text(agent.shownName).font(.system(size: 12, weight: .semibold))
                         if isSignInAgent(agent) {
                             if let label = state.hermesSessionLabel(agent) {
                                 Text("Signed in as \(label)")
@@ -944,6 +944,7 @@ struct SettingsView: View {
                                 .foregroundColor(Color(hex: "#F97316"))
                         }
                     }
+                    HermesDisplayNameRow(agent: agent, state: state) { statusMessage = $0 }
                     Text("\(agent.baseURL) · \(agent.profile.isEmpty ? String(localized: "default") : agent.profile)")
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundColor(.secondary)
@@ -968,7 +969,7 @@ struct SettingsView: View {
                             Button("Sign out") {
                                 Task {
                                     await state.signOutHermesAgent(named: agent.name)
-                                    statusMessage = String(localized: "Signed out of \(agent.name).")
+                                    statusMessage = String(localized: "Signed out of \(agent.shownName).")
                                 }
                             }
                             .buttonStyle(.bordered)
@@ -978,7 +979,7 @@ struct SettingsView: View {
                     Button("Disconnect") {
                         Task {
                             await state.removeHermesAgent(named: agent.name)
-                            statusMessage = String(localized: "\(agent.name) disconnected.")
+                            statusMessage = String(localized: "\(agent.shownName) disconnected.")
                         }
                     }
                     .buttonStyle(.bordered)
@@ -1385,7 +1386,7 @@ struct SettingsView: View {
         let name = !typedName.isEmpty ? typedName
                  : !profile.isEmpty ? profile
                  : (URL(string: pending.baseURL)?.host ?? "hermes")
-        guard !state.hermesAgents.contains(where: { $0.name == name }) else {
+        guard !state.hermesNameTaken(name) else {
             statusMessage = String(localized: "An agent named \(name) already exists.")
             return
         }
@@ -1401,10 +1402,10 @@ struct SettingsView: View {
         guard let pending = await runHermesSignIn(base: agent.baseURL) else { return }
         // The agent may have been disconnected or re-pointed while the browser was open: then drop the session.
         guard await state.storeHermesSession(pending.record, for: agent) else {
-            statusMessage = String(localized: "\(agent.name) changed or was removed while you signed in. Nothing was saved.")
+            statusMessage = String(localized: "\(agent.shownName) changed or was removed while you signed in. Nothing was saved.")
             return
         }
-        statusMessage = String(localized: "✓ Signed in · \(agent.name)")
+        statusMessage = String(localized: "✓ Signed in · \(agent.shownName)")
     }
     #endif
 
@@ -1434,7 +1435,7 @@ struct SettingsView: View {
         let name = !typedName.isEmpty ? typedName
                  : !profile.isEmpty ? profile
                  : (URL(string: base)?.host ?? "hermes")
-        guard !state.hermesAgents.contains(where: { $0.name == name }) else {
+        guard !state.hermesNameTaken(name) else {
             statusMessage = String(localized: "An agent named \(name) already exists.")
             return
         }
@@ -1772,6 +1773,44 @@ struct SettingsView: View {
 }
 
 // MARK: - Sidebar background (NSVisualEffectView .sidebar)
+
+/// The line under a Hermes agent in Settings, Chat: the name it is shown with. Only a label: the agent keeps its
+/// identity (key, pill, conversation). Empty clears it and the agent shows its identity name again.
+struct HermesDisplayNameRow: View {
+    let agent: HermesAgent
+    @ObservedObject var state: AppState
+    let report: (String) -> Void
+    @State private var text: String
+
+    init(agent: HermesAgent, state: AppState, report: @escaping (String) -> Void) {
+        self.agent = agent
+        self.state = state
+        self.report = report
+        _text = State(initialValue: agent.displayName ?? "")
+    }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            TextField("", text: $text, prompt: Text(verbatim: agent.name))
+                .textFieldStyle(.roundedBorder)
+                .onSubmit(save)
+            Button("Rename", action: save)
+                .buttonStyle(.bordered)
+        }
+    }
+
+    private func save() {
+        switch state.renameHermesAgent(agent.name, to: text) {
+        case .success(let shown):
+            text = state.hermesAgents.first { $0.name == agent.name }?.displayName ?? ""
+            report(String(localized: "✓ Shown as \(shown)"))
+        case .failure(.taken(let name)):
+            report(String(localized: "Another agent is already called \(name)."))
+        case .failure(.unknownAgent):
+            break
+        }
+    }
+}
 
 struct SidebarBackground: NSViewRepresentable {
     func makeNSView(context: Context) -> NSVisualEffectView {

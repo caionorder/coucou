@@ -107,16 +107,50 @@ final class AppState: ObservableObject {
     @Published var chatProvider: ChatProvider = .anthropic {
         didSet {
             UserDefaults.standard.set(chatProvider.rawValue, forKey: "chatProvider")
-            // The conversation never crosses to or from a Hermes agent (other switches keep it).
-            if (oldValue == .hermes) != (chatProvider == .hermes) { clearChatConversation() }
+            // Switching only changes which conversation is shown: a Hermes agent never shares one with another
+            // provider or agent, and nothing is cleared or cancelled by the switch.
+            clearHermesBadgeIfChatShown()
         }
     }
 
-    private func clearChatConversation() {
-        chatHistory = []
-        ClaudeService.shared.clearConversation()
+    /// Every chat conversation, in memory for the app session only (never written to disk): one for the non Hermes
+    /// providers, one per Hermes agent (by identity name).
+    @Published private var chatHistories = ConversationStore<[ChatMessage]>(empty: [])
+
+    /// The conversation on screen.
+    var activeConversationID: ConversationID {
+        .current(hermesActive: chatProvider == .hermes, agent: activeHermesAgent?.name)
+    }
+
+    /// The messages of the conversation on screen.
+    var chatHistory: [ChatMessage] {
+        get { chatHistories[activeConversationID] }
+        set { chatHistories.set(activeConversationID, newValue) }
+    }
+
+    /// Changes the messages of one conversation, shown or not (a turn may finish while another chat is on screen).
+    func updateChat(_ id: ConversationID, _ body: (inout [ChatMessage]) -> Void) {
+        chatHistories.mutate(id, body)
+    }
+
+    /// Clears one conversation: its messages, its stored server session and its running turns, nothing else.
+    func clearConversation(_ id: ConversationID) {
+        chatHistories.remove(id)
+        ClaudeService.shared.clearConversation(id)
         // Cancelled turns end by themselves and release their own count in `hermesTurnsRunning`.
-        for i in tasks.indices where HermesPills.isTaskId(tasks[i].id) { tasks[i].pillBadge = nil }
+        if let name = id.hermesAgent, let pill = HermesPills.taskIds(for: hermesAgents.map { $0.name })[name],
+           let i = tasks.firstIndex(where: { $0.id == pill }) { tasks[i].pillBadge = nil }
+    }
+
+    /// The new conversation action: clears the conversation on screen only.
+    func clearActiveConversation() { clearConversation(activeConversationID) }
+
+    /// An agent that is gone: its conversation and its running turns go with it.
+    private func discardHermesConversations(of names: [String]) {
+        for name in names {
+            chatHistories.remove(.hermes(name))
+            ClaudeService.shared.dropConversation(.hermes(name))
+        }
     }
     @Published var googleChatModel: String = ChatProvider.google.defaultModel {
         didSet { UserDefaults.standard.set(googleChatModel, forKey: "googleChatModel") }
@@ -138,23 +172,59 @@ final class AppState: ObservableObject {
     }
     // Hermes agents: the list holds no secret (keys live in the Keychain item "hermes-agent-keys")
     @Published var hermesAgents: [HermesAgent] = [] {
-        didSet { UserDefaults.standard.set(HermesChat.encodeAgents(hermesAgents), forKey: "hermesAgents") }
+        didSet {
+            UserDefaults.standard.set(HermesChat.encodeAgents(hermesAgents), forKey: "hermesAgents")
+            let gone = Set(oldValue.map { $0.name }).subtracting(hermesAgents.map { $0.name })
+            discardHermesConversations(of: gone.sorted())
+        }
     }
     @Published var hermesChatAgent: String = "" {
-        didSet { UserDefaults.standard.set(hermesChatAgent, forKey: "hermesChatAgent") }
+        didSet {
+            UserDefaults.standard.set(hermesChatAgent, forKey: "hermesChatAgent")
+            clearHermesBadgeIfChatShown()
+        }
     }
     /// The agent picked in the chat (by name), else the first configured one.
     var activeHermesAgent: HermesAgent? {
         hermesAgents.first(where: { $0.name == hermesChatAgent }) ?? hermesAgents.first
     }
 
-    /// Picks the Hermes agent used by the chat. Each agent is a separate conversation partner, so the
-    /// conversation is cleared when the active agent changes.
+    /// Picks the Hermes agent used by the chat. Each agent has its own conversation: selecting another one only
+    /// switches which conversation is shown, nothing is cleared or cancelled.
     func selectHermesAgent(_ name: String) {
-        let previous = activeHermesAgent?.name
         hermesChatAgent = name
-        guard name != previous else { return }
-        clearChatConversation()
+    }
+
+    /// Replaces the stored agent of the same name (or adds it) with one update of the list. A conversation tied to a
+    /// different destination (another address, profile or kind) is dropped: its history must not reach the new one.
+    private func storeHermesAgent(_ agent: HermesAgent) {
+        let old = hermesAgents.first { $0.name == agent.name }
+        var next = agent
+        if next.displayName == nil { next.displayName = old?.displayName }
+        var list = hermesAgents
+        list.removeAll { $0.name == agent.name }
+        list.append(next)
+        hermesAgents = list
+        if let old, !old.sameDestination(as: next) { clearConversation(.hermes(agent.name)) }
+    }
+
+    /// Sets (or clears, with an empty text) the display name of an agent. The identity name stays: Keychain binding,
+    /// pill id, conversation and selection are untouched.
+    @discardableResult
+    func renameHermesAgent(_ identity: String, to raw: String) -> Result<String, HermesAgentNames.RenameError> {
+        switch HermesAgentNames.rename(identity, to: raw, in: hermesAgents) {
+        case .failure(let e): return .failure(e)
+        case .success(let list):
+            hermesAgents = list
+            fetchedProviderModels[.hermes] = nil   // the picker lists the shown names
+            syncHermesPills()
+            return .success(list.first { $0.name == identity }?.shownName ?? identity)
+        }
+    }
+
+    /// True when `name` is already the identity or the shown name of an agent (a new agent may not take it).
+    func hermesNameTaken(_ name: String) -> Bool {
+        hermesAgents.contains { $0.name == name } || HermesAgentNames.isTaken(name, in: hermesAgents, except: nil)
     }
 
     /// Stores the agent and its key bound to its URL and profile (Keychain only), then selects it.
@@ -162,14 +232,10 @@ final class AppState: ObservableObject {
         var keys = HermesChat.decodeKeys(KeychainStore.shared.get("hermes-agent-keys") ?? "")
         keys[agent.name] = HermesChat.KeyRecord(key: key, baseURL: agent.baseURL, profile: agent.profile)
         KeychainStore.shared.set("hermes-agent-keys", value: HermesChat.encodeKeys(keys))
-        let previous = activeHermesAgent
-        hermesAgents.removeAll { $0.name == agent.name }
-        hermesAgents.append(agent)
+        storeHermesAgent(agent)
         fetchedProviderModels[.hermes] = nil
         providerModelFetchError[.hermes] = nil
         hermesChatAgent = agent.name
-        // Only a Hermes conversation is tied to the active agent.
-        if chatProvider == .hermes, previous != agent { clearChatConversation() }
         syncHermesPills()
     }
 
@@ -200,14 +266,14 @@ final class AppState: ObservableObject {
     func storeHermesSession(_ record: HermesSignIn.SessionRecord, for agent: HermesAgent) async -> Bool {
         guard hermesAgents.contains(where: { $0.name == agent.name && $0.baseURL == agent.baseURL && $0.connection == .signIn }) else { return false }
         await HermesSessions.shared.store(record, name: agent.name)
-        if activeHermesAgent?.name == agent.name, chatProvider == .hermes { clearChatConversation() }
+        clearConversation(.hermes(agent.name))   // the stored server session belonged to the old sign in
         return true
     }
 
     /// Drops the session of an agent, keeps the row.
     func signOutHermesAgent(named name: String) async {
         await HermesSessions.shared.remove(name: name)
-        if activeHermesAgent?.name == name, chatProvider == .hermes { clearChatConversation() }
+        clearConversation(.hermes(name))
     }
 
     /// Adds a signed-in agent and stores its session (Keychain only), then selects it.
@@ -215,28 +281,23 @@ final class AppState: ObservableObject {
         var signedIn = agent
         signedIn.connection = .signIn
         await HermesSessions.shared.store(record, name: signedIn.name)
-        let previous = activeHermesAgent
-        hermesAgents.removeAll { $0.name == signedIn.name }
-        hermesAgents.append(signedIn)
+        storeHermesAgent(signedIn)
         fetchedProviderModels[.hermes] = nil
         providerModelFetchError[.hermes] = nil
         hermesChatAgent = signedIn.name
-        if chatProvider == .hermes, previous != signedIn { clearChatConversation() }
         syncHermesPills()
     }
 
     func removeHermesAgent(named name: String) async {
-        let wasActive = activeHermesAgent?.name == name
         var keys = HermesChat.decodeKeys(KeychainStore.shared.get("hermes-agent-keys") ?? "")
         keys[name] = nil
         if keys.isEmpty { KeychainStore.shared.remove("hermes-agent-keys") }
         else { KeychainStore.shared.set("hermes-agent-keys", value: HermesChat.encodeKeys(keys)) }
         await HermesSessions.shared.remove(name: name)
-        hermesAgents.removeAll { $0.name == name }
+        hermesAgents.removeAll { $0.name == name }   // its conversation is dropped by the list observer
         fetchedProviderModels[.hermes] = nil
         providerModelFetchError[.hermes] = nil
         if hermesChatAgent == name { hermesChatAgent = hermesAgents.first?.name ?? "" }
-        if wasActive, chatProvider == .hermes { clearChatConversation() }
         if hermesAgents.isEmpty, chatProvider == .hermes { chatProvider = .anthropic }
         syncHermesPills()
         // A "Sign in again" stored while the first removal ran: the row is gone now, so the record goes too.
@@ -263,7 +324,7 @@ final class AppState: ObservableObject {
             if hermesAgents.isEmpty {
                 providerModelFetchError[.hermes] = String(localized: "Connect a Hermes agent in Settings → Chat first.")
             } else {
-                fetchedProviderModels[.hermes] = hermesAgents.map { (id: $0.name, label: $0.name) }
+                fetchedProviderModels[.hermes] = hermesAgents.map { (id: $0.name, label: $0.shownName) }
                 providerModelFetchError.removeValue(forKey: .hermes)
                 if !hermesAgents.contains(where: { $0.name == hermesChatAgent }) {
                     selectHermesAgent(hermesAgents[0].name)
@@ -342,6 +403,11 @@ final class AppState: ObservableObject {
                 }
             }
         }
+    }
+
+    /// What the chat header shows for the model: the shown name of the active Hermes agent, else the model id.
+    var activeChatModelLabel: String {
+        chatProvider == .hermes ? (activeHermesAgent?.shownName ?? "Hermes") : activeChatModel
     }
 
     /// The model currently active for chat (provider-aware).
@@ -468,7 +534,6 @@ final class AppState: ObservableObject {
     @Published var n8nRuns: [N8nRun] = []
 
     // Chat conversation history
-    @Published var chatHistory: [ChatMessage] = []
 
     #if !APPSTORE
     // cmux as the main workspace: the reply / new chat prompt, per session transcripts, settings.
@@ -857,7 +922,8 @@ final class AppState: ObservableObject {
         for entry in plan.add {
             let look = PillLook.appearance(key: String(entry.id.dropFirst(HermesPills.taskPrefix.count)), takenColors: taken)
             taken.insert(look.color)
-            var task = AgentTask(id: entry.id, name: entry.name, color: look.color, state: .idle, steps: [], source: .agent)
+            let shown = hermesAgents.first { $0.name == entry.name }?.shownName ?? entry.name
+            var task = AgentTask(id: entry.id, name: shown, color: look.color, state: .idle, steps: [], source: .agent)
             if look.eye != "pill" { task.miniEye = EyeShape(rawValue: look.eye) }
             tasks.append(task)
         }
@@ -866,6 +932,7 @@ final class AppState: ObservableObject {
             guard let id = ids[agent.name], let i = tasks.firstIndex(where: { $0.id == id }) else { continue }
             let line = HermesPills.subtitle(profile: agent.profile, baseURL: agent.baseURL)
             if tasks[i].subtitle != line { tasks[i].subtitle = line }
+            if tasks[i].name != agent.shownName { tasks[i].name = agent.shownName }
         }
         placeHermesPills()
         syncMode()
@@ -959,8 +1026,10 @@ final class AppState: ObservableObject {
     /// comes back to `target` (the chat, or the error note) unless an approval or question card holds the screen.
     @discardableResult
     func announceHermesTurn(agentName: String, failed: Bool, view target: IslandView) -> HermesAnnounce.Outcome {
+        let ofThisAgent = activeConversationID == .hermes(agentName)
         let outcome = HermesAnnounce.decide(expanded: mode == .expanded, viewIsChat: view == .prompt,
-                                            cmuxPromptOpen: cmuxPromptIsOpenOrOpening, alertPending: alertCardPending)
+                                            cmuxPromptOpen: cmuxPromptIsOpenOrOpening, alertPending: alertCardPending,
+                                            chatIsOfThisAgent: ofThisAgent)
         guard outcome != .none else { return outcome }
         SoundEngine.shared.play(failed ? "error" : "finish")
         let pillId = HermesPills.taskIds(for: hermesAgents.map { $0.name })[agentName]
@@ -969,6 +1038,11 @@ final class AppState: ObservableObject {
             tasks[i].pillBadge = failed ? .error : .finished
         }
         guard outcome == .expand else { return outcome }
+        // The island comes back on the chat of the agent that answered, not on whatever was selected.
+        if !ofThisAgent, hermesAgents.contains(where: { $0.name == agentName }) {
+            chatProvider = .hermes
+            hermesChatAgent = agentName
+        }
         if let pillId, tasks.contains(where: { $0.id == pillId }) { focusId = pillId }
         hermesAnnounceAt = Date()
         if mode == .expanded { view = target }
