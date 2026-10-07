@@ -122,6 +122,12 @@ struct CmuxPromptView: View {
         return []
     }
 
+    /// The session that answers: its label (the string the header and chips show) in the colour of its pill.
+    private var replySpeaker: ChatSpeaker {
+        let label = replyTask.flatMap { t in HookServer.shared.cmuxSurfaces(for: t.id).first { $0.key == targetKey }?.label }
+        return ChatSpeaker(name: label ?? replyTask?.name ?? "cmux", colorHex: replyTask?.color ?? "#8E939C")
+    }
+
     private var typing: Bool {
         guard let key = targetKey, let raw = HookServer.shared.cmuxSurface(key: key)?.state,
               let s = BotState(rawValue: raw) else { return false }
@@ -283,17 +289,11 @@ struct CmuxPromptView: View {
 
     @ViewBuilder private var replyBody: some View {
         if !transcript.isEmpty || typing {
+            let who = replySpeaker
             ScrollViewReader { proxy in
                 ScrollView(.vertical, showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(transcript) { msg in
-                            ChatBubble(message: msg).id(msg.id)
-                        }
-                        if typing {
-                            HStack { TypingDotsView(); Spacer(minLength: 32) }.id("typing")
-                        }
-                    }
-                    .padding(.vertical, 2)
+                    ChatTurnList(messages: transcript, speaker: { _ in who }, streamingLast: false, typing: typing)
+                        .padding(.vertical, 2)
                 }
                 .pinnedScrollTracking($pinned) { scrollToEnd(proxy) }
                 .onChange(of: transcript) { _, _ in if pinned { scrollToEnd(proxy) } }

@@ -1321,15 +1321,11 @@ struct PromptView: View {
                 if !state.chatHistory.isEmpty {
                     ScrollViewReader { proxy in
                         ScrollView(.vertical, showsIndicators: false) {
-                            VStack(alignment: .leading, spacing: 6) {
-                                ForEach(state.chatHistory) { msg in
-                                    ChatBubble(message: msg).id(msg.id)
-                                }
-                                if typingShown {
-                                    HStack { TypingDotsView(); Spacer(minLength: 32) }
-                                        .id("typing")
-                                }
-                            }
+                            ChatTurnList(messages: state.chatHistory,
+                                         speaker: { state.chatSpeaker(for: $0) },
+                                         streamingLast: state.chatProvider == .hermes
+                                             ? state.hermesTurnRunning : ClaudeService.shared.sharedChatStreaming,
+                                         typing: typingShown)
                             .padding(.vertical, 2)
                         }
                         .pinnedScrollTracking($pinned) {
@@ -1644,26 +1640,22 @@ struct ModelPickerView: View {
     }
 }
 
+/// The user's message: a bubble on the right. What an agent writes is drawn by `AgentTurnBlock`.
 struct ChatBubble: View {
     let message: ChatMessage
 
     var body: some View {
-        if !message.content.isEmpty {
+        if message.role == .user, !message.content.isEmpty {
             HStack(alignment: .top) {
-                if message.role == .user {
-                    Spacer(minLength: 32)
-                    Text(message.content)
-                        .font(.system(size: 12.5))
-                        .foregroundColor(Color(hex: "#F1F2F4"))
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textSelection(.enabled)
-                        .padding(.horizontal, 10).padding(.vertical, 6)
-                        .background(Color.white.opacity(0.13))
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                } else {
-                    ChatMarkdownView(markdown: message.content)
-                    Spacer(minLength: 8)
-                }
+                Spacer(minLength: 32)
+                Text(message.content)
+                    .font(.system(size: 12.5))
+                    .foregroundColor(Color(hex: "#F1F2F4"))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .background(Color.white.opacity(0.13))
+                    .clipShape(RoundedRectangle(cornerRadius: 12))
             }
         }
     }
@@ -3906,6 +3898,8 @@ struct TickerRowView: View {
 
 struct TickerShimmerText: View {
     let text: String
+    /// 13 in the ticker; the chat step rows use a smaller one.
+    var size: CGFloat = 13
 
     var body: some View {
         TimelineView(.animation) { tl in
@@ -3914,7 +3908,7 @@ struct TickerShimmerText: View {
             // phase sweeps -0.1 → 1.1 so white peak enters from left and exits right
             let phase = p * 1.2 - 0.1
             Text(text)
-                .font(.system(size: 13, weight: .medium))
+                .font(.system(size: size, weight: .medium))
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .foregroundStyle(LinearGradient(stops: [

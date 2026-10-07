@@ -185,6 +185,10 @@ final class ClaudeService {
 
     var apiKey: String? { KeychainStore.shared.get("anthropic-api-key") }
 
+    /// A local provider (Ollama, LM Studio) is streaming an answer into the shared chat. Display only: it tells the
+    /// chat that the last text is still arriving. The writes that end it also write the message, which redraws.
+    private(set) var sharedChatStreaming = false
+
     /// Hermes turns in flight, by id. A second message may start while the first still runs.
     private struct HermesTurn {
         var task: Task<String, Error>?
@@ -430,8 +434,9 @@ final class ClaudeService {
 
         if useStream {
             // Add placeholder (hidden until first token via ChatBubble empty-content guard)
-            let placeholder = ChatMessage(role: .assistant, content: "")
+            let placeholder = ChatMessage(role: .assistant, content: "", provider: provider)
             let msgId = placeholder.id
+            sharedChatStreaming = true
             state.updateChat(.shared) { $0.append(placeholder) }
             state.stateOverride = .thinking
             let modelCopy = state.chatModel(for: provider)
@@ -455,6 +460,7 @@ final class ClaudeService {
                         if let idx = h.firstIndex(where: { $0.id == msgId }) { h[idx].content = visible }
                     }
                 }
+                sharedChatStreaming = false
                 conversationMessages.append(["role": "assistant", "content": final])
                 state.updateChat(.shared) { h in
                     if let idx = h.firstIndex(where: { $0.id == msgId }) { h[idx].content = final }
@@ -463,6 +469,7 @@ final class ClaudeService {
                 state.showSharedChatAnswer()
                 NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
             } catch let e as LocalChatError {
+                sharedChatStreaming = false
                 if !conversationMessages.isEmpty { conversationMessages.removeLast() }
                 state.updateChat(.shared) { $0.removeAll { $0.id == msgId } }
                 state.stateOverride = nil
@@ -479,6 +486,7 @@ final class ClaudeService {
                 }
                 await showError(msg, state: state)
             } catch {
+                sharedChatStreaming = false
                 if !conversationMessages.isEmpty { conversationMessages.removeLast() }
                 state.updateChat(.shared) { $0.removeAll { $0.id == msgId } }
                 state.stateOverride = nil
@@ -503,7 +511,7 @@ final class ClaudeService {
                 }
                 let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
                 conversationMessages.append(["role": "assistant", "content": trimmed])
-                state.updateChat(.shared) { $0.append(ChatMessage(role: .assistant, content: trimmed)) }
+                state.updateChat(.shared) { $0.append(ChatMessage(role: .assistant, content: trimmed, provider: provider)) }
                 state.stateOverride = nil
                 state.showSharedChatAnswer()
                 NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
@@ -668,7 +676,7 @@ final class ClaudeService {
             // A card on screen keeps the screen: the error is only signalled by the sound and the pill badge.
             if outcome == .badgeOnly {
                 // The text waits in the chat of this agent for when it is next shown.
-                state.updateChat(id, createIfMissing: false) { $0.append(ChatMessage(role: .assistant, content: msg)) }
+                state.updateChat(id, createIfMissing: false) { $0.append(ChatMessage(role: .assistant, content: msg, isNotice: true)) }
             } else { await showError(msg, state: state) }
         }
     }
@@ -786,7 +794,7 @@ final class ClaudeService {
         }
 
         // Add to display history
-        let answer = ChatMessage(role: .assistant, content: text)
+        let answer = ChatMessage(role: .assistant, content: text, provider: .anthropic)
         state.updateChat(.shared) { $0.append(answer) }
 
         state.stateOverride = nil

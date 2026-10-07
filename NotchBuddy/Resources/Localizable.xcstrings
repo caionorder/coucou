@@ -3907,6 +3907,17 @@
         }
       }
     },
+    "Earlier steps hidden" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Etapas anteriores ocultas"
+          }
+        }
+      }
+    },
     "Email sent to %@." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -9058,6 +9069,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Óculos redondos"
+          }
+        }
+      }
+    },
+    "Rows hidden: %lld" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Linhas ocultas: %lld"
           }
         }
       }

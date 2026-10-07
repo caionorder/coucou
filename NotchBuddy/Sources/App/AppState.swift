@@ -1034,7 +1034,8 @@ final class AppState: ObservableObject {
     }
 
     /// Running chat turns per agent name. The pill stays thinking until the last of them ends.
-    private(set) var hermesTurnsRunning: [String: Int] = [:]
+    /// Published: the last message of a chat is drawn as finished when the count drops, with or without a pill row.
+    @Published private(set) var hermesTurnsRunning: [String: Int] = [:]
 
     /// A turn starts (`true`) or ends (`false`) for an agent: the pill is thinking while any turn runs.
     func setHermesPillBusy(agentName: String, _ busy: Bool) {
@@ -1333,6 +1334,13 @@ struct ChatMessage: Identifiable, Equatable {
     let id = UUID()
     let role: ChatRole
     var content: String   // var for streaming updates
+    /// Display only, never encoded, persisted, logged or sent: the shared chat provider that wrote an answer
+    /// (nil for the user, for Hermes and for messages made before this field), and the rows of an agent turn
+    /// (empty: the message is drawn as one answer made from `content`).
+    var provider: ChatProvider? = nil
+    var segments: [ChatSegment] = []
+    /// A sentence the app wrote (an error kept in the chat), never a text that is still arriving.
+    var isNotice = false
 }
 
 /// The one sign in session store of the app, over the Keychain item "hermes-agent-sessions".
