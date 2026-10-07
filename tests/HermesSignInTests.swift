@@ -76,8 +76,9 @@ enum HermesSignInTests {
         var value: String { get { lock.withLock { v } } set { lock.withLock { v = newValue } } }
     }
 
-    static func makeSessions(_ mem: Mem, now: @escaping @Sendable () -> Double = { Date().timeIntervalSince1970 }) -> HermesSessions {
-        HermesSessions(storage: HermesSessionStorage(load: { mem.value }, save: { mem.value = $0 }), now: now)
+    static func makeSessions(_ mem: Mem, now: @escaping @Sendable () -> Double = { Date().timeIntervalSince1970 },
+                             retry: HermesChat.ConnectRetry = .standard) -> HermesSessions {
+        HermesSessions(storage: HermesSessionStorage(load: { mem.value }, save: { mem.value = $0 }), now: now, connectRetry: retry)
     }
 
     static func record(_ mem: Mem, _ name: String = "steve") -> SI.SessionRecord? { SI.decodeSessions(mem.value)[name] }
@@ -174,7 +175,302 @@ enum HermesSignInTests {
 
         pureTests()
         await endToEnd()
+        await connectRetryTests()
         finish()
+    }
+
+    // MARK: Connection retry
+
+    final class Lines: @unchecked Sendable {
+        private let lock = NSLock()
+        private var v: [String] = []
+        func add(_ s: String) { lock.withLock { v.append(s) } }
+        var all: [String] { lock.withLock { v } }
+        func reset() { lock.withLock { v = [] } }
+    }
+
+    static func wsForms(_ s: [String: Any]) -> [String] {
+        ((s["ws"] as? [[String: Any]]) ?? []).map { ($0["form"] as? String ?? "?") + ($0["accepted"] as? Bool == true ? "+" : "-") }
+    }
+
+    static func submits(_ s: [String: Any]) -> Int { methods(s).filter { $0 == "prompt.submit" }.count }
+
+    /// Runs `op`; nil when it does not finish within `seconds` (a retry that never gives up would hang the suite).
+    static func within<T: Sendable>(_ seconds: Double, _ op: @escaping @Sendable () async -> T) async -> T? {
+        await withTaskGroup(of: T?.self) { g in
+            g.addTask { await op() }
+            g.addTask { try? await Task.sleep(for: .seconds(seconds)); return nil }
+            let first = await g.next() ?? nil
+            g.cancelAll()
+            return first
+        }
+    }
+
+    static func connectRetryTests() async {
+        let lines = Lines()
+        HermesChat.Diagnostics.setSink { lines.add($0) }
+        defer { HermesChat.Diagnostics.setSink(nil) }
+        // Same shape as the real policy, with the per attempt wait and the backoff scaled down.
+        let fastPolicy = HermesChat.ConnectRetry(attempts: 3, attemptTimeout: 0.6, backoff: [0.05, 0.1], budget: 20)
+        var fast = HermesChat.Limits.standard
+        fast.connectRetry = fastPolicy
+
+        let mem = Mem()
+        let ses = makeSessions(mem, retry: fastPolicy)
+        let ag = agent()
+        func fresh() async -> Bool {
+            await ctl("/_test/reset")
+            lines.reset()
+            mem.value = ""
+            return await signedIn(mem, sessions: ses) != nil
+        }
+
+        print("retry: ticket request that never gets an answer")
+        guard await fresh() else { failures += 1; return }
+        await ctl("/_test/config", ["ticket_drop": 2])
+        var x = await turn(ag, ses, "hello", limits: fast)
+        check("two lost ticket connections, the third works", x.text, "Hello from Steve.")
+        var st = await state()
+        check("three ticket requests reached the server", int(st, "ticket_count"), 3)
+        check("prompt.submit was sent exactly once", submits(st), 1)
+        check("one socket", ((st["ws"] as? [Any]) ?? []).count, 1)
+        checkTrue("recovery logged with the step and the attempts", lines.all.contains("hermes connect recovered step=ticket attempts=3"))
+
+        guard await fresh() else { failures += 1; return }
+        await ctl("/_test/config", ["ticket_drop": 3])
+        x = await turn(ag, ses, "hello", limits: fast)
+        check("all three ticket attempts lost: unreachable", chatError(x), .unreachable("127.0.0.1"))
+        st = await state()
+        check("exactly three ticket requests", int(st, "ticket_count"), 3)
+        check("no socket was opened", ((st["ws"] as? [Any]) ?? []).count, 0)
+        check("no prompt.submit", submits(st), 0)
+        checkTrue("failure logged with the step and the attempts", lines.all.contains("hermes connect failed step=ticket attempts=3"))
+        checkTrue("diagnostics carry no URL, host or token",
+                  lines.all.allSatisfy { !$0.contains("127.0.0.1") && !$0.contains("http") && !$0.contains("at-") && !$0.contains("rt-") })
+
+        print("retry: a ticket answer is final, whatever the status")
+        guard await fresh() else { failures += 1; return }
+        await ctl("/_test/config", ["ticket_status": 500])
+        x = await turn(ag, ses, "hello", limits: fast)
+        check("500 is reported", chatError(x), .server("HTTP 500"))
+        check("a 500 is not retried", int(await state(), "ticket_count"), 1)
+        await ctl("/_test/config", ["ticket_status": 503])
+        x = await turn(ag, ses, "hello", limits: fast)
+        check("503 is busy", chatError(x), .busy)
+        check("a 503 is not retried either", int(await state(), "ticket_count"), 2)
+
+        // A handshake that is dropped is repeated by URLSession itself (it repeats an idempotent GET), so a dropped
+        // handshake is checked for its outcome only; the attempts of Coucou are counted with stalled handshakes,
+        // which only Coucou's own attempt timeout can end.
+        print("retry: WebSocket handshake that drops")
+        guard await fresh() else { failures += 1; return }
+        await ctl("/_test/config", ["ws_drop": 2])
+        x = await turn(ag, ses, "hello", limits: fast)
+        check("dropped handshakes, then an open socket", x.text, "Hello from Steve.")
+        st = await state()
+        check("prompt.submit was sent exactly once", submits(st), 1)
+
+        print("retry: WebSocket handshake that stalls past the attempt timeout")
+        guard await fresh() else { failures += 1; return }
+        await ctl("/_test/config", ["ws_stall": 2, "ws_stall_seconds": 3])
+        let t0 = Date()
+        x = await turn(ag, ses, "hello", limits: fast)
+        check("two stalled handshakes, the third opens", x.text, "Hello from Steve.")
+        checkTrue("each stalled one was cut at the attempt timeout, not waited for", Date().timeIntervalSince(t0) < 2.8)
+        st = await state()
+        check("three handshakes, all in the subprotocol form, the last accepted", wsForms(st), ["?-", "?-", "subprotocol+"])
+        check("a fresh ticket for every attempt", int(st, "ticket_count"), 3)
+        check("prompt.submit was sent exactly once", submits(st), 1)
+        checkTrue("recovery logged with the step and the attempts", lines.all.contains("hermes connect recovered step=socket attempts=3"))
+
+        print("retry: all subprotocol handshakes stall, the query form gets its own attempts")
+        guard await fresh() else { failures += 1; return }
+        await ctl("/_test/config", ["ws_stall": 3, "ws_stall_seconds": 3])
+        x = await turn(ag, ses, "hello", limits: fast)
+        check("falls back after three attempts", x.text, "Hello from Steve.")
+        st = await state()
+        check("three stalled, then the query form accepted", wsForms(st), ["?-", "?-", "?-", "query+"])
+        check("a ticket per handshake", int(st, "ticket_count"), 4)
+        check("prompt.submit was sent exactly once", submits(st), 1)
+
+        guard await fresh() else { failures += 1; return }
+        await ctl("/_test/config", ["ws_stall": 6, "ws_stall_seconds": 3])
+        x = await turn(ag, ses, "hello", limits: fast)
+        check("both forms stall: unreachable", chatError(x), .unreachable("127.0.0.1"))
+        st = await state()
+        check("three attempts per form", ((st["ws"] as? [Any]) ?? []).count, 6)
+        check("never a prompt.submit", submits(st), 0)
+        checkTrue("failure logged for the socket step", lines.all.contains("hermes connect failed step=socket attempts=3"))
+
+        print("retry: a refused handshake is not retried in the same form")
+        guard await fresh() else { failures += 1; return }
+        await ctl("/_test/config", ["reject_subprotocol": true])
+        x = await turn(ag, ses, "hello", limits: fast)
+        check("fallback to the query form", x.text, "Hello from Steve.")
+        st = await state()
+        check("one refused handshake, one accepted", wsForms(st), ["subprotocol-", "query+"])
+        check("no retry of the refused form", int(st, "ticket_count"), 2)
+
+        print("retry: the budget keeps the worst case short")
+        guard await fresh() else { failures += 1; return }
+        await ctl("/_test/config", ["ws_stall": 6, "ws_stall_seconds": 3])
+        var tight = HermesChat.Limits.standard
+        tight.connectRetry = HermesChat.ConnectRetry(attempts: 3, attemptTimeout: 0.6, backoff: [0.05, 0.1], budget: 0.5)
+        x = await turn(ag, ses, "hello", limits: tight)
+        check("over budget: unreachable", chatError(x), .unreachable("127.0.0.1"))
+        check("no retry past the budget, no query fallback", ((await state())["ws"] as? [Any])?.count, 1)
+
+        print("retry: nothing after prompt.submit is retried")
+        guard await fresh() else { failures += 1; return }
+        x = await turn(ag, ses, "close", limits: fast)
+        check("the socket closes during the turn: the partial answer is kept", x.error == nil, true)
+        st = await state()
+        check("one handshake", ((st["ws"] as? [Any]) ?? []).count, 1)
+        check("prompt.submit exactly once", submits(st), 1)
+        check("one ticket", int(st, "ticket_count"), 1)
+
+        print("retry: cancellation during a backoff")
+        guard await fresh() else { failures += 1; return }
+        await ctl("/_test/config", ["ticket_drop": 3])
+        var slow = HermesChat.Limits.standard
+        slow.connectRetry = HermesChat.ConnectRetry(attempts: 3, attemptTimeout: 0.6, backoff: [30, 30], budget: 100)
+        let task = Task { await turn(ag, ses, "hello", limits: slow) }
+        try? await Task.sleep(nanoseconds: 700_000_000)
+        let tc = Date()
+        task.cancel()
+        let cancelled = await task.value
+        checkTrue("CancellationError", cancelled.error is CancellationError)
+        checkTrue("at once", Date().timeIntervalSince(tc) < 2)
+        check("no further ticket request", int(await state(), "ticket_count"), 1)
+
+        print("retry: refresh (a POST with side effects: repeated only when no body byte left the machine)")
+        guard await fresh() else { failures += 1; return }
+        var expired = record(mem)!
+        let before = expired
+        expired.expiresAt = Date().timeIntervalSince1970 - 10
+        await ses.store(expired, name: "steve")
+        await ctl("/_test/config", ["refresh_drop": 3])
+        x = await turn(ag, ses, "hello", limits: fast)
+        check("the server READ the refresh body, then dropped the connection: busy, nothing removed", chatError(x), .busy)
+        check("the server saw exactly ONE refresh request (a request that reached it is never sent again)", int(await state(), "refresh_count"), 1)
+        check("the tokens are kept", record(mem)?.refreshToken, before.refreshToken)
+        checkTrue("logged as a failed request with the body sent, not as a connect failure",
+                  lines.all.contains("hermes request failed step=refresh attempts=1 sent=true") && !lines.all.contains { $0.hasPrefix("hermes connect failed") })
+
+        guard await fresh() else { failures += 1; return }
+        expired = record(mem)!
+        expired.expiresAt = Date().timeIntervalSince1970 - 10
+        await ses.store(expired, name: "steve")
+        await ctl("/_test/config", ["refresh_mode": "503"])
+        x = await turn(ag, ses, "hello", limits: fast)
+        check("a 503 on refresh: the token is expired, so busy", chatError(x), .busy)
+        check("a refresh that got an answer is never repeated", int(await state(), "refresh_count"), 1)
+        check("the tokens are kept", record(mem)?.refreshToken, expired.refreshToken)
+
+        guard await fresh() else { failures += 1; return }
+        expired = record(mem)!
+        expired.expiresAt = Date().timeIntervalSince1970 - 10
+        await ses.store(expired, name: "steve")
+        x = await turn(ag, ses, "hello", limits: fast)
+        check("a normal refresh still rotates the token", x.text, "Hello from Steve.")
+        checkTrue("the rotated tokens were stored", record(mem)?.refreshToken != expired.refreshToken)
+
+        // Connect level failures of the refresh, against a listener of our own (no byte can leave).
+        let refreshAnswer = "{\"access_token\":\"at-from-the-listener-0123456789\",\"refresh_token\":\"rt-from-the-listener\",\"expires_at\":9999999999}"
+        let refreshHTTP = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: \(refreshAnswer.utf8.count)\r\n\r\n" + refreshAnswer
+        func listenerRecord(_ port: UInt16) -> SI.SessionRecord {
+            var r = record(mem)!
+            r.baseURL = "http://127.0.0.1:\(port)"
+            return r
+        }
+        func isRefreshed(_ o: HermesSessions.RefreshOutcome?) -> Bool { if case .refreshed? = o { return true }; return false }
+        func isUnavailable(_ o: HermesSessions.RefreshOutcome?) -> Bool { if case .unavailable? = o { return true }; return false }
+
+        guard await fresh() else { failures += 1; return }
+        if let dead = StallingListener.closedPort() {
+            let rec = listenerRecord(dead)
+            let t = Date()
+            let o = await HermesSignInNet.refresh(record: rec, retry: fastPolicy)
+            checkTrue("refresh: connection refused on every attempt → unavailable (tokens kept by the caller)", isUnavailable(o))
+            checkTrue("refresh: a refused connection is retried three times", lines.all.contains("hermes connect failed step=refresh attempts=3"))
+            checkTrue("refresh: ... and quickly", Date().timeIntervalSince(t) < 4)
+            lines.reset()
+            let revive = Task { () -> StallingListener? in
+                try? await Task.sleep(for: .seconds(0.15))
+                let l = StallingListener(port: dead)
+                l?.serve(refreshHTTP)
+                return l
+            }
+            var lateRetry = fastPolicy
+            lateRetry.backoff = [0.3, 0.6]
+            let o2 = await HermesSignInNet.refresh(record: rec, retry: lateRetry)
+            let srv = await revive.value
+            checkTrue("refresh: refused, then the server is up: the refresh goes through", isRefreshed(o2))
+            check("refresh: the body reached the server exactly once", srv?.requests, 1)
+            checkTrue("refresh: recovery logged", lines.all.contains { $0.hasPrefix("hermes connect recovered step=refresh attempts=") })
+            srv?.stop()
+        } else { print("  ✗ no free port"); failures += 1 }
+
+        print("retry: refresh on a connection that never completes (the reported failure mode)")
+        lines.reset()
+        if let hang = StallingListener(fillBacklog: true) {
+            let rec = listenerRecord(hang.port)
+            let t = Date()
+            let o = await within(8) { await HermesSignInNet.refresh(record: rec, retry: fastPolicy) }
+            let took = Date().timeIntervalSince(t)
+            checkTrue("refresh: gives up after the attempts (without retries it waits the 15 s request timeout)", isUnavailable(o))
+            checkTrue("refresh: three attempts, each cut at the attempt timeout (\(String(format: "%.1f", took)) s)", took >= 1.5 && took < 5)
+            checkTrue("refresh: logged with three attempts", lines.all.contains("hermes connect failed step=refresh attempts=3"))
+            check("refresh: no request ever reached the server", hang.requests, 0)
+            hang.stop()
+        } else { print("  ✗ could not build the stalled listener"); failures += 1 }
+
+        lines.reset()
+        if let hang = StallingListener(fillBacklog: true) {
+            let rec = listenerRecord(hang.port)
+            let release = Task { try? await Task.sleep(for: .seconds(0.2)); hang.serve(refreshHTTP) }
+            let o = await within(8) { await HermesSignInNet.refresh(record: rec, retry: fastPolicy) }
+            await release.value
+            checkTrue("refresh: the first connection hangs, a later attempt gets through", isRefreshed(o))
+            check("refresh: the body reached the server exactly once", hang.requests, 1)
+            hang.stop()
+        }
+
+        print("retry: the refresh counts against the turn's budget and is not repeated for every ticket")
+        guard await fresh() else { failures += 1; return }
+        var near = record(mem)!
+        near.expiresAt = Date().timeIntervalSince1970 + 10   // inside the 60 s refresh window, still valid
+        await ses.store(near, name: "steve")
+        await ctl("/_test/config", ["refresh_drop": 100, "ws_stall": 2, "ws_stall_seconds": 3])
+        x = await turn(ag, ses, "hello", limits: fast)
+        check("the turn works with the access token that is still valid", x.text, "Hello from Steve.")
+        st = await state()
+        check("three tickets (two stalled handshakes, then the open one)", int(st, "ticket_count"), 3)
+        check("the refresh ran once for the whole turn (one request, it is not repeated per ticket)", int(st, "refresh_count"), 1)
+
+        print("retry: the real budget to attempt ratio keeps the third handshake attempt with slow tickets")
+        guard await fresh() else { failures += 1; return }
+        let attemptT = 0.6
+        let ratio = HermesChat.ConnectRetry.standard.budget / HermesChat.ConnectRetry.standard.attemptTimeout
+        var real = HermesChat.Limits.standard
+        real.connectRetry = HermesChat.ConnectRetry(attempts: 3, attemptTimeout: attemptT, backoff: [0.05, 0.1], budget: ratio * attemptT)
+        await ctl("/_test/config", ["ws_stall": 2, "ws_stall_seconds": 3, "ticket_delay": 0.3])
+        x = await turn(ag, ses, "hello", limits: real)
+        check("two stalled handshakes after 0.3 s tickets: the third attempt still happens", x.text, "Hello from Steve.")
+        check("three handshakes", wsForms(await state()), ["?-", "?-", "subprotocol+"])
+
+        print("retry: profiles and me")
+        guard await fresh() else { failures += 1; return }
+        let tok = record(mem)!.accessToken
+        await ctl("/_test/config", ["profiles_drop": 2])
+        if case .success(let p) = await HermesSignInNet.profiles(baseURL: base, token: tok, retry: fastPolicy) {
+            check("profiles after two lost connections", p.map(\.name), ["default", "codex"])
+        } else { print("  ✗ profiles failed"); failures += 1 }
+        await ctl("/_test/config", ["profiles_drop": 100])
+        if case .failure(let e) = await HermesSignInNet.profiles(baseURL: base, token: tok, retry: fastPolicy) {
+            check("profiles never reached: unreachable", e, .unreachable("127.0.0.1"))
+        } else { print("  ✗ profiles: expected failure"); failures += 1 }
+        checkTrue("failure logged for profiles", lines.all.contains { $0.hasPrefix("hermes connect failed step=profiles attempts=") })
     }
 
     // MARK: Pure logic

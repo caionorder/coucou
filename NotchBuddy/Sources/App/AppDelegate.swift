@@ -16,6 +16,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Warm up Keychain cache on main thread BEFORE any poller or view touches it
         _ = KeychainStore.shared
         _ = AppLanguage.launched
+        HermesChat.Diagnostics.setSink { appendAppLog("nb.log", $0) }
         NSApp.setActivationPolicy(.accessory)
         setupMenuBarItem()
         setupIsland()

@@ -2,7 +2,7 @@ import Foundation
 import Network
 
 // MARK: - Hermes sign in: session store, loopback listener, REST calls, one chat turn over the dashboard WebSocket.
-// Nothing here logs. Tokens go only to HermesSignIn.endpoint(agent.baseURL, …) and into the Keychain through `HermesSessionStorage`.
+// The only logging is `HermesChat.Diagnostics` (step names and attempt counts, never a URL, token or text). Tokens go only to HermesSignIn.endpoint(agent.baseURL, …) and into the Keychain through `HermesSessionStorage`.
 
 struct HermesSessionStorage: Sendable {
     var load: @Sendable () -> String
@@ -27,11 +27,14 @@ actor HermesSessions {
 
     private let storage: HermesSessionStorage
     private let now: @Sendable () -> Double
+    private let connectRetry: HermesChat.ConnectRetry
     private var inflight: [String: Task<RefreshOutcome, Never>] = [:]
 
-    init(storage: HermesSessionStorage, now: @escaping @Sendable () -> Double = { Date().timeIntervalSince1970 }) {
+    init(storage: HermesSessionStorage, now: @escaping @Sendable () -> Double = { Date().timeIntervalSince1970 },
+         connectRetry: HermesChat.ConnectRetry = .standard) {
         self.storage = storage
         self.now = now
+        self.connectRetry = connectRetry
     }
 
     private func all() -> [String: HermesSignIn.SessionRecord] { HermesSignIn.decodeSessions(storage.load()) }
@@ -60,10 +63,13 @@ actor HermesSessions {
     }
 
     /// One refresh per agent at a time. The rotated record is saved before any caller gets the new token.
-    private func refreshOutcome(name: String, record: HermesSignIn.SessionRecord) async -> RefreshOutcome {
+    /// `deadline` is the turn's connect deadline: the refresh counts against the same budget as the tickets and
+    /// handshakes (when a refresh is already in flight, the deadline of its first caller applies).
+    private func refreshOutcome(name: String, record: HermesSignIn.SessionRecord,
+                                deadline: ContinuousClock.Instant?) async -> RefreshOutcome {
         if let t = inflight[name] { return await t.value }
         let t = Task { () -> RefreshOutcome in
-            var out = await HermesSignInNet.refresh(record: record)
+            var out = await HermesSignInNet.refresh(record: record, retry: connectRetry, deadline: deadline)
             // Only a record that still exists and still holds the refresh token this request was made with may
             // be rotated or removed by its answer.
             if self.all()[name]?.refreshToken != record.refreshToken { out = .superseded }
@@ -81,7 +87,8 @@ actor HermesSessions {
 
     /// An access token that is fresh enough to use, refreshing first when needed.
     /// `forceRefresh` is for a token the server just refused.
-    func validToken(for agent: HermesAgent, forceRefresh: Bool = false) async throws -> String {
+    func validToken(for agent: HermesAgent, forceRefresh: Bool = false,
+                    deadline: ContinuousClock.Instant? = nil) async throws -> String {
         let rec: HermesSignIn.SessionRecord
         switch record(for: agent) {
         case .success(let r): rec = r
@@ -97,7 +104,7 @@ actor HermesSessions {
             if forceRefresh { remove(name: agent.name) }
             throw HermesChatError.signInNeeded(agent.name)
         case .refresh:
-            switch await refreshOutcome(name: agent.name, record: rec) {
+            switch await refreshOutcome(name: agent.name, record: rec, deadline: deadline) {
             case .refreshed(let r): return r.accessToken
             case .expired: throw HermesChatError.signInNeeded(agent.name)
             case .superseded:
@@ -290,8 +297,13 @@ enum HermesSignInNet {
     }
 
     /// One request, no redirect followed (the Authorization header never leaves the stored origin), body capped.
+    /// A connection that fails to open is retried (`step` names it in the diagnostics); an answer of any status never is.
+    /// `rule` is stated at every call site: a POST with side effects is repeated only when no body byte left the machine.
     private static func call(_ method: String, _ url: URL, bearer: String?, json: [String: Any]?,
-                             host: String, timeout: TimeInterval = 15) async -> Result<(Int, Data), HermesChatError> {
+                             host: String, step: String, rule: HermesChat.ConnectRetry.Rule,
+                             retry: HermesChat.ConnectRetry = .standard,
+                             deadline: ContinuousClock.Instant? = nil,
+                             timeout: TimeInterval = 15) async -> Result<(Int, Data), HermesChatError> {
         var req = URLRequest(url: url, timeoutInterval: timeout)
         req.httpMethod = method
         req.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -300,14 +312,14 @@ enum HermesSignInNet {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = try? JSONSerialization.data(withJSONObject: json)
         }
-        let s = URLSession(configuration: config())
-        defer { s.finishTasksAndInvalidate() }
         var data = Data()
         let response: URLResponse
         do {
-            let (bytes, r) = try await s.bytes(for: req, delegate: HermesNoRedirect())
-            response = r
-            for try await b in bytes {
+            let opened = try await HermesChat.open(req, step: step, host: host, policy: retry, rule: rule, deadline: deadline,
+                                                   makeSession: { URLSession(configuration: config()) })
+            defer { opened.session.finishTasksAndInvalidate() }
+            response = opened.response
+            for try await b in opened.bytes {
                 data.append(b)
                 if data.count > HermesChat.Limits.standard.connectBodyBytes {
                     return .failure(.server(String(localized: "The server answer is too large for a Hermes server.")))
@@ -320,12 +332,14 @@ enum HermesSignInNet {
     }
 
     /// `POST /auth/native/refresh`. Never throws; the caller decides what each outcome means.
-    static func refresh(record: HermesSignIn.SessionRecord) async -> HermesSessions.RefreshOutcome {
+    static func refresh(record: HermesSignIn.SessionRecord, retry: HermesChat.ConnectRetry = .standard,
+                        deadline: ContinuousClock.Instant? = nil) async -> HermesSessions.RefreshOutcome {
         guard !record.refreshToken.isEmpty,
               let url = HermesSignIn.endpoint(record.baseURL, "/auth/native/refresh") else { return .unavailable }
         let r = await call("POST", url, bearer: nil,
                            json: ["refresh_token": record.refreshToken, "provider": record.provider],
-                           host: HermesChat.hostLabel(record.baseURL))
+                           host: HermesChat.hostLabel(record.baseURL), step: "refresh",
+                           rule: .sideEffects, retry: retry, deadline: deadline)
         guard case .success(let (status, body)) = r else { return .unavailable }
         if status == 401 { return .expired }
         guard status == 200,
@@ -336,17 +350,20 @@ enum HermesSignInNet {
     }
 
     /// Label for Settings (`GET /api/auth/me`); nil on any failure.
-    static func me(baseURL: String, token: String) async -> String? {
+    static func me(baseURL: String, token: String, retry: HermesChat.ConnectRetry = .standard) async -> String? {
         guard let url = HermesSignIn.endpoint(baseURL, "/api/auth/me"),
               case .success(let (status, body)) = await call("GET", url, bearer: token, json: nil,
-                                                               host: HermesChat.hostLabel(baseURL)),
+                                                               host: HermesChat.hostLabel(baseURL), step: "me",
+                                                               rule: .idempotent, retry: retry),
               status == 200 else { return nil }
         return HermesSignIn.parseMe(body)
     }
 
-    static func profiles(baseURL: String, token: String) async -> Result<[HermesSignIn.Profile], HermesChatError> {
+    static func profiles(baseURL: String, token: String,
+                         retry: HermesChat.ConnectRetry = .standard) async -> Result<[HermesSignIn.Profile], HermesChatError> {
         guard let url = HermesSignIn.endpoint(baseURL, "/api/profiles") else { return .failure(.invalidURL) }
-        switch await call("GET", url, bearer: token, json: nil, host: HermesChat.hostLabel(baseURL)) {
+        switch await call("GET", url, bearer: token, json: nil, host: HermesChat.hostLabel(baseURL), step: "profiles",
+                        rule: .idempotent, retry: retry) {
         case .failure(let e): return .failure(e)
         case .success(let (status, body)):
             if HermesSignIn.isSessionExpired(status: status, body: body) {
@@ -391,7 +408,8 @@ enum HermesSignInNet {
         case .failure(let e): return .failure(e)
         }
         guard let tokenURL = HermesSignIn.endpoint(baseURL, "/auth/native/token") else { return .failure(.invalidURL) }
-        switch await call("POST", tokenURL, bearer: nil, json: ["code": code, "code_verifier": pkce.verifier], host: host) {
+        switch await call("POST", tokenURL, bearer: nil, json: ["code": code, "code_verifier": pkce.verifier],
+                        host: host, step: "token", rule: .sideEffects, retry: HermesChat.ConnectRetry(attempts: 1, attemptTimeout: 15)) {
         case .failure(let e): return .failure(e)
         case .success(let (status, body)):
             guard status == 200 else {
@@ -405,15 +423,24 @@ enum HermesSignInNet {
     // MARK: Ticket
 
     /// A fresh single use ticket. A refused token is refreshed once; a second refusal ends the session.
-    private static func mintTicket(agent: HermesAgent, sessions: HermesSessions, host: String) async throws -> String {
+    /// `turnToken` holds the access token of the turn: the token check (and its refresh, when due) runs once per turn,
+    /// not on every ticket, so a refresh that cannot connect is not repeated for each handshake attempt. A token the
+    /// server refuses is still refreshed (`forceRefresh`). Refreshes count against the turn's connect `deadline`.
+    private static func mintTicket(agent: HermesAgent, sessions: HermesSessions, host: String,
+                                   retry: HermesChat.ConnectRetry, deadline: ContinuousClock.Instant,
+                                   turnToken: inout String?) async throws -> String {
         guard let url = HermesSignIn.endpoint(agent.baseURL, "/api/auth/ws-ticket") else { throw HermesChatError.invalidURL }
-        var token = try await sessions.validToken(for: agent)
+        var token: String
+        if let t = turnToken { token = t } else { token = try await sessions.validToken(for: agent, deadline: deadline) }
+        turnToken = token
         for attempt in 0..<2 {
-            switch await call("POST", url, bearer: token, json: [:], host: host) {
-            case .failure(let e): throw e
+            switch await call("POST", url, bearer: token, json: [:], host: host, step: "ticket", rule: .idempotent, retry: retry, deadline: deadline) {
+            case .failure(let e):
+                if Task.isCancelled { throw CancellationError() }
+                throw e
             case .success(let (status, body)):
                 if HermesSignIn.isSessionExpired(status: status, body: body) {
-                    if attempt == 0 { token = try await sessions.validToken(for: agent, forceRefresh: true); continue }
+                    if attempt == 0 { token = try await sessions.validToken(for: agent, forceRefresh: true, deadline: deadline); turnToken = token; continue }
                     await sessions.remove(name: agent.name, ifAccessToken: token)
                     throw HermesChatError.signInNeeded(agent.name)
                 }
@@ -443,27 +470,64 @@ enum HermesSignInNet {
         guard agent.connection == .signIn, HermesChat.isValidAgent(agent) else { throw HermesChatError.invalidURL }
         let host = HermesChat.hostLabel(agent.baseURL)
 
-        // Handshake: ticket in the subprotocol; once, the query form when that form is refused.
+        // Handshake: ticket in the subprotocol; once, the query form when that form is refused (or never gets ready).
         // The socket is registered for closing the moment it exists, so a cancellation anywhere below cannot leak it.
+        // Opening is separate from ready: a handshake that does not complete in `attemptTimeout` (or drops) is retried
+        // with a fresh ticket; a handshake the server REFUSED is not. Once open, the `readyTimeout` wait applies.
+        let policy = limits.connectRetry
+        let clock = ContinuousClock()
+        var deadline = clock.now.advanced(by: .seconds(policy.budget))   // opening connections; ready waits are excluded
+        var turnToken: String?
         var opened: HermesSocket?
         defer { opened?.close() }
-        for queryForm in [false, true] {
+        forms: for queryForm in [false, true] {
             if queryForm && !limits.allowQueryTicketFallback { break }
-            try Task.checkCancellation()
-            let ticket = try await mintTicket(agent: agent, sessions: sessions, host: host)
-            guard let url = HermesSignIn.socketURL(baseURL: agent.baseURL, queryTicket: queryForm ? ticket : nil) else {
-                if queryForm { break }   // no query ticket for a target that is not wss (or loopback)
-                throw HermesChatError.invalidURL
+            // The fallback form gets only what is left of the budget.
+            if queryForm, clock.now.advanced(by: .seconds(policy.attemptTimeout)) > deadline { break }
+            var attempt = 0
+            while true {
+                try Task.checkCancellation()
+                attempt += 1
+                let ticket = try await mintTicket(agent: agent, sessions: sessions, host: host, retry: policy,
+                                                  deadline: deadline, turnToken: &turnToken)
+                guard let url = HermesSignIn.socketURL(baseURL: agent.baseURL, queryTicket: queryForm ? ticket : nil) else {
+                    if queryForm { break forms }   // no query ticket for a target that is not wss (or loopback)
+                    throw HermesChatError.invalidURL
+                }
+                let protocols = queryForm ? [] : (HermesSignIn.ticketProtocols(ticket) ?? [])
+                // The request timeout is not an idle limit here: the ready, rpc and turn timers below are.
+                let s = HermesSocket(url: url, protocols: protocols,
+                                     requestTimeout: limits.duration + limits.readyTimeout + 60)
+                opened = s
+                s.start()
+                switch await s.waitOpen(timeout: policy.attemptTimeout) {
+                case .open:
+                    if attempt > 1 { HermesChat.Diagnostics.recovered(step: "socket", attempts: attempt) }
+                    let waitStart = clock.now
+                    let ready = await s.waitReady(timeout: limits.readyTimeout)
+                    deadline = deadline.advanced(by: waitStart.duration(to: clock.now))
+                    if ready { break forms }
+                    if !Task.isCancelled { HermesChat.Diagnostics.failed(step: "ready", attempts: 1) }
+                    s.close()
+                    opened = nil
+                    continue forms
+                case .refused:
+                    s.close()
+                    opened = nil
+                    continue forms
+                case .failed(let code):
+                    s.close()
+                    opened = nil
+                    try Task.checkCancellation()
+                    if policy.isRetryable(code, rule: .idempotent, bytesSent: 0),
+                       let wait = policy.mayRetry(afterAttempt: attempt, now: clock.now, deadline: deadline) {
+                        try await Task.sleep(for: .seconds(wait))
+                        continue
+                    }
+                    HermesChat.Diagnostics.failed(step: "socket", attempts: attempt)
+                    continue forms
+                }
             }
-            let protocols = queryForm ? [] : (HermesSignIn.ticketProtocols(ticket) ?? [])
-            // The request timeout is not an idle limit here: the ready, rpc and turn timers below are.
-            let s = HermesSocket(url: url, protocols: protocols,
-                                 requestTimeout: limits.duration + limits.readyTimeout + 60)
-            opened = s
-            s.start()
-            if await s.waitReady(timeout: limits.readyTimeout) { break }
-            s.close()
-            opened = nil
         }
         try Task.checkCancellation()
         guard let socket = opened else { throw HermesChatError.unreachable(host) }
@@ -661,6 +725,63 @@ final class HermesSocket: @unchecked Sendable {
     private let creditStream: AsyncStream<Void>
     private var owed = false
     private var reader: Task<Void, Never>?
+    private let handshaker: Handshaker
+
+    /// How the WebSocket handshake ended.
+    enum Handshake: Sendable, Equatable {
+        /// HTTP 101: the socket is open (not yet ready).
+        case open
+        /// The server answered the handshake with an HTTP status other than 101: never retried in the same form.
+        case refused
+        /// No answer: the connection failed to open or dropped, or `waitOpen` timed out (`.timedOut`).
+        case failed(URLError.Code)
+    }
+
+    /// Session delegate: refuses redirects and reports how the handshake ended. Frames and timers do not go through it.
+    private final class Handshaker: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
+        private let lock = NSLock()
+        private var result: Handshake?
+        private var waiter: CheckedContinuation<Handshake, Never>?
+
+        func settle(_ r: Handshake) {
+            let w = lock.withLock { () -> CheckedContinuation<Handshake, Never>? in
+                guard result == nil else { return nil }
+                result = r
+                let w = waiter
+                waiter = nil
+                return w
+            }
+            w?.resume(returning: r)
+        }
+
+        func wait() async -> Handshake {
+            await withCheckedContinuation { (c: CheckedContinuation<Handshake, Never>) in
+                let done = lock.withLock { () -> Handshake? in
+                    if let result { return result }
+                    waiter = c
+                    return nil
+                }
+                if let done { c.resume(returning: done) }
+            }
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
+
+        func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didOpenWithProtocol protocol: String?) {
+            settle(.open)
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            // Only reached before `didOpen` when the handshake failed.
+            if let http = task.response as? HTTPURLResponse, http.statusCode != 101 { settle(.refused); return }
+            settle(.failed((error as? URLError)?.code ?? .unknown))
+        }
+    }
 
     /// `requestTimeout` is URLSession's request timeout, which can behave as an idle limit on a WebSocket:
     /// callers pass a value that covers the whole turn. Ready, rpc and turn timers are explicit (`arm`).
@@ -670,7 +791,9 @@ final class HermesSocket: @unchecked Sendable {
         c.httpCookieStorage = nil
         c.urlCache = nil
         c.timeoutIntervalForRequest = requestTimeout
-        session = URLSession(configuration: c, delegate: HermesNoRedirect(), delegateQueue: nil)
+        let hsDelegate = Handshaker()
+        handshaker = hsDelegate
+        session = URLSession(configuration: c, delegate: hsDelegate, delegateQueue: nil)
         task = protocols.isEmpty ? session.webSocketTask(with: url) : session.webSocketTask(with: url, protocols: protocols)
         task.maximumMessageSize = 4 * 1024 * 1024
         let (stream, cont) = AsyncStream.makeStream(of: Event.self, bufferingPolicy: .unbounded)
@@ -713,6 +836,17 @@ final class HermesSocket: @unchecked Sendable {
         let ev = await iterator.next()
         if case .text? = ev { owed = true }
         return ev
+    }
+
+    /// Waits for the HTTP 101 of the handshake, at most `timeout`. Cancellation ends the wait as `.timedOut`.
+    func waitOpen(timeout: TimeInterval) async -> Handshake {
+        let h = handshaker
+        let timer = Task {
+            try? await Task.sleep(for: .seconds(timeout))
+            if !Task.isCancelled { h.settle(.failed(.timedOut)) }
+        }
+        defer { timer.cancel() }
+        return await withTaskCancellationHandler { await h.wait() } onCancel: { h.settle(.failed(.cancelled)) }
     }
 
     /// True when `gateway.ready` arrives in time; false on handshake failure, close or timeout.

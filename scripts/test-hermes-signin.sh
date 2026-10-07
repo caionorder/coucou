@@ -23,7 +23,7 @@ SERVER_PID=$!
 swiftc -swift-version 6 -typecheck "${SOURCES[@]}"
 # ... and without the code the App Store build leaves out (the listener and the browser flow)
 swiftc -swift-version 6 -D APPSTORE -typecheck "${SOURCES[@]}"
-swiftc "${SOURCES[@]}" tests/HermesSignInTests.swift -o "$TEST_DIR/hermes-signin-tests"
+swiftc "${SOURCES[@]}" tests/StallingListener.swift tests/HermesSignInTests.swift -o "$TEST_DIR/hermes-signin-tests"
 
 for i in $(seq 1 300); do
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then

@@ -18,6 +18,17 @@ Routes (prefix is "", "/p/default" or "/p/mark"):
         "bigtext"        -> content frames totalling 3000 characters
         "slow"           -> some content, then keepalive lines for ~8 s
         "bigmodels"      -> (GET /big/v1/models) a 100 KB body
+Test control (shared by both endpoints):
+  POST /_test/reset                    counters and failures back to zero
+  POST /_test/config {"models_drop": N, "chat_drop": N, "chat_stall": seconds, "chat_stall_count": N, "chat_status": 500,
+                      "models_stall": seconds, "models_stall_count": N}
+        models_drop: accept the next N models requests and close the connection without answering
+        chat_drop: accept the next N chat requests, READ THE WHOLE BODY, then close without answering (the request
+          reached the server, so the client must not send it again)
+        models_stall: hold the response headers of the next models_stall_count models requests for that long
+        chat_stall: hold the response headers of the next chat_stall_count chat requests for that long
+        chat_status: answer every chat request with this status
+  GET  /_test/state                    {"models_hits": n, "chat_hits": n}
 Wrong/missing key -> 401 gateway_auth_failed. Unknown profile -> 404.
 Response header X-Test-Model echoes the request "model"; X-Test-System is "1" if a system
 message was sent (the client must not send one).
@@ -28,6 +39,7 @@ import socket
 import socketserver
 import struct
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -40,6 +52,31 @@ EXPECTED_RESPONSE = "Hello from mark."
 
 def envelope(message, etype, code):
     return json.dumps({"error": {"message": message, "type": etype, "code": code}}).encode()
+
+
+LOCK = threading.Lock()
+CONFIG = {}
+COUNTS = {}
+
+
+def reset():
+    with LOCK:
+        CONFIG.clear()
+        CONFIG.update({"models_drop": 0, "chat_drop": 0, "chat_stall": 0, "chat_stall_count": 0, "chat_status": 0,
+                       "models_stall": 0, "models_stall_count": 0})
+        COUNTS.clear()
+        COUNTS.update({"models_hits": 0, "chat_hits": 0})
+
+
+reset()
+
+
+def take(key):
+    with LOCK:
+        if CONFIG[key] > 0:
+            CONFIG[key] -= 1
+            return True
+    return False
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -73,6 +110,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
+        if path == "/_test/state":
+            with LOCK:
+                return self.send_json(200, json.dumps(COUNTS).encode())
         if path == "/dashboard/v1/models":
             body = b"<html><body>Login</body></html>"
             self.send_response(200)
@@ -93,6 +133,16 @@ class Handler(BaseHTTPRequestHandler):
         profile, tail = self.route()
         if profile == "__unknown__":
             return self.send_json(404, envelope("no such profile", "not_found", "profile_not_found"))
+        if tail == "/v1/models":
+            with LOCK:
+                COUNTS["models_hits"] += 1
+            if take("models_drop"):
+                self.close_connection = True
+                return
+            if take("models_stall_count"):
+                with LOCK:
+                    hold = CONFIG["models_stall"]
+                time.sleep(hold)
         if tail != "/v1/models":
             return self.send_json(404, envelope("not found", "not_found", "not_found"))
         if not self.authed(profile):
@@ -100,6 +150,15 @@ class Handler(BaseHTTPRequestHandler):
         self.send_json(200, json.dumps({"object": "list", "data": [{"id": MODEL_IDS[profile]}]}).encode())
 
     def do_POST(self):
+        if self.path.split("?")[0] in ("/_test/reset", "/_test/config"):
+            n = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(n) if n else b""
+            if self.path.endswith("reset"):
+                reset()
+            else:
+                with LOCK:
+                    CONFIG.update(json.loads(raw or b"{}"))
+            return self.send_json(200, b"{}")
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length)
         try:
@@ -111,6 +170,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(404, envelope("no such profile", "not_found", "profile_not_found"))
         if tail != "/v1/chat/completions":
             return self.send_json(404, envelope("not found", "not_found", "not_found"))
+        with LOCK:
+            COUNTS["chat_hits"] += 1
+            status = CONFIG["chat_status"]
+        if take("chat_drop"):
+            self.close_connection = True
+            return
+        if take("chat_stall_count"):
+            with LOCK:
+                hold = CONFIG["chat_stall"]
+            time.sleep(hold)
+        if status:
+            return self.send_json(status, envelope("injected", "server_error", "injected"))
         if not self.authed(profile):
             return self.send_json(401, envelope("Invalid API key", "invalid_request_error", "gateway_auth_failed"))
 
@@ -199,7 +270,9 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
 
-class FastBindHTTPServer(HTTPServer):
+class FastBindHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
     def server_bind(self):
         socketserver.TCPServer.server_bind(self)
         self.server_name = "127.0.0.1"

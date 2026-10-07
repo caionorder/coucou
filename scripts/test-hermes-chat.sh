@@ -19,6 +19,7 @@ swiftc \
     NotchBuddy/Sources/App/HermesChat.swift \
     NotchBuddy/Sources/App/LocalChat.swift \
     NotchBuddy/Sources/App/SafeWebURL.swift \
+    tests/StallingListener.swift \
     tests/HermesChatTests.swift \
     -o "$TEST_DIR/hermes-chat-tests"
 
