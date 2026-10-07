@@ -181,7 +181,13 @@ final class RecapStore {
 
         // Top agent by session count
         var countByAgent: [String: Int] = [:]
-        for t in turns { countByAgent[t.pillId, default: 0] += 1 }
+        for t in turns {
+            #if !APPSTORE
+            countByAgent[CmuxRouting.recapAgentKey(t.pillId), default: 0] += 1
+            #else
+            countByAgent[t.pillId, default: 0] += 1
+            #endif
+        }
         let topAgentId = countByAgent.max { $0.value < $1.value }?.key
         #if !APPSTORE
         let topAgent = topAgentId.flatMap { id in

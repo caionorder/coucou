@@ -827,6 +827,7 @@ final class HookServer: @unchecked Sendable {
                 if cmuxEndedAt.count < 64 { cmuxEndedAt[key] = now }
                 forgetCmuxSurface(key, wasFocused: state.focusId == agentId)
                 requestCmuxDiscovery()
+                RecapStore.shared.sessionEnd(sessionId: recapSessionId)
                 break
             }
             #endif

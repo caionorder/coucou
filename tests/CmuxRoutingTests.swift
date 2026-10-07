@@ -383,6 +383,22 @@ enum CmuxRoutingTests {
         try? FileManager.default.removeItem(atPath: sockDir)
 
         // ── timing and lifecycle ───────────────────────────────────────────────
+        print("CmuxRouting.recapAgentKey")
+        check("a cmux workspace folds into the cmux bucket",
+              CmuxRouting.recapAgentKey("agent_cmux_abcdef12-3456-7890-abcd-ef1234567890") == CmuxRouting.taskPrefix)
+        check("two workspaces share one bucket",
+              CmuxRouting.recapAgentKey("agent_cmux_aaa") == CmuxRouting.recapAgentKey("agent_cmux_bbb"))
+        check("the bucket is still a cmux task id (displayed as cmux)",
+              CmuxRouting.isCmuxTaskId(CmuxRouting.recapAgentKey("agent_cmux_aaa")))
+        check("other pills keep their own id",
+              CmuxRouting.recapAgentKey("agent_vscode") == "agent_vscode" && CmuxRouting.recapAgentKey("integration_claude") == "integration_claude")
+        var tally: [String: Int] = [:]
+        for id in (0..<6).flatMap({ i in Array(repeating: "agent_cmux_ws\(i)", count: 5) }) + Array(repeating: "agent_vscode", count: 8) {
+            tally[CmuxRouting.recapAgentKey(id), default: 0] += 1
+        }
+        check("30 cmux turns over 6 workspaces beat 8 turns in one pill",
+              tally.max { $0.value < $1.value }?.key == CmuxRouting.taskPrefix)
+
         print("CmuxRouting.inputLocked / isLateCard / mayRegister")
         check("lock window is 700 ms", CmuxRouting.promotionLock == 0.7)
         check("no promotion → never locked", !CmuxRouting.inputLocked(promotedAt: nil, now: 100))
