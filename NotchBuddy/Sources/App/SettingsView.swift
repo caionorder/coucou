@@ -1793,6 +1793,7 @@ struct HermesDisplayNameRow: View {
         HStack(spacing: 8) {
             TextField("", text: $text, prompt: Text(verbatim: agent.name))
                 .textFieldStyle(.roundedBorder)
+                .accessibilityLabel(Text("Rename"))
                 .onSubmit(save)
             Button("Rename", action: save)
                 .buttonStyle(.bordered)
@@ -1800,10 +1801,12 @@ struct HermesDisplayNameRow: View {
     }
 
     private func save() {
+        let before = state.hermesAgents.first { $0.name == agent.name }?.shownName
         switch state.renameHermesAgent(agent.name, to: text) {
         case .success(let shown):
             text = state.hermesAgents.first { $0.name == agent.name }?.displayName ?? ""
-            report(String(localized: "✓ Shown as \(shown)"))
+            // Nothing changed (same name submitted again): nothing to confirm.
+            if shown != before { report(String(localized: "✓ Shown as \(shown)")) }
         case .failure(.taken(let name)):
             report(String(localized: "Another agent is already called \(name)."))
         case .failure(.unknownAgent):

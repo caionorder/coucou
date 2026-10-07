@@ -129,8 +129,10 @@ final class AppState: ObservableObject {
     }
 
     /// Changes the messages of one conversation, shown or not (a turn may finish while another chat is on screen).
-    func updateChat(_ id: ConversationID, _ body: (inout [ChatMessage]) -> Void) {
-        chatHistories.mutate(id, body)
+    /// A turn that outlives its conversation (the agent was removed) passes `createIfMissing: false`: it must not
+    /// bring an empty conversation back.
+    func updateChat(_ id: ConversationID, createIfMissing: Bool = true, _ body: (inout [ChatMessage]) -> Void) {
+        if createIfMissing { chatHistories.mutate(id, body) } else { chatHistories.mutateIfPresent(id, body) }
     }
 
     /// Clears one conversation: its messages, its stored server session and its running turns, nothing else.
@@ -542,7 +544,12 @@ final class AppState: ObservableObject {
     }
     /// True only while `IslandWindowController.openCmuxPrompt` switches to the prompt view.
     var cmuxOpeningPrompt = false
+    /// Transcripts of the cmux sessions, keyed by surface key (a pill is a workspace with one or more).
     @Published var cmuxTranscripts: [String: [ChatMessage]] = [:]
+    /// The session the user picked in the reply header, per pill id. Memory only, until that session closes.
+    @Published var cmuxReplyChoice: [String: String] = [:]
+    /// Bumped when the sessions of a workspace change, so the reply header and cards redraw.
+    @Published var cmuxRevision = 0
     @Published var cmuxNotice: String? = nil {
         didSet { if !settingCmuxFailure { cmuxNoticeFailure = nil; cmuxNoticeOffersCmux = false } }
     }
@@ -608,7 +615,7 @@ final class AppState: ObservableObject {
     var promptMessageCount: Int {
         #if !APPSTORE
         switch cmuxPrompt {
-        case .reply(let id)?: return cmuxTranscripts[id]?.count ?? 0
+        case .reply(let id)?: return cmuxTranscripts[HookServer.shared.cmuxReplyTarget(for: id) ?? id]?.count ?? 0
         case .newChat?:       return 1
         case nil:             break
         }

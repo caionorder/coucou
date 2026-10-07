@@ -57,6 +57,41 @@ enum ChatConversationsTests {
         check("another id still empty", s2[.hermes("b")], [])
         check("values count", s2.values.count, 1)
 
+        print("ConversationStore: bookkeeping never creates (a turn outliving its agent)")
+        var s3 = ConversationStore<[String]>(empty: [])
+        s3.mutate(.hermes("x")) { $0.append("answer of the removed agent") }
+        s3.remove(.hermes("x"))
+        check("mutateIfPresent on a removed id changes nothing", s3.mutateIfPresent(.hermes("x")) { $0.append("late") }, false)
+        check("and does not bring the conversation back", s3.contains(.hermes("x")), false)
+        check("the removed agent reads empty", s3[.hermes("x")], [])
+        check("mutateIfPresent on a live id changes it", s3.mutateIfPresent(.shared) { $0.append("a") } == false && { s3.set(.shared, ["a"]); return s3.mutateIfPresent(.shared) { $0.append("b") } }(), true)
+        check("live id after mutateIfPresent", s3[.shared], ["a", "b"])
+
+        print("ConversationGenerations: remove, re-add, remove again (the review's sequence)")
+        var gens = ConversationGenerations()
+        var turns = ConversationStore<[String]>(empty: [])
+        let x = ConversationID.hermes("x")
+        let g1 = gens.ensure(x)                      // T1 starts on X
+        turns.mutate(x) { $0.append("T1") }
+        gens.drop(x); turns.remove(x)                // Disconnect X while T1 runs
+        turns.mutateIfPresent(x) { $0 = [] }         // T1's own cleanup after the cancel: must not resurrect
+        check("T1 is stale after the drop", gens.isCurrent(x, g1), false)
+        check("the cleanup did not recreate the conversation", turns.contains(x), false)
+        let g2 = gens.ensure(x)                      // X connected again, T2 starts
+        turns.mutate(x) { $0.append("T2") }
+        check("a recreated conversation has a new generation", g2 != g1, true)
+        check("T1 is still stale, T2 is current", gens.isCurrent(x, g1) == false && gens.isCurrent(x, g2), true)
+        gens.drop(x); turns.remove(x)                // Disconnect X again while T2 runs
+        turns.mutateIfPresent(x) { $0 = [] }
+        check("T2 is stale after the second drop", gens.isCurrent(x, g2), false)
+        let g3 = gens.ensure(x)
+        check("a third incarnation matches neither stale turn", g3 != g1 && g3 != g2 && gens.isCurrent(x, g2) == false, true)
+        check("an id that never had a generation is nobody's current", gens.isCurrent(.hermes("never"), 0) == false && gens.isCurrent(.hermes("never"), -1) == false, true)
+        check("clear renews: the old turn is stale, the conversation keeps existing", { () -> Bool in
+            let old = gens.ensure(x); gens.renew(x); return !gens.isCurrent(x, old) && gens.isCurrent(x, gens.ensure(x)) }(), true)
+        check("another conversation is not touched by a drop of x", { () -> Bool in
+            let y = ConversationID.hermes("y"); let gy = gens.ensure(y); gens.drop(x); return gens.isCurrent(y, gy) }(), true)
+
         print("HermesAgentNames.clean")
         check("plain", HermesAgentNames.clean("Steve"), "Steve")
         check("trimmed", HermesAgentNames.clean("  Steve \n"), "Steve")
@@ -112,7 +147,7 @@ enum ChatConversationsTests {
         typealias H = HermesAnnounce
         check("chat of this agent on screen: nothing", H.decide(expanded: true, viewIsChat: true, cmuxPromptOpen: false, alertPending: false, chatIsOfThisAgent: true), .none)
         check("chat of another agent on screen: badge only", H.decide(expanded: true, viewIsChat: true, cmuxPromptOpen: false, alertPending: false, chatIsOfThisAgent: false), .badgeOnly)
-        check("not on the chat: expand whoever is selected", H.decide(expanded: true, viewIsChat: false, cmuxPromptOpen: false, alertPending: false, chatIsOfThisAgent: false), .expand)
+        check("not on the chat: expand, the chat of the agent that answered", H.decide(expanded: true, viewIsChat: false, cmuxPromptOpen: false, alertPending: false, chatIsOfThisAgent: false), .expand)
         check("collapsed: expand", H.decide(expanded: false, viewIsChat: true, cmuxPromptOpen: false, alertPending: false, chatIsOfThisAgent: false), .expand)
         check("card pending: badge only", H.decide(expanded: false, viewIsChat: false, cmuxPromptOpen: false, alertPending: true, chatIsOfThisAgent: false), .badgeOnly)
         check("default is this agent", H.decide(expanded: true, viewIsChat: true, cmuxPromptOpen: false, alertPending: false), .none)

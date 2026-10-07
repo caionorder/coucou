@@ -53,8 +53,6 @@ final class HookServer: @unchecked Sendable {
     #if !APPSTORE
     // cmux: per-surface registry (holds the capability token, memory only) and the queue of waiting cards.
     private var cmuxRegistry = CmuxRegistry()
-    /// Set by upsertCmuxTask: true when the last upsert created the task (not a /clear or a later event).
-    private var cmuxLastUpsertCreated = false
     private var cmuxLaunchGeneration = 0
     /// Per task: a permission / question dialog Coucou gave back to the terminal and that may still be
     /// open there. Typing Enter then would answer it. Cleared only by the event that resolves it.
@@ -68,6 +66,7 @@ final class HookServer: @unchecked Sendable {
         var fd: Int32
         var source: any DispatchSourceRead
         var taskId: String
+        var surfaceKey: String
         var payload: [String: Any]
         var parsed: AskQuestion?
     }
@@ -75,6 +74,21 @@ final class HookServer: @unchecked Sendable {
     private var cmuxShownPayload: [String: Any]? = nil   // payload of the cmux card currently on screen
     private var cmuxShownArrival: TimeInterval = 0
     private var cmuxPromotedAt: TimeInterval? = nil      // set when the card on screen came out of the queue
+    /// Discovery (the cmux tree and session file): one run at a time, throttled, with no timer of its own.
+    private var cmuxDiscoveryLast: TimeInterval? = nil
+    private var cmuxDiscoveryInFlight = false
+    private var cmuxDiscoveryRerun = false
+    private var cmuxDiscoveryDeferred = false
+    /// True while the last snapshot had a tree.
+    private var cmuxTreeKnown = false
+    /// Surface keys of the sessions the last discovery found with a live process in the cmux session file; nil
+    /// when that file could not be read. A live process keeps its entry, anything else is subject to the time rule.
+    private var cmuxLiveSessionKeys: Set<String>? = nil
+    /// Sessions that ended a moment ago, by surface key: a discovery that read the file before the SessionEnd (or
+    /// while the process shut down) must not bring them back.
+    private var cmuxEndedAt: [String: TimeInterval] = [:]
+    /// The session whose Stop wrote the pill's final line, so ending another session leaves it alone.
+    private var cmuxFinalLineKey: [String: String] = [:]
     #endif
 
     private init() {}
@@ -91,11 +105,13 @@ final class HookServer: @unchecked Sendable {
     /// 3-second note, clears approval state, then collapses the island.
     @MainActor
     private func dismissApprovalCard(note: String, resolved: Bool = false) {
+        var cardKey: String? = nil
         #if !APPSTORE
+        cardKey = cmuxShownKey
         cmuxShownPayload = nil
         // Not resolved by an event (timeout, the hook went away): the dialog may still be open in cmux.
         if !resolved, let p = AppState.shared.pendingApproval {
-            markCmuxDialogOpen(p.pillId, tool: p.tool, inputKey: p.inputKey)
+            markCmuxDialogOpen(cardKey, tool: p.tool, inputKey: p.inputKey)
         }
         #endif
         // cancelApprovalFDSource() triggers the cancel handler which closes the fd.
@@ -106,8 +122,8 @@ final class HookServer: @unchecked Sendable {
         let pillId = state.pendingApproval?.pillId ?? "integration_claude"
         state.pendingApproval = nil
         state.isPinned = false
-        state.updateTask(id: pillId, state: .working)
-        clearPillBadge(id: pillId)
+        setTaskState(pillId, .working, cmuxKey: cardKey)
+        clearPillBadgeUnlessCardHeld(id: pillId)
         // Restore focus to the pill that was focused before the approval card appeared.
         if let prev = focusBeforeApproval {
             focusBeforeApproval = nil
@@ -137,9 +153,11 @@ final class HookServer: @unchecked Sendable {
 
     @MainActor
     private func dismissQuestionCard(note: String, leftOpen: Bool = false) {
+        var cardKey: String? = nil
         #if !APPSTORE
+        cardKey = cmuxShownKey
         cmuxShownPayload = nil
-        if leftOpen { markCmuxDialogOpen(questionPillId, tool: "AskUserQuestion", inputKey: nil) }
+        if leftOpen { markCmuxDialogOpen(cardKey, tool: "AskUserQuestion", inputKey: nil) }
         #endif
         cancelQuestionFDSource()
         pendingQuestionFD = -1
@@ -147,8 +165,8 @@ final class HookServer: @unchecked Sendable {
         let pillId = questionPillId
         state.pendingQuestion = nil
         state.isPinned = false
-        state.updateTask(id: pillId, state: .working)
-        clearPillBadge(id: pillId)
+        setTaskState(pillId, .working, cmuxKey: cardKey)
+        clearPillBadgeUnlessCardHeld(id: pillId)
         if let prev = focusBeforeQuestion {
             focusBeforeQuestion = nil
             if state.focusId == pillId, state.tasks.contains(where: { $0.id == prev }) {
@@ -197,8 +215,8 @@ final class HookServer: @unchecked Sendable {
     func releaseQuestionFD() {
         guard pendingQuestionFD >= 0 else { return }
         #if !APPSTORE
+        markCmuxDialogOpen(cmuxShownKey, tool: "AskUserQuestion", inputKey: nil)
         cmuxShownPayload = nil
-        markCmuxDialogOpen(questionPillId, tool: "AskUserQuestion", inputKey: nil)
         #endif
         let fd = pendingQuestionFD
         pendingQuestionFD = -1
@@ -260,6 +278,21 @@ final class HookServer: @unchecked Sendable {
             let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
             guard app?.bundleIdentifier == CmuxRouting.bundleId else { return }
             MainActor.assumeIsolated { self?.cmuxRegistry.clearCredentials() }
+        }
+        // cmux launched or activated: the workspaces may have changed. Throttled, one run at a time. Leaving cmux
+        // is no trigger: nothing changed by itself.
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didActivateApplicationNotification] {
+            NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+                guard app?.bundleIdentifier == CmuxRouting.bundleId else { return }
+                MainActor.assumeIsolated { self?.requestCmuxDiscovery() }
+            }
+        }
+        // App start with cmux already running: one discovery once the pills are loaded.
+        if NSWorkspace.shared.runningApplications.contains(where: { $0.bundleIdentifier == CmuxRouting.bundleId }) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                MainActor.assumeIsolated { self?.requestCmuxDiscovery() }
+            }
         }
         #endif
         Thread.detachNewThread { self.serverThread() }
@@ -438,8 +471,9 @@ final class HookServer: @unchecked Sendable {
         let isVSCodeEditor = !isCursorEditor && (
             termProgram.lowercased().contains("vscode") ||
             bundleId.lowercased().contains("vscode"))
+        // The pill of a cmux event is the pill of its surface's registry entry, whatever workspace the payload names.
         #if !APPSTORE
-        let cmuxTaskId = CmuxRouting.taskId(payload: payload)
+        let cmuxTaskId = cmuxRoutedTaskId(payload: payload)
         #else
         let cmuxTaskId: String? = nil
         #endif
@@ -476,13 +510,28 @@ final class HookServer: @unchecked Sendable {
             return
         }
 
+        /// Surface key of the cmux session that sent the event. Only an event that really belongs to the cmux pill
+        /// speaks for one of its surfaces (a Codex session inside cmux is its own pill).
+        #if !APPSTORE
+        let cmuxKey: String? = (cmuxTaskId != nil && cmuxTaskId == agentId) ? CmuxRouting.surfaceKey(payload: payload) : nil
+        if let key = cmuxKey, cmuxRegistry.surface(key: key) == nil, name != "SessionEnd" {
+            // Past the per pill cap (or not registered): such a session has no state of its own and must not
+            // write the pill's.
+            nbLog("Ignored \(name) of an unregistered cmux session")
+            return
+        }
+        #else
+        let cmuxKey: String? = nil
+        #endif
+
         #if !APPSTORE
         if let routed = cmuxTaskId, routed == agentId {
             let eventInputKey = Self.approvalInputKey(payload["tool_input"] as? [String: Any] ?? [:])
-            if let mark = cmuxOpenDialogs[routed],
+            // Only a hook event carrying a valid token for the surface (heard) may clear a dialog mark.
+            if let key = cmuxKey, cmuxRegistry.surface(key: key)?.heard == true, let mark = cmuxOpenDialogs[key],
                CmuxRouting.dialogResolved(mark: mark, event: name, tool: payload["tool_name"] as? String ?? "",
                                           inputKey: eventInputKey) {
-                cmuxOpenDialogs[routed] = nil
+                cmuxOpenDialogs[key] = nil
             }
             purgeCmuxQueue(event: name, sessionId: sessionId,
                            tool: payload["tool_name"] as? String ?? "",
@@ -504,7 +553,14 @@ final class HookServer: @unchecked Sendable {
 
         // While a permission request is pending, dismiss when the resolving event arrives,
         // then continue normal processing. Only skip normal processing when unresolved.
-        if let pending = state.pendingApproval, agentId == pending.pillId {
+        // A cmux pill holds several sessions: only an event of the session that asked is about the card.
+        #if !APPSTORE
+        let cmuxPillEvent = CmuxRouting.isCmuxTaskId(agentId)
+        #else
+        let cmuxPillEvent = false
+        #endif
+        if let pending = state.pendingApproval, agentId == pending.pillId,
+           !cmuxPillEvent || sessionId == pending.sessionId {
             let handledNote: String
             switch pending.pillId {
             case "agent_cursor": handledNote = String(localized: "Handled in Cursor.")
@@ -548,12 +604,13 @@ final class HookServer: @unchecked Sendable {
 
         case "SessionStart":
             activeSessionId = sessionId
-            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd) }
+            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKey) }
             if let idx = state.tasks.firstIndex(where: { $0.id == agentId }) { state.tasks[idx].finalLine = nil }
             #if !APPSTORE
             if cmuxTaskId == agentId {
-                refreshCmuxMeta(taskId: agentId, cwd: cwd)
-                handleCmuxSessionStart(agentId: agentId, payload: payload, cwd: cwd)
+                refreshCmuxMeta(taskId: agentId, cwd: cwd, key: cmuxKey)
+                handleCmuxSessionStart(agentId: agentId, key: cmuxKey, payload: payload, cwd: cwd)
+                requestCmuxDiscovery()
             }
             #endif
             nbLog("SessionStart \(isExternalAgent ? agentId : projectName) (\(sessionId.prefix(8)))")
@@ -562,17 +619,20 @@ final class HookServer: @unchecked Sendable {
 
         case "UserPromptSubmit":
             activeSessionId = sessionId
-            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd) }
+            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKey) }
             if let idx = state.tasks.firstIndex(where: { $0.id == agentId }) { state.tasks[idx].finalLine = nil }
-            state.updateTask(id: agentId, state: .thinking)
+            setTaskState(agentId, .thinking, cmuxKey: cmuxKey)
             if let prompt = payload["prompt"] as? String, !prompt.isEmpty {
-                appendStep(id: agentId, step: String(prompt.prefix(60)))
+                appendStep(id: agentId, step: stepPrefix(forKey: cmuxKey) + String(prompt.prefix(60)))
                 #if !APPSTORE
-                if cmuxTaskId == agentId { appendCmuxMessage(agentId, role: .user, text: prompt, limit: 2000) }
+                if cmuxTaskId == agentId { appendCmuxMessage(cmuxKey, role: .user, text: prompt, limit: 2000) }
                 #endif
             }
             #if !APPSTORE
-            if cmuxTaskId == agentId { refreshCmuxMeta(taskId: agentId, cwd: cwd) }
+            if cmuxTaskId == agentId {
+                refreshCmuxMeta(taskId: agentId, cwd: cwd, key: cmuxKey)
+                requestCmuxDiscovery()
+            }
             #endif
             if state.isPresent { expandIfNeeded(to: .overview) }
 
@@ -583,15 +643,15 @@ final class HookServer: @unchecked Sendable {
             // AskUserQuestion is handled via the dedicated --ask hook.
             // Skip state/step update here to avoid flickering over the question card.
             guard tool != "AskUserQuestion" else { break }
-            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd) }
-            state.updateTask(id: agentId, state: .working)
+            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKey) }
+            setTaskState(agentId, .working, cmuxKey: cmuxKey)
             let input = payload["tool_input"] as? [String: Any] ?? [:]
             let step = frenchStep(tool: tool, input: input)
-            appendStep(id: agentId, step: step)
+            appendStep(id: agentId, step: stepPrefix(forKey: cmuxKey) + step)
             nbLog("PreToolUse \(tool)")
 
         case "PostToolUse":
-            state.updateTask(id: agentId, state: .working)
+            setTaskState(agentId, .working, cmuxKey: cmuxKey)
             // Live diff for Edit / MultiEdit / Write
             let diffTool = payload["tool_name"] as? String ?? ""
             let diffInput = payload["tool_input"] as? [String: Any] ?? [:]
@@ -602,56 +662,82 @@ final class HookServer: @unchecked Sendable {
             }
 
         case "PostToolUseFailure":
-            state.updateTask(id: agentId, state: .working)
-            appendStep(id: agentId, step: String(localized: "⚠ failed"))
+            setTaskState(agentId, .working, cmuxKey: cmuxKey)
+            appendStep(id: agentId, step: stepPrefix(forKey: cmuxKey) + String(localized: "⚠ failed"))
 
         case "Notification":
             let message = payload["message"] as? String ?? ""
             let lower = message.lowercased()
             if lower.contains("rate limit") || lower.contains("limite d") {
-                state.updateTask(id: agentId, state: .ratelimit)
+                setTaskState(agentId, .ratelimit, cmuxKey: cmuxKey)
                 SoundEngine.shared.play("rate")
             } else if message.hasSuffix("?") {
-                state.updateTask(id: agentId, state: .question)
-                appendStep(id: agentId, step: message)
+                setTaskState(agentId, .question, cmuxKey: cmuxKey)
+                appendStep(id: agentId, step: stepPrefix(forKey: cmuxKey) + message)
             }
 
         case "Stop":
-            state.updateTask(id: agentId, state: .finished)
+            // A helper that stops while another session of the workspace is mid turn adds a step, nothing else:
+            // no sound, no finished view, no badge. The main session is never silent, and a sibling stuck in an
+            // old state (error, rate limit) silences nobody. Decided before the state is recorded.
+            #if !APPSTORE
+            var silentStop = false
+            if let key = cmuxKey {
+                let states = Dictionary(cmuxRegistry.surfaces(ofTask: agentId).map { ($0.key, $0.state) },
+                                        uniquingKeysWith: { a, _ in a })
+                silentStop = CmuxRouting.stopIsSilent(stoppingKey: key, mainKey: cmuxRegistry.surface(for: agentId)?.key,
+                                                      states: states)
+            }
+            #else
+            let silentStop = false
+            #endif
+            setTaskState(agentId, .finished, cmuxKey: cmuxKey)
             let rawFinal = (payload["last_assistant_message"] as? String)
                 ?? (payload["message"] as? String) ?? ""
             let finalText = DiffEngine.toOneLine(rawFinal)
             #if !APPSTORE
             if cmuxTaskId == agentId {
-                appendCmuxMessage(agentId, role: .assistant, text: rawFinal, limit: 4000)
-                refreshCmuxMeta(taskId: agentId, cwd: cwd)
+                appendCmuxMessage(cmuxKey, role: .assistant, text: rawFinal, limit: 4000)
+                refreshCmuxMeta(taskId: agentId, cwd: cwd, key: cmuxKey)
+                requestCmuxDiscovery()
             }
             #endif
             if !finalText.isEmpty {
-                appendStep(id: agentId, step: finalText)
-                if let idx = state.tasks.firstIndex(where: { $0.id == agentId }) {
+                appendStep(id: agentId, step: stepPrefix(forKey: cmuxKey) + finalText)
+                if !silentStop, let idx = state.tasks.firstIndex(where: { $0.id == agentId }) {
                     state.tasks[idx].finalLine = finalText
+                    #if !APPSTORE
+                    if let key = cmuxKey { cmuxFinalLineKey[agentId] = key }
+                    #endif
                 }
             }
-            SoundEngine.shared.play("finish")
+            if !silentStop { SoundEngine.shared.play("finish") }
             #if !APPSTORE
             // The reply view of this session shows the answer in place: no view switch, the draft stays.
             let answerInPlace = CmuxRouting.answerStaysInReply(prompt: state.cmuxPrompt, taskId: agentId,
-                                                               viewIsPrompt: state.view == .prompt)
+                                                               viewIsPrompt: state.view == .prompt,
+                                                               surfaceKey: cmuxKey,
+                                                               targetKey: cmuxTaskId == nil ? nil : cmuxReplyTarget(for: agentId))
             #else
             let answerInPlace = false
             #endif
-            if answerInPlace {
+            if silentStop {
+                // nothing to show
+            } else if answerInPlace {
                 // nothing to switch
-            } else if focused && !cardPromoted {
-                expandIfNeeded(to: .finished)
             } else {
-                setPillBadge(id: agentId, badge: .finished)
+                switch alertPlacement(pillId: agentId, cmuxKey: cmuxKey, focused: focused && !cardPromoted) {
+                case .view: expandIfNeeded(to: .finished)
+                case .badge: setPillBadge(id: agentId, badge: .finished)
+                case .none: break
+                }
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 5.2) {
                 #if !APPSTORE
-                // A cmux task that has a queued card or owns the card on screen keeps its state and badge.
-                if CmuxRouting.isCmuxTaskId(agentId), self.cmuxTaskHoldsCard(agentId) { return }
+                if let key = cmuxKey, CmuxRouting.isCmuxTaskId(agentId) {
+                    self.settleFinishedCmuxSurface(taskId: agentId, key: key)
+                    return
+                }
                 #endif
                 if isExternalAgent {
                     AppState.shared.removeTask(id: agentId)
@@ -662,45 +748,54 @@ final class HookServer: @unchecked Sendable {
             }
 
         case "StopFailure":
-            state.updateTask(id: agentId, state: .error)
+            setTaskState(agentId, .error, cmuxKey: cmuxKey)
             SoundEngine.shared.play("error")
             #if !APPSTORE
             let errorInPlace = CmuxRouting.answerStaysInReply(prompt: state.cmuxPrompt, taskId: agentId,
-                                                              viewIsPrompt: state.view == .prompt)
+                                                              viewIsPrompt: state.view == .prompt,
+                                                              surfaceKey: cmuxKey,
+                                                              targetKey: cmuxTaskId == nil ? nil : cmuxReplyTarget(for: agentId))
             #else
             let errorInPlace = false
             #endif
             if errorInPlace {
                 // the reply view stays open
-            } else if focused && !cardPromoted {
-                expandIfNeeded(to: .error)
             } else {
-                setPillBadge(id: agentId, badge: .error)
+                switch alertPlacement(pillId: agentId, cmuxKey: cmuxKey, focused: focused && !cardPromoted) {
+                case .view: expandIfNeeded(to: .error)
+                case .badge: setPillBadge(id: agentId, badge: .error)
+                case .none: break
+                }
             }
 
         case "Interrupt":
             // Codex: user stopped the turn
             activeSessionId = nil
-            state.updateTask(id: agentId, state: .idle)
-            clearPillBadge(id: agentId)
+            setTaskState(agentId, .idle, cmuxKey: cmuxKey)
+            clearPillBadgeIfIdle(id: agentId)
 
         case "SessionEnd":
             activeSessionId = nil
+            #if !APPSTORE
+            // A cmux pill is a workspace: only the last session that ends takes the pill with it.
+            if cmuxTaskId == agentId, let key = cmuxKey {
+                let now = Date().timeIntervalSinceReferenceDate
+                cmuxEndedAt = cmuxEndedAt.filter { now - $0.value < CmuxRouting.endedGrace * 6 }
+                if cmuxEndedAt.count < 64 { cmuxEndedAt[key] = now }
+                forgetCmuxSurface(key, wasFocused: state.focusId == agentId)
+                requestCmuxDiscovery()
+                break
+            }
+            #endif
             if let idx = state.tasks.firstIndex(where: { $0.id == agentId }) { state.tasks[idx].finalLine = nil }
             state.clearSessionDiffs(for: agentId)
-            #if !APPSTORE
-            let cmuxWasFocused = state.focusId == agentId
-            #endif
             state.removeTask(id: agentId)
-            #if !APPSTORE
-            if cmuxTaskId == agentId { forgetCmuxTask(agentId, wasFocused: cmuxWasFocused) }
-            #endif
 
         case "SubagentStart":
-            appendStep(id: agentId, step: String(localized: "+ subagent"))
+            appendStep(id: agentId, step: stepPrefix(forKey: cmuxKey) + String(localized: "+ subagent"))
 
         case "SubagentStop":
-            appendStep(id: agentId, step: String(localized: "• subagent done"))
+            appendStep(id: agentId, step: stepPrefix(forKey: cmuxKey) + String(localized: "• subagent done"))
 
         default:
             break
@@ -808,7 +903,7 @@ final class HookServer: @unchecked Sendable {
         #endif
         #if !APPSTORE
         let cmuxTaskId: String? = (isCodexRequest || isCursorEditor || isVSCodeEditor)
-            ? nil : CmuxRouting.taskId(payload: payload)
+            ? nil : cmuxRoutedTaskId(payload: payload)
         #else
         let cmuxTaskId: String? = nil
         #endif
@@ -857,13 +952,16 @@ final class HookServer: @unchecked Sendable {
 
         let command = toolInput["command"] as? String ?? tool
 
+        var displacedKey: String? = nil
+        var cmuxKeyOfRequest: String? = nil
         #if !APPSTORE
+        cmuxKeyOfRequest = cmuxTaskId == nil ? nil : CmuxRouting.surfaceKey(payload: payload)
         if cmuxTaskId != nil {
             if pendingApprovalFD >= 0 || pendingQuestionFD >= 0 {
                 // A card is on screen: wait in line, the fd stays open and silent.
-                guard cmuxQueue.canAccept(taskId: pillId) else {
+                guard cmuxQueue.canAccept(taskId: pillId, surfaceKey: cmuxKeyOfRequest) else {
                     // Queue full: answer like a terminal Coucou does not support. The dialog is open there.
-                    markCmuxDialogOpen(pillId, tool: tool, inputKey: inputKey)
+                    markCmuxDialogOpen(cmuxKeyOfRequest, tool: tool, inputKey: inputKey)
                     Task.detached { [weak self] in
                         self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
                         close(fd)
@@ -871,6 +969,7 @@ final class HookServer: @unchecked Sendable {
                     return
                 }
                 enqueueCmuxCard(kind: .approval, fd: fd, payload: payload, parsed: nil, taskId: pillId,
+                                surfaceKey: cmuxKeyOfRequest ?? pillId,
                                 sessionId: sessionId, tool: tool, inputKey: inputKey, arrivedAt: arrivedAt)
                 return
             }
@@ -878,6 +977,7 @@ final class HookServer: @unchecked Sendable {
             // A legacy request must not answer "ask" to a cmux card: send it back to the queue.
             requeueCmuxCardIfShowing()
         }
+        displacedKey = cmuxShownKey
         cmuxShownPayload = cmuxTaskId != nil ? payload : nil
         cmuxShownArrival = arrivedAt ?? Date().timeIntervalSinceReferenceDate
         cmuxPromotedAt = nil   // presentNextCmuxCard sets it again when this card came out of the queue
@@ -890,7 +990,7 @@ final class HookServer: @unchecked Sendable {
             let oldSource = approvalFDSource
             approvalFDSource = nil
             #if !APPSTORE
-            if let p = state.pendingApproval { markCmuxDialogOpen(p.pillId, tool: p.tool, inputKey: p.inputKey) }
+            if let p = state.pendingApproval { markCmuxDialogOpen(displacedKey, tool: p.tool, inputKey: p.inputKey) }
             #endif
             Task.detached { [weak self] in
                 // "ask" → nb-hook outputs nothing → Claude Code re-asks
@@ -903,8 +1003,8 @@ final class HookServer: @unchecked Sendable {
         let gen = cardGeneration
         activeSessionId = sessionId
 
-        upsertWorkspaceTask(id: pillId, projectName: projectName, cwd: cwd)
-        state.updateTask(id: pillId, state: .approval)
+        upsertWorkspaceTask(id: pillId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKeyOfRequest)
+        setTaskState(pillId, .approval, cmuxKey: cmuxKeyOfRequest)
         state.pendingApproval = ApprovalInfo(sessionId: sessionId, tool: tool,
                                               command: command, inputKey: inputKey, pillId: pillId)
         state.isPinned = true
@@ -970,8 +1070,10 @@ final class HookServer: @unchecked Sendable {
     /// Called by ApprovalView buttons. Writes the decision to the waiting nb-hook and cleans up.
     @MainActor
     func sendApprovalDecision(_ decision: String) {
+        var cardKey: String? = nil
         #if !APPSTORE
         if cmuxInputLocked() { return }
+        cardKey = cmuxShownKey
         cmuxShownPayload = nil
         #endif
         let fd = pendingApprovalFD
@@ -1004,13 +1106,13 @@ final class HookServer: @unchecked Sendable {
         #if !APPSTORE
         // "ask" hands the request back to the terminal: its dialog is open there.
         if decision == "ask", let p = state.pendingApproval {
-            markCmuxDialogOpen(p.pillId, tool: p.tool, inputKey: p.inputKey)
+            markCmuxDialogOpen(cardKey, tool: p.tool, inputKey: p.inputKey)
         }
         #endif
         state.pendingApproval = nil
         state.isPinned = false
-        state.updateTask(id: pillId, state: .working)
-        clearPillBadge(id: pillId)
+        setTaskState(pillId, .working, cmuxKey: cardKey)
+        clearPillBadgeUnlessCardHeld(id: pillId)
         // Restore focus to the pill that was focused before the approval card appeared.
         if let prev = focusBeforeApproval {
             focusBeforeApproval = nil
@@ -1050,7 +1152,7 @@ final class HookServer: @unchecked Sendable {
         #endif
         #if !APPSTORE
         let cmuxTaskId: String? = (isCodexRequest || isCursorEditor || isVSCodeEditor || Self.validateAgent(rawAgent) != nil)
-            ? nil : CmuxRouting.taskId(payload: payload)
+            ? nil : cmuxRoutedTaskId(payload: payload)
         #else
         let cmuxTaskId: String? = nil
         #endif
@@ -1072,11 +1174,14 @@ final class HookServer: @unchecked Sendable {
             return
         }
 
+        var displacedKey: String? = nil
+        var cmuxKeyOfRequest: String? = nil
         #if !APPSTORE
+        cmuxKeyOfRequest = cmuxTaskId == nil ? nil : CmuxRouting.surfaceKey(payload: payload)
         if cmuxTaskId != nil {
             if pendingApprovalFD >= 0 || pendingQuestionFD >= 0 {
-                guard cmuxQueue.canAccept(taskId: pillId) else {
-                    markCmuxDialogOpen(pillId, tool: "AskUserQuestion", inputKey: nil)
+                guard cmuxQueue.canAccept(taskId: pillId, surfaceKey: cmuxKeyOfRequest) else {
+                    markCmuxDialogOpen(cmuxKeyOfRequest, tool: "AskUserQuestion", inputKey: nil)
                     Task.detached { [weak self] in
                         self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
                         close(fd)
@@ -1085,6 +1190,7 @@ final class HookServer: @unchecked Sendable {
                 }
                 let toolInput = payload["tool_input"] as? [String: Any] ?? [:]
                 enqueueCmuxCard(kind: .question, fd: fd, payload: payload, parsed: parsed, taskId: pillId,
+                                surfaceKey: cmuxKeyOfRequest ?? pillId,
                                 sessionId: sessionId, tool: "AskUserQuestion",
                                 inputKey: Self.approvalInputKey(toolInput), arrivedAt: arrivedAt)
                 return
@@ -1092,6 +1198,7 @@ final class HookServer: @unchecked Sendable {
         } else {
             requeueCmuxCardIfShowing()
         }
+        displacedKey = cmuxShownKey
         cmuxShownPayload = cmuxTaskId != nil ? payload : nil
         cmuxShownArrival = arrivedAt ?? Date().timeIntervalSinceReferenceDate
         cmuxPromotedAt = nil   // presentNextCmuxCard sets it again when this card came out of the queue
@@ -1103,7 +1210,7 @@ final class HookServer: @unchecked Sendable {
             let oldSrc = questionFDSource
             questionFDSource = nil
             #if !APPSTORE
-            markCmuxDialogOpen(questionPillId, tool: "AskUserQuestion", inputKey: nil)
+            markCmuxDialogOpen(displacedKey, tool: "AskUserQuestion", inputKey: nil)
             #endif
             Task.detached { [weak self] in
                 self?.sendLine(fd: old, text: #"{"permissionDecision":"ask"}"#)
@@ -1116,8 +1223,8 @@ final class HookServer: @unchecked Sendable {
         activeSessionId = sessionId
         questionPillId = pillId
 
-        upsertWorkspaceTask(id: pillId, projectName: projectName, cwd: cwd)
-        state.updateTask(id: pillId, state: .question)
+        upsertWorkspaceTask(id: pillId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKeyOfRequest)
+        setTaskState(pillId, .question, cmuxKey: cmuxKeyOfRequest)
         state.pendingQuestion = parsed
         state.isPinned = true
         SoundEngine.shared.play("approval")
@@ -1160,9 +1267,9 @@ final class HookServer: @unchecked Sendable {
     /// If the task already exists (persistent), just updates name/cwd.
     /// If missing (transient), creates it and inserts after the main pill.
     @MainActor
-    private func upsertWorkspaceTask(id: String, projectName: String, cwd: String = "") {
+    private func upsertWorkspaceTask(id: String, projectName: String, cwd: String = "", cmuxKey: String? = nil) {
         #if !APPSTORE
-        if CmuxRouting.isCmuxTaskId(id) { upsertCmuxTask(id: id, projectName: projectName, cwd: cwd); return }
+        if CmuxRouting.isCmuxTaskId(id) { upsertCmuxTask(id: id, projectName: projectName, cwd: cwd, key: cmuxKey); return }
         #endif
         let state = AppState.shared
         if let idx = state.tasks.firstIndex(where: { $0.id == id }) {
@@ -1190,49 +1297,153 @@ final class HookServer: @unchecked Sendable {
 
     #if !APPSTORE
 
-    /// Surface data for the exact jump. Contains the capability: never log or persist it.
+    /// Surface data of the pill's main surface. Contains the capability: never log or persist it.
     @MainActor
     func cmuxSurface(for taskId: String) -> CmuxSurface? { cmuxRegistry.surface(for: taskId) }
+
+    /// Surface data of one surface (by key).
+    @MainActor
+    func cmuxSurface(key: String) -> CmuxSurface? { cmuxRegistry.surface(key: key) }
 
     @MainActor
     func cmuxCredential(for taskId: String?, hasPassword: Bool) -> CmuxCredential {
         cmuxRegistry.credential(for: taskId, hasPassword: hasPassword)
     }
 
+    /// Token for typing into a surface: its own, else the freshest on the same socket. Never the password.
     @MainActor
-    func cmuxSendCredential(for taskId: String) -> CmuxCredential { cmuxRegistry.sendCredential(for: taskId) }
+    func cmuxSendCredential(forKey key: String) -> CmuxCredential { cmuxRegistry.sendCredential(forKey: key) }
 
-    /// True while a dialog Coucou gave back to the terminal may still be open for this task.
+    /// Token for bringing a surface to the front (nothing is typed): its own, else one on the same socket.
     @MainActor
-    func cmuxDialogMayBeOpen(_ taskId: String) -> Bool { cmuxOpenDialogs[taskId] != nil }
+    func cmuxJumpCredential(forKey key: String) -> CmuxCredential { cmuxRegistry.jumpCredential(forKey: key) }
+
+    /// True when Coucou has proof that the surface runs an agent session: a hook event with a valid token for that
+    /// very surface (see `CmuxSurface.canType`). A surface known only through discovery or the session file is a
+    /// pill with Send off until its session reports in.
+    @MainActor
+    func cmuxCanType(key: String) -> Bool { cmuxRegistry.surface(key: key)?.canType == true }
+
+    /// The pill of a cmux event: the pill of its surface's registry entry when it has one (one source of truth,
+    /// whatever workspace the payload names), else the workspace of the payload.
+    @MainActor
+    private func cmuxRoutedTaskId(payload: [String: Any]) -> String? {
+        guard let id = CmuxRouting.taskId(payload: payload) else { return nil }
+        if let key = CmuxRouting.surfaceKey(payload: payload), let own = cmuxRegistry.pillId(forKey: key) { return own }
+        return id
+    }
+
+    /// The pill that owns the question card on screen, nil without one.
+    @MainActor
+    var cmuxQuestionPillId: String? {
+        AppState.shared.pendingQuestion != nil && !questionPillId.isEmpty ? questionPillId : nil
+    }
+
+    /// True when the approval or question card on screen belongs to this pill.
+    @MainActor
+    private func cmuxCardOnScreen(forPill taskId: String) -> Bool {
+        if pendingApprovalFD >= 0, AppState.shared.pendingApproval?.pillId == taskId { return true }
+        if pendingQuestionFD >= 0, questionPillId == taskId { return true }
+        return false
+    }
+
+    /// Agent sessions across every pill (the hub says "N sessions").
+    @MainActor
+    var cmuxSessionCount: Int { cmuxRegistry.surfaces.count }
+
+    /// Where a reply to the pill goes: the surface the user picked (while it lives), else the main one.
+    @MainActor
+    func cmuxReplyTarget(for taskId: String) -> String? {
+        if let choice = AppState.shared.cmuxReplyChoice[taskId],
+           let s = cmuxRegistry.surface(key: choice), s.taskId == taskId { return choice }
+        return cmuxRegistry.surface(for: taskId)?.key
+    }
+
+    /// The user picked a surface in the reply header. Remembered until that surface closes.
+    @MainActor
+    func setCmuxReplyChoice(_ key: String, for taskId: String) {
+        guard let s = cmuxRegistry.surface(key: key), s.taskId == taskId else { return }
+        let state = AppState.shared
+        state.cmuxReplyChoice[taskId] = key
+        state.cmuxNotice = nil
+    }
+
+    /// Label, key and role of the agent surfaces of a pill, the main one first.
+    @MainActor
+    func cmuxSurfaces(for taskId: String) -> [CmuxSurfaceInfo] {
+        let list = cmuxRegistry.surfaces(ofTask: taskId)
+        let labels = CmuxRouting.surfaceLabels(titles: list.map { $0.title }, fallback: String(localized: "Session"))
+        let main = cmuxRegistry.surface(for: taskId)?.key
+        return zip(list, labels).map { CmuxSurfaceInfo(key: $0.key, label: $1, isMain: $0.key == main) }
+    }
+
+    /// Surface of the card on screen, else the first queued one, for this pill. nil without a card.
+    @MainActor
+    private func cmuxCardSurfaceKey(for taskId: String) -> String? {
+        if pendingApprovalFD >= 0, AppState.shared.pendingApproval?.pillId == taskId, let k = cmuxShownKey { return k }
+        if pendingQuestionFD >= 0, questionPillId == taskId, let k = cmuxShownKey { return k }
+        return cmuxQueue.cards.first { $0.taskId == taskId }?.surfaceKey
+    }
+
+    /// Where Jump goes: the surface of the card on screen or queued for the pill, else the surface whose
+    /// state is the folded one, else the reply target.
+    @MainActor
+    func cmuxJumpTarget(for taskId: String) -> CmuxSurface? {
+        if let key = cmuxCardSurfaceKey(for: taskId), let s = cmuxRegistry.surface(key: key), s.taskId == taskId { return s }
+        if let fold = cmuxRegistry.foldedState(ofTask: taskId), fold != "idle",
+           let s = cmuxRegistry.surfaces(ofTask: taskId).first(where: { $0.state == fold }) { return s }
+        return cmuxReplyTarget(for: taskId).flatMap { cmuxRegistry.surface(key: $0) }
+    }
+
+    /// Name of the session the card on screen belongs to, when its workspace has several. nil otherwise.
+    @MainActor
+    var cmuxCardOrigin: String? {
+        guard let key = cmuxShownKey, let s = cmuxRegistry.surface(key: key) else { return nil }
+        let list = cmuxSurfaces(for: s.taskId)
+        guard list.count > 1 else { return nil }
+        return list.first { $0.key == key }?.label
+    }
+
+    /// True while a dialog Coucou gave back to the terminal (or a session Coucou never heard from) may still
+    /// be open for this surface.
+    @MainActor
+    func cmuxDialogMayBeOpen(key: String) -> Bool { cmuxOpenDialogs[key] != nil }
 
     /// The "Answered" click of the reply view: the user says the request is gone. Explicit action only.
     @MainActor
-    func clearCmuxDialogMark(_ taskId: String) { cmuxOpenDialogs[taskId] = nil }
+    func clearCmuxDialogMark(key: String) { cmuxOpenDialogs[key] = nil }
 
-    /// The one gate for typing into a session: no card, no dialog that may be open, not in approval/question.
+    /// The one gate for typing into a surface: proof that it runs an agent session (it reported in with a token),
+    /// no card of its own, no dialog that may be open, not in approval or question. Evaluated per target
+    /// surface: a card of another session does not block it.
     @MainActor
-    func cmuxCanSend(_ taskId: String) -> Bool {
-        let task = AppState.shared.tasks.first { $0.id == taskId }
-        return CmuxRouting.canSend(state: task?.state.rawValue ?? "",
-                                   holdsCard: cmuxTaskHoldsCard(taskId),
-                                   dialogMayBeOpen: cmuxOpenDialogs[taskId] != nil)
+    func cmuxCanSend(key: String) -> Bool {
+        guard let s = cmuxRegistry.surface(key: key), s.canType else { return false }
+        return CmuxRouting.canSend(state: s.state,
+                                   holdsCard: cmuxSurfaceHoldsCard(key),
+                                   dialogMayBeOpen: cmuxOpenDialogs[key] != nil)
     }
 
     @MainActor
-    private func markCmuxDialogOpen(_ taskId: String, tool: String, inputKey: String?) {
-        guard CmuxRouting.isCmuxTaskId(taskId) else { return }
-        cmuxOpenDialogs[taskId] = CmuxRouting.DialogMark(tool: tool, inputKey: inputKey)
+    private func markCmuxDialogOpen(_ key: String?, tool: String, inputKey: String?) {
+        guard let key else { return }
+        cmuxOpenDialogs[key] = CmuxRouting.DialogMark(tool: tool, inputKey: inputKey)
     }
 
     @MainActor
     private func markCmuxDialogOpen(from held: CmuxHeld) {
         if held.parsed != nil {
-            markCmuxDialogOpen(held.taskId, tool: "AskUserQuestion", inputKey: nil)
+            markCmuxDialogOpen(held.surfaceKey, tool: "AskUserQuestion", inputKey: nil)
         } else {
-            markCmuxDialogOpen(held.taskId, tool: held.payload["tool_name"] as? String ?? "Tool",
+            markCmuxDialogOpen(held.surfaceKey, tool: held.payload["tool_name"] as? String ?? "Tool",
                                inputKey: Self.approvalInputKey(held.payload["tool_input"] as? [String: Any] ?? [:]))
         }
+    }
+
+    /// Surface key of the cmux card on screen.
+    @MainActor
+    private var cmuxShownKey: String? {
+        cmuxShownPayload.flatMap { CmuxRouting.surfaceKey(payload: $0) }
     }
 
     /// Remembers a "New chat" until the SessionStart of its surface arrives, or 90 s pass.
@@ -1264,7 +1475,7 @@ final class HookServer: @unchecked Sendable {
     /// The cmux fields are validated as one unit; when one fails the whole context is dropped.
     @MainActor
     private func noteCmuxContext(payload: [String: Any], token: String) {
-        guard let id = CmuxRouting.taskId(payload: payload) else { return }
+        guard let id = cmuxRoutedTaskId(payload: payload), let key = CmuxRouting.surfaceKey(payload: payload) else { return }
         let rawAgent = payload["coucou_agent"] as? String ?? ""
         guard Self.validateAgent(rawAgent) == nil else { return }
         let bundleId = (payload["bundle_id"] as? String ?? "").lowercased()
@@ -1277,13 +1488,17 @@ final class HookServer: @unchecked Sendable {
             ? "AskUserQuestion" : (payload["hook_event_name"] as? String ?? "")
         let taskIsLive = AppState.shared.tasks.contains { $0.id == id }
         guard CmuxRouting.mayRegister(event: event, taskIsLive: taskIsLive) else { return }
+        // The surface speaks again: a discovery may see it (a SessionEnd sets this again right after).
+        cmuxEndedAt[key] = nil
 
         let surfaceId = payload["cmux_surface_id"] as? String ?? ""
         let workspaceId = payload["cmux_workspace_id"] as? String ?? ""
         let socketPath = payload["cmux_socket_path"] as? String ?? ""
         let valid = CmuxRouting.isValidContext(surfaceId: surfaceId, workspaceId: workspaceId,
                                                socketPath: socketPath, capability: token)
-        let accepted = cmuxRegistry.note(taskId: id,
+        var hadToken = false
+        if case .token = cmuxRegistry.credential(for: nil, hasPassword: false) { hadToken = true }
+        let accepted = cmuxRegistry.note(taskId: id, key: key,
                           surfaceId: valid ? surfaceId : "",
                           workspaceId: valid ? workspaceId : "",
                           socketPath: valid ? socketPath : "",
@@ -1294,14 +1509,18 @@ final class HookServer: @unchecked Sendable {
             // One line per task, no id, path or token.
             nbLog("cmux: a session reported another socket path, kept the stored one")
         }
-        pruneStaleCmux()
+        // The first usable token, or a session never heard before: the workspaces may be unknown to us.
+        var hasToken = false
+        if case .token = cmuxRegistry.credential(for: nil, hasPassword: false) { hasToken = true }
+        if cmuxRegistry.lastNoteCreated { AppState.shared.cmuxRevision &+= 1 }
+        if (hasToken && !hadToken) || cmuxRegistry.lastNoteCreated { requestCmuxDiscovery() }
     }
 
     /// cmux cards wait for the card slot.
     @MainActor
     var hasQueuedCmuxCards: Bool { !cmuxQueue.cards.isEmpty }
 
-    /// True when the task has a queued card or owns the card on screen.
+    /// True when the pill has a queued card or owns the card on screen.
     @MainActor
     private func cmuxTaskHoldsCard(_ taskId: String) -> Bool {
         if cmuxQueue.hasCards(for: taskId) { return true }
@@ -1310,63 +1529,143 @@ final class HookServer: @unchecked Sendable {
         return false
     }
 
-    /// Drops registry entries not seen for 30 minutes, with their task, whatever its state.
+    /// True when the surface has a queued card or owns the card on screen.
+    @MainActor
+    func cmuxSurfaceHoldsCard(_ key: String) -> Bool {
+        if cmuxQueue.hasCards(forSurface: key) { return true }
+        if pendingApprovalFD >= 0 || pendingQuestionFD >= 0, cmuxShownKey == key { return true }
+        return false
+    }
+
+    /// Records the state of a surface and writes the pill's folded state (written only when it changes).
+    /// A surface without a registry entry (past the cap, or just gone) has no state of its own and never
+    /// writes the pill's.
+    @MainActor
+    private func setCmuxSurfaceState(taskId: String, key: String, _ newState: BotState) {
+        guard cmuxRegistry.surface(key: key) != nil else { return }
+        cmuxRegistry.setState(key: key, newState.rawValue)
+        refoldCmuxTask(taskId)
+    }
+
+    /// Pill state = fold of its surfaces' states. The badge goes when the fold is idle.
+    @MainActor
+    private func refoldCmuxTask(_ taskId: String) {
+        let state = AppState.shared
+        guard let raw = cmuxRegistry.foldedState(ofTask: taskId), let fold = BotState(rawValue: raw),
+              let idx = state.tasks.firstIndex(where: { $0.id == taskId }) else { return }
+        if state.tasks[idx].state != fold { state.tasks[idx].state = fold }
+        if fold == .idle, state.tasks[idx].pillBadge != nil { state.tasks[idx].pillBadge = nil }
+    }
+
+    /// 5 s after a Stop: a surface still `finished` goes idle, and the pill with it when nothing else shows
+    /// a state. A surface that moved on meanwhile (a new prompt) keeps its state.
+    @MainActor
+    private func settleFinishedCmuxSurface(taskId: String, key: String) {
+        guard !cmuxSurfaceHoldsCard(key), let s = cmuxRegistry.surface(key: key),
+              s.state == BotState.finished.rawValue else { return }
+        setCmuxSurfaceState(taskId: taskId, key: key, .idle)
+    }
+
+    /// The step prefix of a session that is not the main one of a workspace with several: `<label> · `.
+    @MainActor
+    private func cmuxStepPrefix(forKey key: String) -> String {
+        guard let s = cmuxRegistry.surface(key: key) else { return "" }
+        let list = cmuxSurfaces(for: s.taskId)
+        guard list.count > 1, let me = list.first(where: { $0.key == key }), !me.isMain else { return "" }
+        return me.label + " · "
+    }
+
+    /// Drops the registry entries not seen for 30 minutes, whatever their state, except the protected ones. An
+    /// entry whose process the last discovery found alive in the cmux session file is never subject (an idle
+    /// workspace stays); one whose process is gone is, so a session that died without a SessionEnd does not stay
+    /// an agent for as long as its terminal tab exists (see `CmuxRouting.timeRuleApplies`).
     @MainActor
     private func pruneStaleCmux() {
         let state = AppState.shared
         let protected = CmuxRouting.pruneProtected(
-            holdingCard: Set(cmuxRegistry.surfaces.keys.filter { cmuxTaskHoldsCard($0) }),
+            holdingCard: Set(cmuxRegistry.taskIds.filter { cmuxTaskHoldsCard($0) }),
             openReplyTask: openCmuxReplyTask())
         let busy = Set(state.tasks.filter {
             CmuxRouting.isCmuxTaskId($0.id) && [.working, .thinking, .searching].contains($0.state)
         }.map { $0.id })
-        for stale in cmuxRegistry.staleTaskIds(now: Date().timeIntervalSinceReferenceDate, protected: protected, busy: busy) {
-            let wasFocused = state.focusId == stale
-            state.clearSessionDiffs(for: stale)
-            state.removeTask(id: stale)
-            forgetCmuxTask(stale, wasFocused: wasFocused)
+        let treeKnown = cmuxTreeKnown
+        let liveKeys = cmuxLiveSessionKeys
+        for stale in cmuxRegistry.staleTaskIds(now: Date().timeIntervalSinceReferenceDate, protected: protected, busy: busy,
+                                               only: { CmuxRouting.timeRuleApplies(entry: $0, treeKnown: treeKnown, liveKeys: liveKeys) }) {
+            // Focus moves on to the next session when the pill that goes was the focused one.
+            forgetCmuxSurface(stale, wasFocused: state.focusId == cmuxRegistry.surface(key: stale)?.taskId)
         }
     }
 
-    /// Reads the tab title and the git branch of a session. Called on task creation and on SessionStart,
+    /// Reads the git branch of the main session of a pill. Called on task creation and on SessionStart,
     /// UserPromptSubmit and Stop only, at most once every few seconds per task: no timer, no polling.
-    /// The title is untrusted text, cleaned in `CmuxRouting`. Without a title the folder name stays.
+    /// Only the main surface speaks for the pill (a helper may work in another folder). The title is not
+    /// read here: discovery gives the workspace title.
     @MainActor
-    private func refreshCmuxMeta(taskId: String, cwd: String) {
+    private func refreshCmuxMeta(taskId: String, cwd: String, key: String?) {
+        if let key, let main = cmuxRegistry.surface(for: taskId)?.key, main != key { return }
         let now = Date().timeIntervalSinceReferenceDate
         guard CmuxRouting.metaRefreshDue(last: cmuxMetaAt[taskId], now: now) else { return }
         cmuxMetaAt[taskId] = now
         let folder = cwd.isEmpty ? (AppState.shared.tasks.first { $0.id == taskId }?.sessionCwd ?? "") : cwd
-        CmuxControl.fetchMeta(surface: cmuxRegistry.surface(for: taskId), cwd: folder) { [weak self] title, branch in
-            guard let self else { return }
+        CmuxControl.fetchBranch(cwd: folder) { branch in
             let state = AppState.shared
             guard let idx = state.tasks.firstIndex(where: { $0.id == taskId }) else { return }
             // Written only when changed: every write republishes `tasks`.
-            if let title {
-                self.cmuxTitles[taskId] = title
-                // Two live sessions with the same title get the numeric suffix, like folder names.
-                let existing = state.tasks.filter { CmuxRouting.isCmuxTaskId($0.id) }.map { (id: $0.id, name: $0.name) }
-                let name = CmuxRouting.displayName(base: title, taskId: taskId, existing: existing)
-                if state.tasks[idx].name != name { state.tasks[idx].name = name }
-            }
             let subtitle = CmuxRouting.folderLine(cwd: folder, branch: branch)
             if state.tasks[idx].subtitle != subtitle { state.tasks[idx].subtitle = subtitle }
         }
     }
 
-    /// Everything tied to a cmux task that is gone (SessionEnd, stale prune, eviction): registry entry,
-    /// queued cards, transcript, the reply view of that session, and where focus goes next.
+    /// Everything tied to one cmux session that is gone: registry entry, queued cards, transcript, dialog
+    /// mark, the reply target that pointed at it. The pill goes with its last session.
+    @MainActor
+    private func forgetCmuxSurface(_ key: String, wasFocused: Bool) {
+        guard let s = cmuxRegistry.surface(key: key) else { return }
+        let state = AppState.shared
+        let taskId = s.taskId
+        if cmuxRegistry.surfaces(ofTask: taskId).count <= 1 {
+            state.clearSessionDiffs(for: taskId)
+            state.removeTask(id: taskId)
+            forgetCmuxTask(taskId, wasFocused: wasFocused)
+            return
+        }
+        cmuxRegistry.remove(key: key)
+        cleanupCmuxSurface(key, taskId: taskId)
+        refoldCmuxTask(taskId)
+        // The final line goes only when it was this session's: another session's answer stays on the pill.
+        if cmuxFinalLineKey[taskId] == key {
+            cmuxFinalLineKey[taskId] = nil
+            if let idx = state.tasks.firstIndex(where: { $0.id == taskId }) { state.tasks[idx].finalLine = nil }
+        }
+        state.cmuxRevision &+= 1
+    }
+
+    @MainActor
+    private func cleanupCmuxSurface(_ key: String, taskId: String) {
+        let state = AppState.shared
+        for cardId in cmuxQueue.removeAll(surfaceKey: key) { dropCmuxHeld(cardId, leftOpen: false) }
+        cmuxOpenDialogs[key] = nil
+        state.cmuxTranscripts[key] = nil
+        if state.cmuxReplyChoice[taskId] == key { state.cmuxReplyChoice[taskId] = nil }
+    }
+
+    /// Everything tied to a cmux pill that is gone (last SessionEnd, stale prune, eviction, closed workspace):
+    /// its registry entries, queued cards, transcripts, the reply view of that pill, and where focus goes next.
     @MainActor
     private func forgetCmuxTask(_ id: String, wasFocused: Bool) {
         let state = AppState.shared
-        let candidates = cmuxRegistry.surfaces.values.filter { $0.taskId != id }.map { (id: $0.taskId, lastSeen: $0.lastSeen) }
+        let candidates = cmuxRegistry.taskIds.filter { $0 != id }.map { (id: $0, lastSeen: cmuxRegistry.pillLastSeen($0) ?? 0) }
+        let keys = cmuxRegistry.surfaces(ofTask: id).map { $0.key }
         cmuxRegistry.remove(taskId: id)
+        for key in keys { cleanupCmuxSurface(key, taskId: id) }
         for cardId in cmuxQueue.removeAll(taskId: id) { dropCmuxHeld(cardId, leftOpen: false) }
-        cmuxOpenDialogs[id] = nil
+        state.cmuxReplyChoice[id] = nil
         cmuxMetaAt[id] = nil
         cmuxTitles[id] = nil
+        cmuxFinalLineKey[id] = nil
         cmuxRefusedLogged.remove(id)
-        state.cmuxTranscripts[id] = nil
+        state.cmuxRevision &+= 1
         if state.cmuxPrompt == .reply(taskId: id) {
             state.cmuxPrompt = nil
             state.cmuxNotice = nil
@@ -1387,31 +1686,40 @@ final class HookServer: @unchecked Sendable {
         return nil
     }
 
-    /// Adds a message to the session transcript, keeping the last `maxTranscript`.
+    /// Adds a message to the transcript of a session, keeping the last `maxTranscript`.
     @MainActor
-    private func appendCmuxMessage(_ taskId: String, role: ChatRole, text: String, limit: Int) {
+    private func appendCmuxMessage(_ key: String?, role: ChatRole, text: String, limit: Int) {
+        guard let key else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let state = AppState.shared
-        var list = state.cmuxTranscripts[taskId] ?? []
+        var list = state.cmuxTranscripts[key] ?? []
         list.append(ChatMessage(role: role, content: String(trimmed.prefix(limit))))
         if list.count > CmuxRouting.maxTranscript { list.removeFirst(list.count - CmuxRouting.maxTranscript) }
-        state.cmuxTranscripts[taskId] = list
+        state.cmuxTranscripts[key] = list
     }
 
     /// A new chat started by the user: when its surface reports in, type the first prompt.
     /// The automatic send needs the workspace UUID and the socket path of the launch to match. When the
     /// workspace could not be resolved, a task in the same folder is only focused and the prompt goes
     /// to the Reply field as a draft: the user presses Send.
+    /// The new workspace is a new pill; its first session is the main one and gets the prompt.
     @MainActor
-    private func handleCmuxSessionStart(agentId: String, payload: [String: Any], cwd: String) {
-        guard let pending = cmuxPendingLaunch else { return }
+    private func handleCmuxSessionStart(agentId: String, key: String?, payload: [String: Any], cwd: String) {
+        guard let pending = cmuxPendingLaunch, let key else { return }
+        // Only a hook event with a valid token for this very surface can claim the launch, and with it the first
+        // prompt that is typed without a click. A tokenless event (or one made up) neither matches nor uses up
+        // the launch: the real session still can.
+        guard cmuxRegistry.surface(key: key)?.canType == true else { return }
         let workspace = payload["cmux_workspace_id"] as? String ?? ""
         let socket = payload["cmux_socket_path"] as? String ?? ""
         let now = Date().timeIntervalSinceReferenceDate
+        // New = the first hook event of this surface that carried a token (discovery may have registered the
+        // surface before its SessionStart).
+        let isNewSession = cmuxRegistry.lastNoteFirstHeard
         let exact = pending.matches(workspaceId: workspace, socketPath: socket,
-                                    isNewTask: cmuxLastUpsertCreated, now: now)
-        let byFolder = !exact && pending.matchesFolder(cwd: cwd, isNewTask: cmuxLastUpsertCreated, now: now)
+                                    isNewTask: isNewSession, now: now)
+        let byFolder = !exact && pending.matchesFolder(cwd: cwd, isNewTask: isNewSession, now: now)
         guard exact || byFolder else { return }
         cmuxPendingLaunch = nil
         let state = AppState.shared
@@ -1420,6 +1728,7 @@ final class HookServer: @unchecked Sendable {
                                           promptIsNewChat: state.cmuxPrompt == .newChat) {
             state.setFocus(agentId)
             state.cmuxPrompt = .reply(taskId: agentId)
+            state.cmuxReplyChoice[agentId] = key
         }
         state.cmuxNotice = nil
         let prompt = pending.prompt
@@ -1431,7 +1740,7 @@ final class HookServer: @unchecked Sendable {
         }
         // Gives the claude TUI time to take input. The one and only deferred send.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            CmuxControl.send(text: prompt, to: agentId) { failure in
+            CmuxControl.send(text: prompt, to: agentId, surfaceKey: key) { failure in
                 guard let failure else { return }
                 AppState.shared.showCmuxFailure(failure)
                 if failure != .enterNotSent {
@@ -1441,38 +1750,31 @@ final class HookServer: @unchecked Sendable {
         }
     }
 
-    /// One task per cmux surface. Generic overview card, no dedicated view.
+    /// One pill per cmux workspace. Generic overview card, no dedicated view.
+    /// `key` is the session that sent the event: only the main one speaks for the folder line and the
+    /// working folder, and the workspace title (from discovery) is the name once known.
     @MainActor
-    private func upsertCmuxTask(id: String, projectName: String, cwd: String) {
+    private func upsertCmuxTask(id: String, projectName rawProjectName: String, cwd: String, key: String?) {
         let state = AppState.shared
-        let existing = state.tasks.filter { CmuxRouting.isCmuxTaskId($0.id) }.map { (id: $0.id, name: $0.name) }
-        // The cmux tab title is the name; the folder based name (suffixed ` 2`, ` 3`) is only the fallback.
-        let name = CmuxRouting.displayName(base: cmuxTitles[id] ?? projectName, taskId: id, existing: existing)
-        cmuxLastUpsertCreated = false
+        // The folder name comes from the hook payload: cleaned like the titles that come from the tree.
+        let projectName = CmuxRouting.cleanLabel(rawProjectName) ?? String(localized: "Session")
         if let idx = state.tasks.firstIndex(where: { $0.id == id }) {
-            if state.tasks[idx].name != name { state.tasks[idx].name = name }
-            if !cwd.isEmpty { state.tasks[idx].sessionCwd = cwd }
+            // The workspace title is the name; without one the name set at creation stays.
+            if let title = cmuxTitles[id] {
+                let name = CmuxRouting.displayName(base: title, taskId: id, existing: cmuxPillNames())
+                if state.tasks[idx].name != name { state.tasks[idx].name = name }
+            }
+            let isMain = key == nil || cmuxRegistry.surface(for: id)?.key == key || state.tasks[idx].sessionCwd == nil
+            if isMain, !cwd.isEmpty, state.tasks[idx].sessionCwd != cwd { state.tasks[idx].sessionCwd = cwd }
             return
         }
-        cmuxLastUpsertCreated = true
-        var task = AgentTask(id: id, name: name, color: IslandConst.colorForProject(projectName),
-                             state: .idle, steps: [], source: .claudeCode)
-        if !cwd.isEmpty { task.sessionCwd = cwd }
-        task.subtitle = CmuxRouting.folderLine(cwd: cwd, branch: nil)
-        // Distinct, stable look per session: colour and eye from the surface key, colour probed against live ones.
-        let taken = Set(state.tasks.filter { CmuxRouting.isCmuxTaskId($0.id) }.map { $0.color })
-        let look = CmuxRouting.appearance(key: String(id.dropFirst(CmuxRouting.taskPrefix.count)), takenColors: taken)
-        task.color = look.color
-        if look.eye != "pill" { task.miniEye = EyeShape(rawValue: look.eye) }
+        let name = CmuxRouting.displayName(base: cmuxTitles[id] ?? projectName, taskId: id, existing: cmuxPillNames())
+        var task = makeCmuxPill(id: id, name: name, cwd: cwd)
+        task.sessionCwd = cwd.isEmpty ? nil : cwd
+        insertCmuxPill(task)
         if CmuxRouting.isExistingFolder(cwd) {
             state.cmuxRecentFolders = CmuxRouting.recentFolders(adding: cwd, to: state.cmuxRecentFolders)
         }
-        if let mainIdx = state.tasks.firstIndex(where: { $0.id == state.mainPillId }) {
-            state.tasks.insert(task, at: mainIdx + 1)
-        } else {
-            state.tasks.insert(task, at: 0)
-        }
-        state.placeHermesPills()   // Hermes agent pills stay right after the main pill, ahead of sessions
         if state.focusId == nil { state.focusId = id }
         let viewAllowsSteal = state.cmuxPrompt == nil
             && (state.mode != .expanded || state.view == .overview || state.view == .empty)
@@ -1481,12 +1783,12 @@ final class HookServer: @unchecked Sendable {
             state.setFocus(id)
         }
         state.syncMode()
-        refreshCmuxMeta(taskId: id, cwd: cwd)
+        refreshCmuxMeta(taskId: id, cwd: cwd, key: key)
 
         pruneStaleCmux()
-        // Registry entries whose task is gone (late event after SessionEnd) must not count toward the cap.
+        // Registry entries whose pill is gone (late event after SessionEnd) must not count toward the cap.
         let live = Set(state.tasks.map { $0.id })
-        for stale in cmuxRegistry.surfaces.keys where !live.contains(stale) { cmuxRegistry.remove(taskId: stale) }
+        for stale in cmuxRegistry.taskIds where !live.contains(stale) { cmuxRegistry.remove(taskId: stale) }
         let idle = CmuxRouting.evictableIdle(
             Set(state.tasks.filter { CmuxRouting.isCmuxTaskId($0.id) && $0.state == .idle }.map { $0.id }),
             openReplyTask: openCmuxReplyTask())
@@ -1498,17 +1800,205 @@ final class HookServer: @unchecked Sendable {
         }
     }
 
+    @MainActor
+    private func cmuxPillNames() -> [(id: String, name: String)] {
+        AppState.shared.tasks.filter { CmuxRouting.isCmuxTaskId($0.id) }.map { (id: $0.id, name: $0.name) }
+    }
+
+    /// A workspace pill: distinct, stable colour and eye from its key, colour probed against the live ones.
+    @MainActor
+    private func makeCmuxPill(id: String, name: String, cwd: String) -> AgentTask {
+        let state = AppState.shared
+        var task = AgentTask(id: id, name: name, color: IslandConst.colorForProject(name),
+                             state: .idle, steps: [], source: .claudeCode)
+        task.subtitle = CmuxRouting.folderLine(cwd: cwd, branch: nil)
+        let taken = Set(state.tasks.filter { CmuxRouting.isCmuxTaskId($0.id) }.map { $0.color })
+        let look = CmuxRouting.appearance(key: String(id.dropFirst(CmuxRouting.taskPrefix.count)), takenColors: taken)
+        task.color = look.color
+        if look.eye != "pill" { task.miniEye = EyeShape(rawValue: look.eye) }
+        return task
+    }
+
+    /// Right after the main pill, then the Hermes pills ahead of it.
+    @MainActor
+    private func insertCmuxPill(_ task: AgentTask) {
+        let state = AppState.shared
+        if let mainIdx = state.tasks.firstIndex(where: { $0.id == state.mainPillId }) {
+            state.tasks.insert(task, at: mainIdx + 1)
+        } else {
+            state.tasks.insert(task, at: 0)
+        }
+        state.placeHermesPills()   // Hermes agent pills stay right after the main pill, ahead of sessions
+    }
+
+    // MARK: cmux discovery (workspaces, titles, sessions)
+
+    /// Asks for a discovery: the cmux tree and the cmux session file, read once. Triggers only (a session
+    /// reported in, a SessionStart / SessionEnd / prompt / Stop, the island expanding, cmux launched or
+    /// activated, app start): no timer, no polling. At most one run at a time and one every 5 s; a request
+    /// that cannot run yet is kept as one single delayed run.
+    @MainActor
+    func requestCmuxDiscovery() {
+        let now = Date().timeIntervalSinceReferenceDate
+        if cmuxDiscoveryInFlight { cmuxDiscoveryRerun = true; return }
+        guard CmuxRouting.discoveryDue(last: cmuxDiscoveryLast, now: now, inFlight: false) else {
+            let wait = CmuxRouting.discoveryInterval - (now - (cmuxDiscoveryLast ?? now))
+            deferCmuxDiscovery(after: max(0.2, wait))
+            return
+        }
+        cmuxDiscoveryLast = now
+        cmuxDiscoveryInFlight = true
+        cmuxDiscoveryRerun = false
+        // A token only: the stored password is for the New chat the user starts, never for a background read, and
+        // a tree read without a peer checked socket must not decide what exists. Without a token the pills come
+        // from the session file alone.
+        let credential = cmuxRegistry.credential(for: nil, hasPassword: false)
+        CmuxControl.fetchSnapshot(credential: credential, startedAt: now) { [weak self] snapshot in
+            guard let self else { return }
+            self.cmuxDiscoveryInFlight = false
+            self.applyCmuxSnapshot(snapshot)
+            if self.cmuxDiscoveryRerun {
+                self.cmuxDiscoveryRerun = false
+                self.deferCmuxDiscovery(after: CmuxRouting.discoveryInterval)
+            }
+        }
+    }
+
+    @MainActor
+    private func deferCmuxDiscovery(after delay: TimeInterval) {
+        guard !cmuxDiscoveryDeferred else { return }
+        cmuxDiscoveryDeferred = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            MainActor.assumeIsolated {
+                self?.cmuxDiscoveryDeferred = false
+                self?.requestCmuxDiscovery()
+            }
+        }
+    }
+
+    /// Applies what one discovery found: surfaces and pills appear, get their workspace title, vanish when
+    /// the tree says they are gone. Never moves focus, never opens the island, never sets a token. Surfaces it
+    /// registers are not typing targets: only a hook event with a token makes one (`CmuxSurface.canType`).
+    /// Order: what exists is added first (a pill the plan keeps is never destroyed and created again), then
+    /// the surfaces and pills the tree no longer has go.
+    @MainActor
+    private func applyCmuxSnapshot(_ snapshot: CmuxSnapshot) {
+        let state = AppState.shared
+        let now = Date().timeIntervalSinceReferenceDate
+        cmuxTreeKnown = snapshot.tree != nil
+        cmuxLiveSessionKeys = snapshot.sessions.map { Set($0.map { CmuxRouting.sanitize($0.surfaceId) }) }
+        cmuxEndedAt = cmuxEndedAt.filter { now - $0.value < CmuxRouting.endedGrace * 6 }
+        let protected = CmuxRouting.pruneProtected(
+            holdingCard: Set(cmuxRegistry.taskIds.filter { cmuxTaskHoldsCard($0) }),
+            openReplyTask: openCmuxReplyTask())
+        let plan = CmuxRouting.reconcile(snapshot: snapshot, entries: Array(cmuxRegistry.surfaces.values),
+                                         protected: protected, ended: cmuxEndedAt)
+        var membershipChanged = false
+
+        for ws in plan.workspaces {
+            if snapshot.tree != nil { cmuxTitles[ws.taskId] = ws.title }   // a title removed in cmux goes too
+            else if let title = ws.title { cmuxTitles[ws.taskId] = title }
+            var registered = false
+            for sf in ws.surfaces {
+                // A surface of a pill in use (a card, the open reply view) stays where it is.
+                if let known = cmuxRegistry.surface(key: sf.key), known.taskId != ws.taskId,
+                   protected.contains(known.taskId) { continue }
+                let before = cmuxRegistry.surface(key: sf.key)
+                guard cmuxRegistry.noteDiscovered(taskId: ws.taskId, key: sf.key, surfaceId: sf.surfaceId,
+                                                  workspaceId: ws.workspaceId, socketPath: snapshot.socketPath,
+                                                  sessionId: sf.sessionId, title: sf.title, index: sf.index,
+                                                  startedAt: sf.startedAt, now: now) else { continue }
+                registered = true
+                if before == nil || before?.taskId != ws.taskId { membershipChanged = true }
+                // A session Coucou never heard from may sit on an open permission dialog, whatever its file says:
+                // Send stays off until a turn level hook event or the "Answered" click. Discovery only sets the
+                // mark, it never clears one.
+                if cmuxRegistry.surface(key: sf.key)?.heard != true, CmuxRouting.needsDialogMark(heard: false),
+                   cmuxOpenDialogs[sf.key] == nil {
+                    cmuxOpenDialogs[sf.key] = CmuxRouting.DialogMark(tool: "", inputKey: nil)
+                }
+            }
+            let folder = ws.cwd
+            if let idx = state.tasks.firstIndex(where: { $0.id == ws.taskId }) {
+                if let title = cmuxTitles[ws.taskId] {
+                    let name = CmuxRouting.displayName(base: title, taskId: ws.taskId, existing: cmuxPillNames())
+                    if state.tasks[idx].name != name { state.tasks[idx].name = name }
+                }
+                if state.tasks[idx].sessionCwd == nil, !folder.isEmpty { state.tasks[idx].sessionCwd = folder }
+                if state.tasks[idx].subtitle == nil, let line = CmuxRouting.folderLine(cwd: folder, branch: nil) {
+                    state.tasks[idx].subtitle = line
+                }
+            } else if registered {
+                // A pill exists only with a surface under it.
+                let fallback = aliasProjectName(CmuxRouting.folderPillName(cwd: folder, fallback: String(localized: "Session")))
+                let base = cmuxTitles[ws.taskId] ?? fallback
+                let name = CmuxRouting.displayName(base: base, taskId: ws.taskId, existing: cmuxPillNames())
+                var task = makeCmuxPill(id: ws.taskId, name: name, cwd: folder)
+                task.sessionCwd = folder.isEmpty ? nil : folder
+                insertCmuxPill(task)
+                if !folder.isEmpty { refreshCmuxMeta(taskId: ws.taskId, cwd: folder, key: nil) }
+                membershipChanged = true
+            }
+        }
+
+        for key in plan.removeKeys where cmuxRegistry.surface(key: key) != nil {
+            forgetCmuxSurface(key, wasFocused: state.focusId == cmuxRegistry.surface(key: key)?.taskId)
+            membershipChanged = true
+        }
+        // Pills the plan does not keep, once nothing is filed under them (their surfaces were removed or moved).
+        for task in plan.removeTasks where cmuxRegistry.surfaces(ofTask: task).isEmpty
+            && (state.tasks.contains(where: { $0.id == task }) || cmuxRegistry.taskIds.contains(task)) {
+            let wasFocused = state.focusId == task
+            state.clearSessionDiffs(for: task)
+            state.removeTask(id: task)
+            forgetCmuxTask(task, wasFocused: wasFocused)
+            membershipChanged = true
+        }
+
+        // cmux pills follow the workspace order of the sidebar, ahead of the sessions that are not in the plan.
+        orderCmuxPills(plan.workspaces.map { $0.taskId })
+
+        // Entries without a live process behind them: the time rule.
+        pruneStaleCmux()
+        if membershipChanged { state.cmuxRevision &+= 1 }
+    }
+
+    /// The cmux pills in sidebar order (those of the plan first), kept as one block where they already are.
+    @MainActor
+    private func orderCmuxPills(_ planned: [String]) {
+        let state = AppState.shared
+        let cmux = state.tasks.filter { CmuxRouting.isCmuxTaskId($0.id) }
+        guard cmux.count > 1 else { return }
+        let rank = Dictionary(planned.enumerated().map { ($1, $0) }, uniquingKeysWith: { a, _ in a })
+        let ordered = cmux.enumerated().sorted { a, b in
+            let ra = rank[a.element.id] ?? Int.max, rb = rank[b.element.id] ?? Int.max
+            return ra != rb ? ra < rb : a.offset < b.offset
+        }.map { $0.element }
+        guard ordered.map({ $0.id }) != cmux.map({ $0.id }) else { return }
+        var result: [AgentTask] = []
+        var placed = false
+        for t in state.tasks {
+            if CmuxRouting.isCmuxTaskId(t.id) {
+                if !placed { result.append(contentsOf: ordered); placed = true }
+            } else {
+                result.append(t)
+            }
+        }
+        state.tasks = result
+    }
+
     // MARK: cmux card queue
 
     /// Holds the hook's fd open and silent; the card is shown when it reaches the head of the queue.
     @MainActor
     private func enqueueCmuxCard(kind: CmuxCardKind, fd: Int32, payload: [String: Any], parsed: AskQuestion?,
-                                 taskId: String, sessionId: String, tool: String, inputKey: String,
+                                 taskId: String, surfaceKey: String, sessionId: String, tool: String, inputKey: String,
                                  atFront: Bool = false, arrivedAt: TimeInterval? = nil) {
         let state = AppState.shared
         let now = Date().timeIntervalSinceReferenceDate
         let id = cmuxQueue.enqueue(kind: kind, taskId: taskId, sessionId: sessionId, tool: tool,
-                                   inputKey: inputKey, now: now, atFront: atFront, arrivedAt: arrivedAt)
+                                   inputKey: inputKey, now: now, atFront: atFront, arrivedAt: arrivedAt,
+                                   surfaceKey: surfaceKey)
         // The read source fires when the hook goes away; its cancel handler is the only place the fd is closed.
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
         source.setEventHandler { [weak self] in
@@ -1522,12 +2012,14 @@ final class HookServer: @unchecked Sendable {
         }
         source.setCancelHandler { close(fd) }
         source.resume()
-        cmuxHeld[id] = CmuxHeld(fd: fd, source: source, taskId: taskId, payload: payload, parsed: parsed)
+        cmuxHeld[id] = CmuxHeld(fd: fd, source: source, taskId: taskId, surfaceKey: surfaceKey,
+                                payload: payload, parsed: parsed)
 
         let cwd = payload["cwd"] as? String ?? ""
         let rawName = URL(fileURLWithPath: cwd).lastPathComponent
-        upsertWorkspaceTask(id: taskId, projectName: aliasProjectName(rawName.isEmpty ? String(localized: "Session") : rawName), cwd: cwd)
-        state.updateTask(id: taskId, state: kind == .approval ? .approval : .question)
+        upsertWorkspaceTask(id: taskId, projectName: aliasProjectName(rawName.isEmpty ? String(localized: "Session") : rawName),
+                            cwd: cwd, cmuxKey: surfaceKey)
+        setCmuxSurfaceState(taskId: taskId, key: surfaceKey, kind == .approval ? .approval : .question)
         setPillBadge(id: taskId, badge: .approval)
         nbLog("\(kind == .approval ? "PermissionRequest" : "AskUserQuestion") \(tool) [\(taskId)] queued")
 
@@ -1541,16 +2033,16 @@ final class HookServer: @unchecked Sendable {
         held.source.cancel()
         if leftOpen { markCmuxDialogOpen(from: held) }
         cmuxQueue.remove(id: id)
-        releaseCmuxTaskIfSettled(held.taskId)
+        releaseCmuxSurfaceIfSettled(held.taskId, key: held.surfaceKey)
     }
 
-    /// Back to `.working` and no badge once the task has no queued card and owns no card on screen.
+    /// Back to `.working` once the session has no queued card and owns no card on screen; the badge goes
+    /// when the pill holds no card at all.
     @MainActor
-    private func releaseCmuxTaskIfSettled(_ taskId: String) {
-        let state = AppState.shared
-        guard !cmuxTaskHoldsCard(taskId) else { return }
-        state.updateTask(id: taskId, state: .working)
-        clearPillBadge(id: taskId)
+    private func releaseCmuxSurfaceIfSettled(_ taskId: String, key: String) {
+        guard !cmuxSurfaceHoldsCard(key) else { return }
+        if cmuxRegistry.surface(key: key) != nil { setCmuxSurfaceState(taskId: taskId, key: key, .working) }
+        clearPillBadgeUnlessCardHeld(id: taskId)
     }
 
     /// An event resolved queued requests elsewhere (terminal, cmux Feed): drop them silently.
@@ -1559,7 +2051,7 @@ final class HookServer: @unchecked Sendable {
         for id in cmuxQueue.resolve(event: event, sessionId: sessionId, tool: tool, inputKey: inputKey) {
             guard let held = cmuxHeld.removeValue(forKey: id) else { continue }
             held.source.cancel()
-            releaseCmuxTaskIfSettled(held.taskId)
+            releaseCmuxSurfaceIfSettled(held.taskId, key: held.surfaceKey)
         }
     }
 
@@ -1573,7 +2065,7 @@ final class HookServer: @unchecked Sendable {
                 guard let held = cmuxHeld.removeValue(forKey: id) else { continue }
                 held.source.cancel()
                 markCmuxDialogOpen(from: held)
-                releaseCmuxTaskIfSettled(held.taskId)
+                releaseCmuxSurfaceIfSettled(held.taskId, key: held.surfaceKey)
             }
             guard let card = popped.card else { return false }
             guard let held = cmuxHeld.removeValue(forKey: card.id) else { continue }
@@ -1583,10 +2075,10 @@ final class HookServer: @unchecked Sendable {
             held.source.cancel()
             guard fd2 >= 0 else {
                 markCmuxDialogOpen(from: held)
-                releaseCmuxTaskIfSettled(card.taskId)
+                releaseCmuxSurfaceIfSettled(card.taskId, key: card.surfaceKey)
                 continue
             }
-            clearPillBadge(id: card.taskId)
+            clearPillBadgeUnlessCardHeld(id: card.taskId)
             switch card.kind {
             case .approval:
                 processPermissionRequest(fd: fd2, payload: held.payload, arrivedAt: card.arrivedAt)
@@ -1594,7 +2086,7 @@ final class HookServer: @unchecked Sendable {
                 guard let parsed = held.parsed else {
                     close(fd2)
                     markCmuxDialogOpen(from: held)
-                    releaseCmuxTaskIfSettled(card.taskId)
+                    releaseCmuxSurfaceIfSettled(card.taskId, key: card.surfaceKey)
                     continue
                 }
                 processQuestionRequest(fd: fd2, parsed: parsed, payload: held.payload, arrivedAt: card.arrivedAt)
@@ -1613,6 +2105,7 @@ final class HookServer: @unchecked Sendable {
         guard let payload = cmuxShownPayload else { return }
         let state = AppState.shared
         let arrival = cmuxShownArrival
+        let key = CmuxRouting.surfaceKey(payload: payload)
         if pendingApprovalFD >= 0, let info = state.pendingApproval, CmuxRouting.isCmuxTaskId(info.pillId) {
             let fd2 = dup(pendingApprovalFD)
             let source = approvalFDSource
@@ -1622,11 +2115,11 @@ final class HookServer: @unchecked Sendable {
             state.pendingApproval = nil
             if fd2 >= 0 {
                 enqueueCmuxCard(kind: .approval, fd: fd2, payload: payload, parsed: nil, taskId: info.pillId,
-                                sessionId: info.sessionId, tool: info.tool, inputKey: info.inputKey,
-                                atFront: true, arrivedAt: arrival)
+                                surfaceKey: key ?? info.pillId, sessionId: info.sessionId, tool: info.tool,
+                                inputKey: info.inputKey, atFront: true, arrivedAt: arrival)
             } else {
-                markCmuxDialogOpen(info.pillId, tool: info.tool, inputKey: info.inputKey)
-                releaseCmuxTaskIfSettled(info.pillId)
+                markCmuxDialogOpen(key, tool: info.tool, inputKey: info.inputKey)
+                if let key { releaseCmuxSurfaceIfSettled(info.pillId, key: key) }
             }
         } else if pendingQuestionFD >= 0, CmuxRouting.isCmuxTaskId(questionPillId), let parsed = state.pendingQuestion {
             let fd2 = dup(pendingQuestionFD)
@@ -1639,12 +2132,12 @@ final class HookServer: @unchecked Sendable {
             if fd2 >= 0 {
                 let sessionId = payload["session_id"] as? String ?? payload["conversation_id"] as? String ?? "unknown"
                 enqueueCmuxCard(kind: .question, fd: fd2, payload: payload, parsed: parsed, taskId: questionPillId,
-                                sessionId: sessionId, tool: "AskUserQuestion",
+                                surfaceKey: key ?? questionPillId, sessionId: sessionId, tool: "AskUserQuestion",
                                 inputKey: Self.approvalInputKey(payload["tool_input"] as? [String: Any] ?? [:]),
                                 atFront: true, arrivedAt: arrival)
             } else {
-                markCmuxDialogOpen(questionPillId, tool: "AskUserQuestion", inputKey: nil)
-                releaseCmuxTaskIfSettled(questionPillId)
+                markCmuxDialogOpen(key, tool: "AskUserQuestion", inputKey: nil)
+                if let key { releaseCmuxSurfaceIfSettled(questionPillId, key: key) }
             }
         }
         cmuxShownPayload = nil
@@ -1657,6 +2150,68 @@ final class HookServer: @unchecked Sendable {
     }
 
     #endif
+
+    // MARK: - Pill state helpers (both builds)
+
+    /// Sets the state of a pill. For a cmux pill the state belongs to one session (`cmuxKey`): it is
+    /// recorded for that session and the pill shows the folded state of all of them.
+    @MainActor
+    private func setTaskState(_ id: String, _ newState: BotState, cmuxKey: String? = nil) {
+        #if !APPSTORE
+        if CmuxRouting.isCmuxTaskId(id), let key = cmuxKey {
+            setCmuxSurfaceState(taskId: id, key: key, newState)
+            return
+        }
+        #endif
+        AppState.shared.updateTask(id: id, state: newState)
+    }
+
+    /// `<label> · ` for the steps of a session that is not the main one of its workspace, else "".
+    @MainActor
+    private func stepPrefix(forKey key: String?) -> String {
+        #if !APPSTORE
+        if let key { return cmuxStepPrefix(forKey: key) }
+        #endif
+        return ""
+    }
+
+    private enum AlertSlot { case view, badge, none }
+
+    /// Where a finished / error alert goes. A cmux session also yields to a card of its pill that is on screen
+    /// (it belongs to another session) and to the approval badge of a pill that holds a queued card.
+    /// `focused` already says whether the pill is focused and the event may take the view.
+    @MainActor
+    private func alertPlacement(pillId: String, cmuxKey: String?, focused: Bool) -> AlertSlot {
+        #if !APPSTORE
+        if cmuxKey != nil {
+            switch CmuxRouting.alertPlacement(focused: focused, cardOfPillOnScreen: cmuxCardOnScreen(forPill: pillId),
+                                              pillHoldsCard: cmuxTaskHoldsCard(pillId)) {
+            case .view: return .view
+            case .badge: return .badge
+            case .none: return .none
+            }
+        }
+        #endif
+        return focused ? .view : .badge
+    }
+
+    /// The badge stays while another session of the same cmux pill still holds a card.
+    @MainActor
+    private func clearPillBadgeUnlessCardHeld(id: String) {
+        #if !APPSTORE
+        if CmuxRouting.isCmuxTaskId(id), cmuxTaskHoldsCard(id) { return }
+        #endif
+        clearPillBadge(id: id)
+    }
+
+    /// Interrupt: a cmux pill keeps its badge while another session still shows a state.
+    @MainActor
+    private func clearPillBadgeIfIdle(id: String) {
+        #if !APPSTORE
+        if CmuxRouting.isCmuxTaskId(id), AppState.shared.tasks.first(where: { $0.id == id })?.state != .idle { return }
+        #endif
+        clearPillBadge(id: id)
+    }
 
     // MARK: - Badge helpers
 

@@ -4204,6 +4204,17 @@
         }
       }
     },
+    "That session is no longer open in cmux." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Essa sessão não está mais aberta no cmux."
+          }
+        }
+      }
+    },
     "The address changed while you signed in. Sign in again." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -4314,6 +4325,17 @@
         }
       }
     },
+    "This session hasn't reported in to Coucou yet. Send becomes available after its next prompt in cmux." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Esta sessão ainda não se apresentou ao Coucou. O envio fica disponível depois do próximo prompt dela no cmux."
+          }
+        }
+      }
+    },
     "To" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -4343,6 +4365,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Para usar o Google Gemini ou a OpenAI no chat. As chaves ficam guardadas nas Chaves."
+          }
+        }
+      }
+    },
+    "To: %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Para: %@"
           }
         }
       }

@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Security
 
 #if !APPSTORE
@@ -11,7 +12,7 @@ enum CmuxControl {
     static let passwordKey = "cmux-socket-password"
 
     enum Failure: Error, Equatable {
-        case notRunning, notVerified, noCredential, blockedByDialog, dialogMayBeOpen, invalidInput, enterNotSent, busy, promptNotAccepted, launchFilesUnavailable
+        case notRunning, notVerified, noCredential, blockedByDialog, dialogMayBeOpen, notReachableYet, sessionClosed, invalidInput, enterNotSent, busy, promptNotAccepted, launchFilesUnavailable
         case cli(Int32)
 
         var message: String {
@@ -21,6 +22,8 @@ enum CmuxControl {
             case .noCredential:    return String(localized: "No open cmux session. Add the socket password in Settings, or start one session in cmux.")
             case .blockedByDialog: return String(localized: "Answer the pending request first.")
             case .dialogMayBeOpen: return String(localized: "A request may still be open in cmux. Answer it there first.")
+            case .notReachableYet: return String(localized: "This session hasn't reported in to Coucou yet. Send becomes available after its next prompt in cmux.")
+            case .sessionClosed:   return String(localized: "That session is no longer open in cmux.")
             case .invalidInput:    return String(localized: "Check the folder / command in Settings.")
             case .promptNotAccepted: return String(localized: "This agent can't take a first prompt that starts with \"-\" or is only a command name. Reword it.")
             case .launchFilesUnavailable: return String(localized: "Coucou couldn't prepare a private folder for this launch. Nothing was started.")
@@ -183,28 +186,38 @@ enum CmuxControl {
 
     // MARK: - reply
 
-    /// Types `text` into the session and presses Enter. Only ever called from an explicit user action
+    /// Types `text` into a session and presses Enter. Only ever called from an explicit user action
     /// (Send, Return) or from the single deferred first prompt of a new chat the user started.
-    /// Typing always needs a token (the session's own, else the freshest on the same socket): the
-    /// socket password is never used here, and there is no retry with another credential.
+    /// The target is `surfaceKey`, else the reply target of the pill (`taskId`).
+    /// Typing needs the surface's own token, the one that came with its ids in a hook event of that very
+    /// surface: the socket password is never used here, a token of another surface is never lent, and there is
+    /// no retry with another credential. A surface known only through discovery or the session file has no
+    /// proof that it runs an agent session: until one of its own hook events arrives it is not reachable.
     @MainActor
-    static func send(text: String, to taskId: String, completion: @escaping @MainActor (Failure?) -> Void) {
+    static func send(text: String, to taskId: String, surfaceKey: String? = nil,
+                     completion: @escaping @MainActor (Failure?) -> Void) {
         let state = AppState.shared
         guard !state.cmuxBusy else { completion(.busy); return }
         guard CmuxRouting.isCmuxTaskId(taskId), let prepared = CmuxRouting.preparePrompt(text) else {
             completion(.invalidInput); return
         }
         let server = HookServer.shared
-        guard server.cmuxCanSend(taskId) else {
-            completion(server.cmuxDialogMayBeOpen(taskId) ? .dialogMayBeOpen : .blockedByDialog); return
+        // The session closed between the click and now (or never was): not a credential problem.
+        guard let key = surfaceKey ?? server.cmuxReplyTarget(for: taskId),
+              let target = server.cmuxSurface(key: key), target.taskId == taskId else {
+            completion(.sessionClosed); return
         }
-        guard let target = server.cmuxSurface(for: taskId), !target.surfaceId.isEmpty, !target.workspaceId.isEmpty else {
-            completion(.noCredential); return
+        guard server.cmuxCanType(key: key) else { completion(.notReachableYet); return }
+        guard server.cmuxCanSend(key: key) else {
+            completion(server.cmuxDialogMayBeOpen(key: key) ? .dialogMayBeOpen : .blockedByDialog); return
         }
-        let credential = server.cmuxSendCredential(for: taskId)
-        guard credential != CmuxCredential.none else { completion(.noCredential); return }
+        guard !target.surfaceId.isEmpty, !target.workspaceId.isEmpty else {
+            completion(.notReachableYet); return
+        }
         let (running, bundles) = candidateBundles()
         guard running else { completion(.notRunning); return }
+        let credential = server.cmuxSendCredential(forKey: key)
+        guard credential != CmuxCredential.none else { completion(.notReachableYet); return }
         guard let textParams = CmuxRouting.rpcParams(workspaceId: target.workspaceId, surfaceId: target.surfaceId, text: prepared),
               let keyParams = CmuxRouting.rpcParams(workspaceId: target.workspaceId, surfaceId: target.surfaceId, key: "enter"),
               let textJSON = json(textParams), let keyJSON = json(keyParams) else {
@@ -212,7 +225,7 @@ enum CmuxControl {
         }
         state.cmuxBusy = true
         queue.async {
-            let result = deliver(taskId: taskId, bundles: bundles, credential: credential,
+            let result = deliver(key: key, bundles: bundles, credential: credential,
                                  textJSON: textJSON, keyJSON: keyJSON)
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
@@ -224,24 +237,25 @@ enum CmuxControl {
         }
     }
 
-    /// The send gate, evaluated on the main thread from the serial queue. Main never waits on that queue.
-    /// nil when sending is allowed, else the reason (the same pair `send` reports).
-    private nonisolated static func sendGate(_ taskId: String) -> Failure? {
+    /// The send gate of one target surface, evaluated on the main thread from the serial queue. Main never
+    /// waits on that queue. nil when sending is allowed, else the reason (the same pair `send` reports).
+    private nonisolated static func sendGate(_ key: String) -> Failure? {
         DispatchQueue.main.sync {
             MainActor.assumeIsolated {
                 let server = HookServer.shared
-                if server.cmuxCanSend(taskId) { return nil }
-                return server.cmuxDialogMayBeOpen(taskId) ? .dialogMayBeOpen : .blockedByDialog
+                if server.cmuxCanSend(key: key) { return nil }
+                if !server.cmuxCanType(key: key) { return .notReachableYet }
+                return server.cmuxDialogMayBeOpen(key: key) ? .dialogMayBeOpen : .blockedByDialog
             }
         }
     }
 
-    private nonisolated static func deliver(taskId: String, bundles: [URL], credential: CmuxCredential,
+    private nonisolated static func deliver(key: String, bundles: [URL], credential: CmuxCredential,
                                             textJSON: String, keyJSON: String) -> Failure? {
         // The signature check (it hashes the bundle, so it is slow) comes first; the gate is evaluated
         // after it and again right before Enter, so a dialog that opens meanwhile is not answered.
         guard let cli = verifiedCLI(bundles: bundles) else { return .notVerified }
-        if let blocked = sendGate(taskId) { return blocked }
+        if let blocked = sendGate(key) { return blocked }
         // A token that cannot be shown to be talking to the real cmux never leaves the process.
         let env: [String: String]
         switch verifiedEnvironment(for: credential) {
@@ -253,7 +267,7 @@ enum CmuxControl {
         if typed.status != 0 { return .cli(typed.status) }
         Thread.sleep(forTimeInterval: 0.15)
         // A residual window of a few milliseconds remains between this check and the key press.
-        guard sendGate(taskId) == nil else { return .enterNotSent }
+        guard sendGate(key) == nil else { return .enterNotSent }
         let enter = run(cli: cli, args: ["rpc", "surface.send_key", keyJSON], env: env, timeout: 3)
         return enter.status == 0 ? nil : .enterNotSent
     }
@@ -354,28 +368,23 @@ enum CmuxControl {
         return .success(Created(workspaceId: workspaceId, socketPath: socket))
     }
 
-    // MARK: - session name and branch
+    // MARK: - discovery (workspaces, titles, sessions) and branch
 
-    /// Own queue: a slow title lookup never delays a send.
+    /// Own queue: a slow lookup never delays a send.
     private static let metaQueue = DispatchQueue(label: "fr.louisraille.NotchBuddy.cmux-meta", qos: .utility)
 
-    /// Tab title of the surface (through the CLI, with the task's own token) and git branch of `cwd`
-    /// (read from the HEAD file). Either is nil when it cannot be read. Runs once per call, no timer.
+    /// Git branch of `cwd` (read from the HEAD file). nil when it cannot be read. Once per call, no timer.
     @MainActor
-    static func fetchMeta(surface: CmuxSurface?, cwd: String,
-                          completion: @escaping @MainActor (_ title: String?, _ branch: String?) -> Void) {
-        let token: CmuxSurface? = (surface?.canFocusExactly == true) ? surface : nil
-        let bundles = token == nil ? [] : candidateBundles().bundles
+    static func fetchBranch(cwd: String, completion: @escaping @MainActor (_ branch: String?) -> Void) {
         metaQueue.async {
             let branch = CmuxRouting.gitBranch(cwd: cwd)
-            let title = token.flatMap { fetchTitle(surface: $0, bundles: bundles) }
-            DispatchQueue.main.async { MainActor.assumeIsolated { completion(title, branch) } }
+            DispatchQueue.main.async { MainActor.assumeIsolated { completion(branch) } }
         }
     }
 
-    /// What the last successful title lookup verified: the bundle signature (so the CLI) and the socket peer.
-    /// Reused for `verificationReuseInterval` by the title lookup only; send, new chat and jump never read it.
-    private final class TitleVerification: @unchecked Sendable {
+    /// What the last successful lookup verified: the bundle signature (so the CLI) and the socket peer.
+    /// Reused for `verificationReuseInterval` by discovery only; send, new chat and jump never read it.
+    private final class ReadVerification: @unchecked Sendable {
         private let lock = NSLock()
         private var cli: URL?
         private var socketPath = ""
@@ -392,28 +401,80 @@ enum CmuxControl {
             self.cli = cli; socketPath = path; at = ProcessInfo.processInfo.systemUptime
         }
     }
-    private static let titleVerification = TitleVerification()
+    private static let readVerification = ReadVerification()
 
-    private nonisolated static func fetchTitle(surface: CmuxSurface, bundles: [URL]) -> String? {
-        guard let params = CmuxRouting.surfaceListParams(workspaceId: surface.workspaceId),
-              let paramsJSON = json(params) else { return nil }
+    /// One discovery: the cmux tree (through the CLI, with `credential`) and the cmux session file.
+    /// The tree needs a token (the listener of its socket is verified before the token leaves the process); with
+    /// the socket password or without a credential it is nil: the password is never used for a background read.
+    /// Both inputs are untrusted and parsed in `CmuxRouting`; nothing read here is ever used as a credential or
+    /// as proof that a surface runs an agent. Runs once per call, no timer.
+    @MainActor
+    static func fetchSnapshot(credential: CmuxCredential, startedAt: TimeInterval,
+                              completion: @escaping @MainActor (CmuxSnapshot) -> Void) {
+        let (running, candidates) = candidateBundles()
+        let bundles = running ? candidates : []
+        var socket = ""
+        if case .token(let s) = credential { socket = s.socketPath }
+        let socketPath = socket
+        metaQueue.async {
+            let parsed = bundles.isEmpty ? nil : fetchTree(credential: credential, bundles: bundles)
+            let sessions = readSessionFile().flatMap { CmuxRouting.parseSessionFile($0, isLive: pidIsLive(pid:start:)) }
+            let snapshot = CmuxSnapshot(tree: parsed?.workspaces, sessions: sessions,
+                                        socketPath: parsed == nil ? "" : socketPath,
+                                        startedAt: startedAt, treeTruncated: parsed?.truncated ?? false)
+            DispatchQueue.main.async { MainActor.assumeIsolated { completion(snapshot) } }
+        }
+    }
+
+    private nonisolated static func fetchTree(credential: CmuxCredential, bundles: [URL]) -> CmuxParsedTree? {
+        guard case .token(let owner) = credential else { return nil }
+        let path = owner.socketPath
         let cli: URL
         let env: [String: String]
-        if let cached = titleVerification.reusable(socketPath: surface.socketPath),
-           let e = environment(for: .token(surface)) {
+        if let cached = readVerification.reusable(socketPath: path),
+           let e = environment(for: credential) {
             // Fresh enough: signature and peer were verified for this socket moments ago. The socket file
             // check inside `environment` still runs.
             cli = cached; env = e
         } else {
             guard let verified = verifiedCLI(bundles: bundles),
-                  case .success(let e) = verifiedEnvironment(for: .token(surface)) else { return nil }
-            titleVerification.store(cli: verified, socketPath: surface.socketPath)
+                  case .success(let e) = verifiedEnvironment(for: credential) else { return nil }
+            readVerification.store(cli: verified, socketPath: path)
             cli = verified; env = e
         }
-        let r = run(cli: cli, args: ["--id-format", "uuids", "rpc", "surface.list", paramsJSON],
-                    env: env, timeout: 3, captureOutput: true, captureLimit: 524288)
+        let r = run(cli: cli, args: ["--id-format", "uuids", "rpc", "system.tree", "{\"all_windows\":true}"],
+                    env: env, timeout: 3, captureOutput: true, captureLimit: 1_048_576)
         guard r.status == 0 else { return nil }
-        return CmuxRouting.tabTitle(forSurface: surface.surfaceId, inListJSON: r.output)
+        return CmuxRouting.parseTreeChecked(r.output)
+    }
+
+    /// `~/.cmuxterm/claude-hook-sessions.json`: a regular file owned by this user, opened without following
+    /// a link and without blocking, at most `maxSessionFileBytes`. nil otherwise.
+    nonisolated static func readSessionFile(path: String = NSHomeDirectory() + "/.cmuxterm/claude-hook-sessions.json") -> Data? {
+        let fd = open(path, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+        var st = stat()
+        guard fstat(fd, &st) == 0, (st.st_mode & S_IFMT) == S_IFREG, st.st_uid == getuid(),
+              st.st_size > 0, st.st_size <= off_t(CmuxRouting.maxSessionFileBytes) else { return nil }
+        var data = Data(capacity: Int(st.st_size))
+        var buffer = [UInt8](repeating: 0, count: 65536)
+        while data.count <= CmuxRouting.maxSessionFileBytes {
+            let n = read(fd, &buffer, buffer.count)
+            if n < 0 { return nil }
+            if n == 0 { break }
+            data.append(buffer, count: n)
+        }
+        return data.count <= CmuxRouting.maxSessionFileBytes ? data : nil
+    }
+
+    /// True when `pid` is a running process that started at `start` (seconds since the epoch): a recycled
+    /// pid has another start time, a zombie is not an agent.
+    nonisolated static func pidIsLive(pid: Int32, start: Int) -> Bool {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return false }
+        return Int(info.pbi_start_tvsec) == start && info.pbi_status != UInt32(SZOMB)
     }
 
     // MARK: - helpers

@@ -194,29 +194,26 @@ final class ClaudeService {
     /// What the service keeps per conversation (see `ConversationID`): the messages sent to the server, the turns in
     /// flight and, for a signed-in Hermes agent, the stored server session. Memory only.
     private struct Conversation {
-        /// Taken from `generationCounter` on every clear: a request that started before a clear must not touch the
-        /// new conversation (nor one recreated after a drop).
-        var generation: Int
         var messages: [[String: Any]] = []
         var turns: [UUID: HermesTurn] = [:]
         var serverSession: String?
     }
-    private var conversations = ConversationStore<Conversation>(empty: Conversation(generation: -1))
-    private var generationCounter = 0
+    private var conversations = ConversationStore<Conversation>(empty: Conversation())
+    /// A request that started before a clear or a drop must not touch the new conversation: it carries the
+    /// generation it started under. Only `ensureConversation` and `clearConversation` create one.
+    private var generations = ConversationGenerations()
 
-    /// The conversation exists with the given generation (a cleared or dropped one no longer does).
+    /// The conversation still has the generation the request started under (a cleared or dropped one does not).
     private func isCurrent(_ id: ConversationID, generation: Int) -> Bool {
-        conversations.contains(id) && conversations[id].generation == generation
+        generations.isCurrent(id, generation)
     }
 
     /// Creates the conversation if it has none yet and returns its generation.
     @discardableResult
     private func ensureConversation(_ id: ConversationID) -> Int {
-        if !conversations.contains(id) {
-            generationCounter += 1
-            conversations.set(id, Conversation(generation: generationCounter))
-        }
-        return conversations[id].generation
+        let generation = generations.ensure(id)
+        if !conversations.contains(id) { conversations.set(id, Conversation()) }
+        return generation
     }
 
     /// Messages of the conversation shared by the non Hermes providers.
@@ -228,13 +225,14 @@ final class ClaudeService {
     /// Empties one conversation (messages, server session) and cancels its running turns. The others are untouched.
     func clearConversation(_ id: ConversationID) {
         for turn in conversations[id].turns.values { turn.task?.cancel() }
-        generationCounter += 1
-        conversations.set(id, Conversation(generation: generationCounter))
+        generations.renew(id)
+        conversations.set(id, Conversation())
     }
 
     /// Forgets one conversation for good (its agent was removed) and cancels its running turns.
     func dropConversation(_ id: ConversationID) {
         for turn in conversations[id].turns.values { turn.task?.cancel() }
+        generations.drop(id)
         conversations.remove(id)
     }
 
@@ -559,13 +557,13 @@ final class ClaudeService {
         }
         let userText = openAIUserText(query: query, context: context, inlineFiles: true, firstTurn: conversations[id].messages.isEmpty)
         msgs.append(["role": "user", "content": userText])
-        conversations.mutate(id) { $0.messages.append(["role": "user", "content": userText]) }
+        conversations.mutateIfPresent(id) { $0.messages.append(["role": "user", "content": userText]) }
 
         let placeholder = ChatMessage(role: .assistant, content: "")
         let msgId = placeholder.id
         state.updateChat(id) { $0.append(placeholder) }
         let turnId = UUID()
-        conversations.mutate(id) { $0.turns[turnId] = HermesTurn(task: nil, hasText: false) }
+        conversations.mutateIfPresent(id) { $0.turns[turnId] = HermesTurn(task: nil, hasText: false) }
         refreshHermesTyping(state)
         state.setHermesPillBusy(agentName: agent.name, true)
         defer { state.setHermesPillBusy(agentName: agent.name, false) }
@@ -578,11 +576,11 @@ final class ClaudeService {
             let onToken: @MainActor (String) -> Void = { visible in
                 if !visible.isEmpty, self.conversations[id].turns[turnId]?.hasText == false {
                     // hide typing dots once no turn waits for text
-                    self.conversations.mutate(id) { $0.turns[turnId]?.hasText = true }
+                    self.conversations.mutateIfPresent(id) { $0.turns[turnId]?.hasText = true }
                     appendAppLog("nb.log", "hermes turn first text after=\(Self.seconds(since: startedAt))s")
                     self.refreshHermesTyping(state)
                 }
-                state.updateChat(id) { h in
+                state.updateChat(id, createIfMissing: false) { h in
                     if let idx = h.firstIndex(where: { $0.id == msgId }) { h[idx].content = visible }
                 }
             }
@@ -592,24 +590,24 @@ final class ClaudeService {
                     agent: agent, sessions: HermesSessions.shared, storedSession: storedSession, text: userText,
                     onSession: { sessionId in
                         if self.isCurrent(id, generation: generation) {
-                            self.conversations.mutate(id) { $0.serverSession = sessionId.isEmpty ? nil : sessionId }
+                            self.conversations.mutateIfPresent(id) { $0.serverSession = sessionId.isEmpty ? nil : sessionId }
                         }
                     },
                     onToken: onToken)
             }
             return try await HermesChat.streamChat(agent: agent, key: key, encodedBody: encodedBody, onToken: onToken)
         }
-        conversations.mutate(id) { $0.turns[turnId]?.task = task }
+        conversations.mutateIfPresent(id) { $0.turns[turnId]?.task = task }
         do {
             let final = try await task.value
-            conversations.mutate(id) { $0.turns[turnId] = nil }
+            conversations.mutateIfPresent(id) { $0.turns[turnId] = nil }
             guard isCurrent(id, generation: generation) else {
                 appendAppLog("nb.log", "hermes turn discarded (conversation cleared) after=\(Self.seconds(since: startedAt))s")
                 refreshHermesTyping(state)
                 return
             }
-            conversations.mutate(id) { $0.messages.append(["role": "assistant", "content": final]) }
-            state.updateChat(id) { h in
+            conversations.mutateIfPresent(id) { $0.messages.append(["role": "assistant", "content": final]) }
+            state.updateChat(id, createIfMissing: false) { h in
                 if let idx = h.firstIndex(where: { $0.id == msgId }) { h[idx].content = final }
             }
             refreshHermesTyping(state)
@@ -618,7 +616,7 @@ final class ClaudeService {
             state.announceHermesTurn(agentName: agent.name, failed: false, view: .prompt)
             NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
         } catch {
-            conversations.mutate(id) { $0.turns[turnId] = nil }
+            conversations.mutateIfPresent(id) { $0.turns[turnId] = nil }
             guard isCurrent(id, generation: generation) else {
                 // Cleared meanwhile: leave the new conversation alone, only stop the typing dots
                 // when no newer Hermes request is still waiting for its first text.
@@ -627,12 +625,12 @@ final class ClaudeService {
                 return
             }
             // Remove this turn's own message: a sibling turn may have added its own after it.
-            conversations.mutate(id) { c in
+            conversations.mutateIfPresent(id) { c in
                 if let own = c.messages.lastIndex(where: { ($0["role"] as? String) == "user" && ($0["content"] as? String) == userText }) {
                     c.messages.remove(at: own)
                 }
             }
-            state.updateChat(id) { $0.removeAll { $0.id == msgId } }
+            state.updateChat(id, createIfMissing: false) { $0.removeAll { $0.id == msgId } }
             refreshHermesTyping(state)
             let msg = (error as? HermesChatError)?.userMessage ?? String(localized: "Hermes request failed.")
             appendAppLog("nb.log", "hermes turn failed after=\(Self.seconds(since: startedAt))s error=\(Self.errorCaseName(error))")
@@ -640,7 +638,7 @@ final class ClaudeService {
             // A card on screen keeps the screen: the error is only signalled by the sound and the pill badge.
             if outcome == .badgeOnly {
                 // The text waits in the chat of this agent for when it is next shown.
-                state.updateChat(id) { $0.append(ChatMessage(role: .assistant, content: msg)) }
+                state.updateChat(id, createIfMissing: false) { $0.append(ChatMessage(role: .assistant, content: msg)) }
             } else { await showError(msg, state: state) }
         }
     }

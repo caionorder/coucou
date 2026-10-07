@@ -9,7 +9,10 @@ import Security
 enum CmuxRouting {
     static let bundleId = "com.cmuxterm.app"
     static let taskPrefix = "agent_cmux_"
-    static let maxTasks = 6
+    /// Pills (cmux workspaces) kept at once.
+    static let maxTasks = 12
+    /// Agent surfaces (sessions) kept per pill.
+    static let maxSurfacesPerTask = 8
     static let maxKeyLength = 36
     /// A registry entry (and its task) not seen for this long is dropped.
     static let staleAfter: TimeInterval = 30 * 60
@@ -26,13 +29,13 @@ enum CmuxRouting {
         return id.hasPrefix(taskPrefix)
     }
 
-    private static func sanitize(_ raw: String) -> String {
+    static func sanitize(_ raw: String) -> String {
         let allowed = Set("abcdefghijklmnopqrstuvwxyz0123456789-")
         let filtered = raw.lowercased().filter { allowed.contains($0) }
         return String(filtered.prefix(maxKeyLength))
     }
 
-    /// Key of a cmux task: the surface id, else the session id. nil when neither is usable.
+    /// Key of a cmux session (surface level): the surface id, else the session id. nil when neither is usable.
     static func sessionKey(surfaceId: String, sessionId: String) -> String? {
         let surface = sanitize(surfaceId)
         if !surface.isEmpty { return surface }
@@ -41,15 +44,28 @@ enum CmuxRouting {
         return session.isEmpty ? nil : session
     }
 
-    /// nil when the payload does not come from cmux.
-    static func taskId(payload: [String: Any]) -> String? {
+    /// Key of a workspace (pill level): its lowercased UUID. nil for anything that is not a UUID.
+    static func workspaceKey(_ id: String) -> String? {
+        isUUID(id) ? id.lowercased() : nil
+    }
+
+    /// Surface key of a payload that comes from cmux. nil when it does not (or has no usable key).
+    static func surfaceKey(payload: [String: Any]) -> String? {
         let surface = (payload["cmux_surface_id"] as? String) ?? ""
         let bundle = ((payload["bundle_id"] as? String) ?? "").lowercased()
         guard !surface.isEmpty || bundle == bundleId else { return nil }
         let session = (payload["session_id"] as? String)
             ?? (payload["conversation_id"] as? String) ?? ""
-        guard let key = sessionKey(surfaceId: surface, sessionId: session) else { return nil }
-        return taskPrefix + key
+        return sessionKey(surfaceId: surface, sessionId: session)
+    }
+
+    /// Pill id of a payload: one pill per cmux workspace (`agent_cmux_<workspace uuid>`). A payload without
+    /// a usable workspace id keeps the surface (else session) key: one pill per session. nil when the
+    /// payload does not come from cmux.
+    static func taskId(payload: [String: Any]) -> String? {
+        guard let surface = surfaceKey(payload: payload) else { return nil }
+        let workspace = (payload["cmux_workspace_id"] as? String).flatMap(workspaceKey)
+        return taskPrefix + (workspace ?? surface)
     }
 
     // MARK: validation of the fields the hook relay sends
@@ -291,8 +307,12 @@ extension CmuxRouting {
     }
 
     /// True when the answer of a session should appear in the open reply view instead of switching views.
-    static func answerStaysInReply(prompt: CmuxPromptMode?, taskId: String, viewIsPrompt: Bool) -> Bool {
-        viewIsPrompt && prompt == .reply(taskId: taskId)
+    /// With several surfaces, only the one the reply view targets (`surfaceKey == targetKey`) stays in place.
+    static func answerStaysInReply(prompt: CmuxPromptMode?, taskId: String, viewIsPrompt: Bool,
+                                   surfaceKey: String? = nil, targetKey: String? = nil) -> Bool {
+        guard viewIsPrompt, prompt == .reply(taskId: taskId) else { return false }
+        if let surfaceKey, let targetKey { return surfaceKey == targetKey }
+        return true
     }
 
     /// A matched new chat moves focus only while the user is still in the New chat view and no approval
@@ -666,26 +686,6 @@ extension CmuxRouting {
         return String(String.UnicodeScalarView(rest))
     }
 
-    /// Title of the surface with this id in the JSON of the rpc `surface.list`
-    /// (`{"surfaces":[{"id":"…","title":"…"}]}`, optionally under `result`). nil when absent or empty.
-    static func tabTitle(forSurface surfaceId: String, inListJSON json: String) -> String? {
-        guard !surfaceId.isEmpty, let data = json.data(using: .utf8),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
-        let list = (root["surfaces"] as? [[String: Any]])
-            ?? ((root["result"] as? [String: Any])?["surfaces"] as? [[String: Any]]) ?? []
-        for item in list {
-            guard let id = item["id"] as? String, id.caseInsensitiveCompare(surfaceId) == .orderedSame else { continue }
-            guard let title = item["title"] as? String else { return nil }
-            return cleanLabel(stripLeadingGlyphs(title))
-        }
-        return nil
-    }
-
-    /// Params of `surface.list`. nil when the id is not valid.
-    static func surfaceListParams(workspaceId: String) -> [String: String]? {
-        isValidId(workspaceId) ? ["workspace_id": workspaceId] : nil
-    }
-
     /// At most one refresh every `metaRefreshInterval` seconds per task.
     static func metaRefreshDue(last: TimeInterval?, now: TimeInterval) -> Bool {
         guard let last else { return true }
@@ -776,38 +776,490 @@ extension CmuxRouting {
     }
 }
 
-/// One per live cmux task. The capability is a credential: memory only, never logged or persisted.
-struct CmuxSurface: Equatable {
+// MARK: workspaces: folded state, main surface, discovery (cmux tree and session file)
+
+/// A surface of the cmux tree (`system.tree`). Untrusted input, validated by `parseTree`.
+struct CmuxTreeSurface: Equatable {
+    var id: String
+    var title: String
+    var type: String
+    var index: Int
+}
+
+struct CmuxTreeWorkspace: Equatable {
+    var id: String
+    var title: String
+    var index: Int
+    var selected: Bool
+    var surfaces: [CmuxTreeSurface]
+}
+
+/// The session a surface holds, from the cmux session file (`claude-hook-sessions.json`). Untrusted input.
+struct CmuxFileSession: Equatable {
+    var sessionId: String
+    var surfaceId: String
+    var workspaceId: String
+    var cwd: String
+    var lifecycle: String
+    var pid: Int32
+    var pidStart: Int
+    var startedAt: TimeInterval
+}
+
+/// What one discovery run found. `tree` is nil without a credential (or when the tree could not be read),
+/// `sessions` nil when the session file could not be read. `startedAt` is when the run began: a surface
+/// heard through a hook after that moment is newer than the tree and is never removed by it.
+struct CmuxSnapshot: Equatable {
+    var tree: [CmuxTreeWorkspace]?
+    var sessions: [CmuxFileSession]?
+    var socketPath: String
+    var startedAt: TimeInterval
+    /// True when `parseTree` cut the tree at one of its caps: it no longer says what does not exist.
+    var treeTruncated: Bool = false
+}
+
+/// A parsed `system.tree`: the workspaces kept, and whether a cap cut something off.
+struct CmuxParsedTree: Equatable {
+    var workspaces: [CmuxTreeWorkspace]
+    var truncated: Bool
+}
+
+/// One agent session of a workspace as the reply header and the card show it.
+struct CmuxSurfaceInfo: Equatable {
+    var key: String
+    var label: String
+    var isMain: Bool
+}
+
+struct CmuxSurfacePlan: Equatable {
+    var key: String
+    var surfaceId: String
+    var title: String?
+    var index: Int?
+    var sessionId: String
+    var cwd: String
+    var startedAt: TimeInterval?
+    /// `agentLifecycle` of the session file, nil for a surface known only through a hook.
+    var lifecycle: String?
+}
+
+struct CmuxWorkspacePlan: Equatable {
     var taskId: String
+    var workspaceId: String
+    var title: String?
+    var index: Int
+    /// In tree order (lowest index first).
+    var surfaces: [CmuxSurfacePlan]
+
+    /// Folder of the first surface that has one.
+    var cwd: String { surfaces.first { !$0.cwd.isEmpty }?.cwd ?? "" }
+}
+
+struct CmuxReconcilePlan: Equatable {
+    /// Pills that must exist, in workspace order.
+    var workspaces: [CmuxWorkspacePlan] = []
+    /// Registry entries to drop (surface keys).
+    var removeKeys: [String] = []
+    /// Pills left with no surface.
+    var removeTasks: [String] = []
+}
+
+extension CmuxRouting {
+    static let maxWorkspaces = 64
+    static let maxTreeSurfaces = 32
+    static let maxFileSessions = 256
+    static let maxSessionFileBytes = 8 * 1024 * 1024
+    static let discoveryInterval: TimeInterval = 5
+
+    /// Priority of a pill's state over its surfaces (first wins).
+    static let foldOrder = ["approval", "question", "working", "searching", "thinking",
+                            "error", "ratelimit", "finished", "idle"]
+
+    /// The state a pill shows for the states of its surfaces. Empty or unknown values give idle.
+    static func foldedState(_ states: [String]) -> String {
+        var best = "idle"
+        var rank = foldOrder.count - 1
+        for s in states {
+            if let r = foldOrder.firstIndex(of: s), r < rank { rank = r; best = s }
+        }
+        return best
+    }
+
+    /// States that mean a session is mid turn. A session in `error` or `ratelimit` (sticky until its next
+    /// prompt), `approval`, `question` or `finished` is not busy.
+    static let busyStates: Set<String> = ["working", "searching", "thinking"]
+
+    /// True when the Stop of a session adds a step and nothing else (no sound, no finished view, no badge): a
+    /// helper that stops while another session of the workspace is mid turn. The main session is never silent
+    /// (its answer is the one the user waits for), and a sibling stuck in an old state does not silence anybody.
+    /// `states` is the raw state of every session of the pill by surface key.
+    static func stopIsSilent(stoppingKey: String, mainKey: String?, states: [String: String]) -> Bool {
+        guard stoppingKey != mainKey else { return false }
+        return states.contains { $0.key != stoppingKey && busyStates.contains($0.value) }
+    }
+
+    /// Where a finished or error alert of a cmux session goes.
+    enum AlertPlacement: Equatable {
+        /// The island shows the finished / error view.
+        case view
+        /// Only the pill badge.
+        case badge
+        /// Sound only: a card holds the screen and the badge of the pill.
+        case none
+    }
+
+    /// `focused`: the pill is focused and the event may take the view. A card of this pill on screen belongs to
+    /// another session than the event (its own session's events dismiss it first): the alert must neither replace
+    /// it (a question card would be handed back to the terminal) nor overwrite the approval badge.
+    static func alertPlacement(focused: Bool, cardOfPillOnScreen: Bool, pillHoldsCard: Bool) -> AlertPlacement {
+        if cardOfPillOnScreen { return .none }
+        if focused { return .view }
+        return pillHoldsCard ? .none : .badge
+    }
+
+    /// True when the time rule (`staleAfter`, `busyStaleAfter`) may drop a registry entry. `liveKeys` are the
+    /// surface keys of the sessions the last discovery found with a live process in the cmux session file, nil
+    /// when that file could not be read. A live process keeps its entry whatever the hooks say (an idle
+    /// workspace stays); an entry without one expires, so a session that died without a SessionEnd does not
+    /// stay an agent for as long as its terminal tab exists. With no file to ask, a known tree speaks only for
+    /// entries that have a surface id.
+    static func timeRuleApplies(entry: CmuxSurface, treeKnown: Bool, liveKeys: Set<String>?) -> Bool {
+        if let liveKeys { return !liveKeys.contains(entry.key) }
+        return !treeKnown || entry.surfaceId.isEmpty
+    }
+
+    /// Name of a pill with no workspace title yet: the cleaned folder name, else `fallback`.
+    static func folderPillName(cwd: String, fallback: String) -> String {
+        let folder = (cwd as NSString).lastPathComponent
+        return (folder.isEmpty || folder == "/" ? nil : cleanLabel(folder)) ?? fallback
+    }
+
+    /// Lowest tree index first, then oldest start, then smallest key. A missing index or start comes last.
+    static func surfaceOrder(_ aKey: String, _ aIndex: Int?, _ aStart: TimeInterval?,
+                             _ bKey: String, _ bIndex: Int?, _ bStart: TimeInterval?) -> Bool {
+        let ai = aIndex ?? Int.max, bi = bIndex ?? Int.max
+        if ai != bi { return ai < bi }
+        let at = aStart ?? .infinity, bt = bStart ?? .infinity
+        if at != bt { return at < bt }
+        return aKey < bKey
+    }
+
+    /// Main surface of a pill: `current` while it is still a candidate and no other candidate sits at a lower tree
+    /// index (a main without an index yields to a surface that has one, since the first hook event of a workspace
+    /// can come from a helper; and a main that re-registered after `/clear` gets its place back as soon as the
+    /// tree gives it an index). Else the first by `surfaceOrder`. nil without candidates.
+    static func mainSurfaceKey(current: String?,
+                               candidates: [(key: String, index: Int?, startedAt: TimeInterval?)]) -> String? {
+        guard !candidates.isEmpty else { return nil }
+        if let current, let c = candidates.first(where: { $0.key == current }) {
+            let best = candidates.compactMap { $0.index }.min()
+            if let mine = c.index {
+                if let best, mine <= best { return current }
+            } else if best == nil {
+                return current
+            }
+        }
+        return candidates.min { surfaceOrder($0.key, $0.index, $0.startedAt, $1.key, $1.index, $1.startedAt) }?.key
+    }
+
+    /// One discovery at a time, at most one every `discoveryInterval` seconds. A clock that went backwards
+    /// does not hold a run back.
+    static func discoveryDue(last: TimeInterval?, now: TimeInterval, inFlight: Bool) -> Bool {
+        guard !inFlight else { return false }
+        guard let last else { return true }
+        return now < last || now - last >= discoveryInterval
+    }
+
+    /// A surface Coucou never heard from (no hook event with a valid token) may sit on an open permission dialog:
+    /// typing Enter would answer it. Every such surface is marked, whatever the session file says (its
+    /// `agentLifecycle` is user writable and was seen saying `running` after a Stop). Only a turn level hook
+    /// event of that surface or the "Answered" click clears the mark.
+    static func needsDialogMark(heard: Bool) -> Bool { !heard }
+
+    /// Chip / line labels of the surfaces of one pill: the short tab title, "Session" without one, and
+    /// ` 2`, ` 3`… when two share a label.
+    static func surfaceLabels(titles: [String?], fallback: String) -> [String] {
+        var seen: [String: Int] = [:]
+        return titles.map { t in
+            let base = t.map { pillLabel($0) } ?? fallback
+            let n = (seen[base] ?? 0) + 1
+            seen[base] = n
+            return n == 1 ? base : "\(base) \(n)"
+        }
+    }
+
+    // MARK: tree
+
+    private static func cleanTitle(_ raw: Any?) -> String? {
+        (raw as? String).flatMap { cleanLabel(stripLeadingGlyphs($0)) }
+    }
+
+    /// `windows[].workspaces[]{id,title,index,selected,panes[].surfaces[]{id,type,index,title}}` of the rpc
+    /// `system.tree`, at the root or under `result`. Ids must be UUIDs, titles are cleaned, at most
+    /// `maxWorkspaces` workspaces and `maxTreeSurfaces` surfaces each. The index of a workspace is its
+    /// position in the traversal (windows in order, then the workspace index). `truncated` is true when a cap
+    /// cut something off: such a tree cannot say that a surface does not exist. nil for anything else.
+    static func parseTreeChecked(_ json: String) -> CmuxParsedTree? {
+        guard let data = json.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let body = root["windows"] != nil ? root : ((root["result"] as? [String: Any]) ?? root)
+        guard let windows = body["windows"] as? [[String: Any]] else { return nil }
+        var out: [CmuxTreeWorkspace] = []
+        var seen = Set<String>()
+        var truncated = false
+        for window in windows {
+            let list = ((window["workspaces"] as? [[String: Any]]) ?? [])
+                .sorted { ($0["index"] as? Int ?? Int.max) < ($1["index"] as? Int ?? Int.max) }
+            for ws in list {
+                guard let id = ws["id"] as? String, isUUID(id), seen.insert(id.lowercased()).inserted else { continue }
+                guard out.count < maxWorkspaces else { truncated = true; continue }
+                var surfaces: [CmuxTreeSurface] = []
+                var seenSurfaces = Set<String>()
+                for pane in (ws["panes"] as? [[String: Any]]) ?? [] {
+                    for sf in (pane["surfaces"] as? [[String: Any]]) ?? [] {
+                        guard let sid = sf["id"] as? String, isUUID(sid),
+                              seenSurfaces.insert(sid.lowercased()).inserted else { continue }
+                        guard surfaces.count < maxTreeSurfaces else { truncated = true; continue }
+                        let rawType = (sf["type"] as? String) ?? ""
+                        let type = !rawType.isEmpty && rawType.utf8.count <= 24
+                            && rawType.utf8.allSatisfy({ ($0 >= 0x61 && $0 <= 0x7A) || $0 == 0x5F }) ? rawType : "other"
+                        surfaces.append(CmuxTreeSurface(id: sid, title: cleanTitle(sf["title"]) ?? "", type: type,
+                                                        index: sf["index"] as? Int ?? surfaces.count))
+                    }
+                }
+                surfaces.sort { $0.index < $1.index }
+                out.append(CmuxTreeWorkspace(id: id, title: cleanTitle(ws["title"]) ?? "", index: out.count,
+                                             selected: ws["selected"] as? Bool ?? false, surfaces: surfaces))
+            }
+        }
+        return CmuxParsedTree(workspaces: out, truncated: truncated)
+    }
+
+    static func parseTree(_ json: String) -> [CmuxTreeWorkspace]? {
+        parseTreeChecked(json)?.workspaces
+    }
+
+    // MARK: session file
+
+    /// The sessions of `claude-hook-sessions.json` that are the CURRENT session of their surface
+    /// (`activeSessionsBySurface`), with valid UUID ids, a live process (`isLive(pid, pidStartSeconds)`) and
+    /// a cwd that passes `isValidFolder` (else ""). At most `maxFileSessions`. nil when the file does not
+    /// have the expected maps. Nothing in it is a credential.
+    static func parseSessionFile(_ data: Data,
+                                 isLive: (Int32, Int) -> Bool = { _, _ in true }) -> [CmuxFileSession]? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let sessions = root["sessions"] as? [String: Any],
+              let active = root["activeSessionsBySurface"] as? [String: Any] else { return nil }
+        var out: [CmuxFileSession] = []
+        for (surfaceKeyRaw, value) in active.sorted(by: { $0.key < $1.key }) {
+            guard out.count < maxFileSessions else { break }
+            guard isUUID(surfaceKeyRaw), let a = value as? [String: Any],
+                  let sid = a["sessionId"] as? String, isValidId(sid),
+                  let s = sessions[sid] as? [String: Any], (s["sessionId"] as? String) == sid,
+                  let surface = s["surfaceId"] as? String, isUUID(surface),
+                  surface.caseInsensitiveCompare(surfaceKeyRaw) == .orderedSame,
+                  let workspace = s["workspaceId"] as? String, isUUID(workspace),
+                  let pidValue = s["pid"] as? Int, pidValue > 0, pidValue <= Int(Int32.max),
+                  let pidStart = s["pidStartSeconds"] as? Int else { continue }
+            let pid = Int32(pidValue)
+            guard isLive(pid, pidStart) else { continue }
+            let cwd = (s["cwd"] as? String).flatMap { isValidFolder($0) ? $0 : nil } ?? ""
+            let rawLifecycle = (s["agentLifecycle"] as? String) ?? ""
+            let lifecycle = rawLifecycle.utf8.count <= 24 && rawLifecycle.unicodeScalars.allSatisfy({ $0.isASCII && CharacterSet.alphanumerics.contains($0) })
+                ? rawLifecycle : ""
+            out.append(CmuxFileSession(sessionId: sid, surfaceId: surface, workspaceId: workspace, cwd: cwd,
+                                       lifecycle: lifecycle, pid: pid, pidStart: pidStart,
+                                       startedAt: (s["startedAt"] as? Double) ?? 0))
+        }
+        return out
+    }
+
+    // MARK: reconcile
+
+    /// A surface whose session ended is not planned again by a discovery that starts within this long: the
+    /// snapshot may have been read before the SessionEnd, or while the process was still shutting down.
+    static let endedGrace: TimeInterval = 10
+
+    /// What discovery changes. With a tree: one workspace plan per workspace that has an agent surface (a
+    /// terminal surface with a live session in the file, or one the hooks reported with a valid token); a
+    /// surface lives under the pill of the tree's workspace (an entry filed under another pill is moved, unless
+    /// that pill is protected). Entries the tree does not account for are dropped, except those of a protected
+    /// pill, those without a surface id (left to the time rule), those heard after the snapshot began, those of
+    /// another socket than the tree's, and all of them when the tree was cut at a cap. Without a readable
+    /// session file an entry the tree still lists as a terminal stays an agent surface. A pill left with no
+    /// surface is dropped. New pills stop at `maxTasks`. Without a tree (no token) nothing is dropped and the
+    /// pills come from the session file alone, grouped by workspace. Without either, nothing happens.
+    /// `ended` holds the surface keys of sessions that just ended, with the time.
+    static func reconcile(snapshot: CmuxSnapshot, entries: [CmuxSurface], protected: Set<String>,
+                          ended: [String: TimeInterval] = [:]) -> CmuxReconcilePlan {
+        var plan = CmuxReconcilePlan()
+        let byKey = Dictionary(entries.map { ($0.key, $0) }, uniquingKeysWith: { a, _ in a })
+        let files = Dictionary((snapshot.sessions ?? []).map { (sanitize($0.surfaceId), $0) },
+                               uniquingKeysWith: { a, b in a.startedAt <= b.startedAt ? a : b })
+        func recentlyEnded(_ key: String) -> Bool {
+            guard let at = ended[key] else { return false }
+            return snapshot.startedAt < at + endedGrace
+        }
+        var candidates: [CmuxWorkspacePlan] = []
+        var kept = Set<String>()
+        var rehomed = Set<String>()
+
+        if let tree = snapshot.tree {
+            for ws in tree {
+                guard let wk = workspaceKey(ws.id) else { continue }
+                let taskId = taskPrefix + wk
+                var surfaces: [CmuxSurfacePlan] = []
+                for sf in ws.surfaces where sf.type == "terminal" {
+                    let key = sanitize(sf.id)
+                    if recentlyEnded(key) { continue }
+                    var file = files[key]
+                    if let f = file, f.workspaceId.caseInsensitiveCompare(ws.id) != .orderedSame { file = nil }
+                    let entry = byKey[key]
+                    let isAgent = file != nil || entry?.heard == true || (snapshot.sessions == nil && entry != nil)
+                    guard isAgent else { continue }
+                    if let entry, entry.taskId != taskId, protected.contains(entry.taskId) {
+                        // Its pill is in use (a card, the open reply view): left exactly where it is.
+                        kept.insert(key)
+                        continue
+                    }
+                    guard surfaces.count < maxSurfacesPerTask else { break }
+                    surfaces.append(CmuxSurfacePlan(key: key, surfaceId: sf.id, title: sf.title.isEmpty ? nil : sf.title,
+                                                    index: sf.index, sessionId: file?.sessionId ?? "",
+                                                    cwd: file?.cwd ?? "", startedAt: file?.startedAt,
+                                                    lifecycle: file?.lifecycle))
+                    kept.insert(key)
+                    if let entry, entry.taskId != taskId { rehomed.insert(key) }
+                }
+                guard !surfaces.isEmpty else { continue }
+                candidates.append(CmuxWorkspacePlan(taskId: taskId, workspaceId: ws.id,
+                                                    title: ws.title.isEmpty ? nil : ws.title,
+                                                    index: ws.index, surfaces: surfaces))
+            }
+            var removed = Set<String>()
+            if !snapshot.treeTruncated {
+                for e in entries where !kept.contains(e.key) {
+                    // Only what this tree can speak for: the same socket, a surface id, nothing newer than the run.
+                    guard !e.surfaceId.isEmpty, !snapshot.socketPath.isEmpty, e.socketPath == snapshot.socketPath,
+                          e.lastSeen < snapshot.startedAt, !protected.contains(e.taskId) else { continue }
+                    removed.insert(e.key)
+                }
+            }
+            plan.removeKeys = removed.sorted()
+            // A pill the plan does not keep goes when none of its entries stays under it (removed or moved).
+            let planned = Set(candidates.map { $0.taskId })
+            for task in Set(entries.map { $0.taskId }).subtracting(planned).sorted() {
+                let stays = entries.contains { $0.taskId == task && !removed.contains($0.key) && !rehomed.contains($0.key) }
+                if !stays { plan.removeTasks.append(task) }
+            }
+        } else if let sessions = snapshot.sessions {
+            var order: [String] = []
+            var groups: [String: [CmuxFileSession]] = [:]
+            for f in sessions.sorted(by: { ($0.startedAt, $0.surfaceId) < ($1.startedAt, $1.surfaceId) })
+            where !recentlyEnded(sanitize(f.surfaceId)) {
+                let wk = f.workspaceId.lowercased()
+                if groups[wk] == nil { order.append(wk) }
+                groups[wk, default: []].append(f)
+            }
+            for (i, wk) in order.enumerated() {
+                let surfaces = (groups[wk] ?? []).prefix(maxSurfacesPerTask).map {
+                    CmuxSurfacePlan(key: sanitize($0.surfaceId), surfaceId: $0.surfaceId, title: nil, index: nil,
+                                    sessionId: $0.sessionId, cwd: $0.cwd, startedAt: $0.startedAt,
+                                    lifecycle: $0.lifecycle)
+                }
+                guard let first = groups[wk]?.first else { continue }
+                candidates.append(CmuxWorkspacePlan(taskId: taskPrefix + wk, workspaceId: first.workspaceId,
+                                                    title: nil, index: i, surfaces: Array(surfaces)))
+            }
+        } else {
+            return plan
+        }
+
+        // New pills stop at the cap; a pill that exists already is always kept.
+        let existing = Set(entries.map { $0.taskId }).subtracting(plan.removeTasks)
+        var count = existing.count
+        for c in candidates {
+            if existing.contains(c.taskId) { plan.workspaces.append(c); continue }
+            guard count < maxTasks else { continue }
+            count += 1
+            plan.workspaces.append(c)
+        }
+        return plan
+    }
+}
+
+/// One per agent surface (a Claude session in a cmux terminal); a pill (workspace) holds one or more.
+/// The capability is a credential: memory only, never logged or persisted.
+struct CmuxSurface: Equatable {
+    var taskId: String                  // pill id (workspace)
     var surfaceId: String
     var workspaceId: String
     var socketPath: String
     var capability: String
     var sessionId: String
     var lastSeen: TimeInterval
+    /// Registry key (surface level). Empty only for a value built by hand: the registry always sets it.
+    var key: String = ""
+    var title: String? = nil            // tab title, cleaned
+    var index: Int? = nil               // workspace wide index from the tree
+    var startedAt: TimeInterval? = nil  // from the cmux session file
+    var state: String = "idle"          // BotState raw value of this session
+    /// True once a hook event of this surface carried a valid cmux context (surface, workspace, socket and
+    /// token as one unit) that the registry accepted. A tokenless event, the cmux tree and the session file never
+    /// set it: they cannot prove that the surface runs an agent session.
+    var heard: Bool = false
 
     var canFocusExactly: Bool {
         !surfaceId.isEmpty && !workspaceId.isEmpty && !socketPath.isEmpty && !capability.isEmpty
     }
+
+    /// The one rule for typing into a surface: Coucou holds a token that came with the ids of this very surface
+    /// in a hook event (its own unit). A surface known only through discovery or the session file has none, and a
+    /// token of another surface, even on the same socket, is never lent to it.
+    var canType: Bool { canFocusExactly && heard }
 }
 
 struct CmuxRegistry {
+    /// Keyed by surface key.
     private(set) var surfaces: [String: CmuxSurface] = [:]
+    /// Pill id → sticky main surface key.
+    private(set) var mainKeys: [String: String] = [:]
+    /// True when the last `note` created its entry (a surface the registry did not know).
+    private(set) var lastNoteCreated = false
+    /// True when the last `note` was the first event of its surface that carried an accepted valid context:
+    /// a surface that discovery registered earlier, but whose hook never spoke, counts as new.
+    private(set) var lastNoteFirstHeard = false
 
-    /// Upsert. surfaceId, workspaceId, socketPath and capability are one unit: replaced together and
-    /// only when the incoming capability is non empty. Without a capability they stay as they were
-    /// (lastSeen and sessionId are still refreshed). A live entry (it has a socket path and a
-    /// capability) never gets another socket path while its stored socket file is still a socket owned by
-    /// the user: the whole unit is refused and false is returned. When that file is gone (cmux restarted
-    /// somewhere else without a termination notice), the new unit is accepted.
+    private func count(ofTask taskId: String) -> Int { surfaces.values.filter { $0.taskId == taskId }.count }
+
+    /// The pill a surface belongs to. One source of truth: an event routes to the pill of its surface's entry,
+    /// whatever workspace it names, so a forged or stale workspace id never opens a second pill for a surface.
+    func pillId(forKey key: String) -> String? { surfaces[key]?.taskId }
+
+    /// Upsert from a hook event. surfaceId, workspaceId, socketPath and capability are one unit: replaced
+    /// together and only when the incoming capability is non empty. Without a capability they stay as they
+    /// were (lastSeen and sessionId are still refreshed) and the surface is not marked heard. A live entry (it
+    /// has a socket path and a capability) never gets another socket path while its stored socket file is still
+    /// a socket owned by the user: the whole unit is refused and false is returned. When that file is gone
+    /// (cmux restarted somewhere else without a termination notice), the new unit is accepted.
+    /// `key` is the surface key; without it the entry is keyed by the task id (one surface per task). An
+    /// existing entry keeps its pill (`taskId` only places a new one).
+    /// A pill never holds more than `maxSurfacesPerTask` surfaces: a ninth is not registered.
     @discardableResult
-    mutating func note(taskId: String, surfaceId: String, workspaceId: String, socketPath: String,
+    mutating func note(taskId: String, key: String? = nil, surfaceId: String, workspaceId: String, socketPath: String,
                        capability: String, sessionId: String, now: TimeInterval,
                        isStoredSocketTrusted: (String) -> Bool = CmuxRouting.socketFileIsTrusted(path:)) -> Bool {
-        var s = surfaces[taskId] ?? CmuxSurface(taskId: taskId, surfaceId: "", workspaceId: "",
-                                                socketPath: "", capability: "", sessionId: "",
-                                                lastSeen: now)
+        let k = key ?? taskId
+        let existing = surfaces[k]
+        let isNew = existing == nil
+        let wasHeard = existing?.heard ?? false
+        lastNoteCreated = false
+        lastNoteFirstHeard = false
+        if isNew && count(ofTask: taskId) >= CmuxRouting.maxSurfacesPerTask { return true }
+        var s = existing ?? CmuxSurface(taskId: taskId, surfaceId: "", workspaceId: "",
+                                        socketPath: "", capability: "", sessionId: "",
+                                        lastSeen: now, key: k)
         var accepted = true
+        var unitAccepted = false
         if !capability.isEmpty {
             let live = !s.socketPath.isEmpty && !s.capability.isEmpty
             if live && s.socketPath != socketPath && isStoredSocketTrusted(s.socketPath) {
@@ -817,66 +1269,178 @@ struct CmuxRegistry {
                 s.workspaceId = workspaceId
                 s.socketPath = socketPath
                 s.capability = capability
+                unitAccepted = true
             }
         }
         if !sessionId.isEmpty { s.sessionId = sessionId }
         s.lastSeen = now
-        surfaces[taskId] = s
+        if unitAccepted { s.heard = true }
+        surfaces[k] = s
+        lastNoteCreated = isNew
+        lastNoteFirstHeard = unitAccepted && !wasHeard
+        refreshMain(taskId: s.taskId)
         return accepted
     }
 
-    func surface(for taskId: String) -> CmuxSurface? { surfaces[taskId] }
+    /// Upsert from discovery (the cmux tree and session file). Sets ids, title, index, start time and
+    /// session id. Never touches a token backed unit (its ids, socket path and token stay as the hook gave
+    /// them), never sets a token, never marks the surface as heard: a surface known this way cannot be typed
+    /// into. The tree is the authority on which workspace a surface is in: an entry filed under another pill is
+    /// moved to `taskId`. lastSeen is refreshed only for an entry that was never heard: discovery must not keep
+    /// a heard session alive after its process is gone (the time rule decides that).
+    /// False when the pill is full and the surface is new or moves in.
+    @discardableResult
+    mutating func noteDiscovered(taskId: String, key: String, surfaceId: String, workspaceId: String,
+                                 socketPath: String, sessionId: String, title: String?, index: Int?,
+                                 startedAt: TimeInterval?, now: TimeInterval) -> Bool {
+        let existing = surfaces[key]
+        let arrives = existing == nil || existing?.taskId != taskId
+        if arrives && count(ofTask: taskId) >= CmuxRouting.maxSurfacesPerTask { return false }
+        var s = existing ?? CmuxSurface(taskId: taskId, surfaceId: "", workspaceId: "",
+                                        socketPath: "", capability: "", sessionId: "",
+                                        lastSeen: now, key: key)
+        let oldTask = s.taskId
+        s.taskId = taskId
+        if s.capability.isEmpty {
+            s.surfaceId = surfaceId
+            s.workspaceId = workspaceId
+            if !socketPath.isEmpty { s.socketPath = socketPath }
+        }
+        if !sessionId.isEmpty { s.sessionId = sessionId }
+        if let title { s.title = title }
+        if let index { s.index = index }
+        if let startedAt { s.startedAt = startedAt }
+        if !s.heard { s.lastSeen = now }
+        surfaces[key] = s
+        if oldTask != taskId { refreshMain(taskId: oldTask) }
+        refreshMain(taskId: taskId)
+        return true
+    }
 
-    mutating func remove(taskId: String) { surfaces[taskId] = nil }
+    /// The main surface of a pill is kept while it lives; a main without a tree index yields to a surface
+    /// that has one (the first hook event of a workspace can come from a helper).
+    private mutating func refreshMain(taskId: String) {
+        let mine = surfaces.values.filter { $0.taskId == taskId }
+        guard !mine.isEmpty else { mainKeys[taskId] = nil; return }
+        mainKeys[taskId] = CmuxRouting.mainSurfaceKey(
+            current: mainKeys[taskId],
+            candidates: mine.map { (key: $0.key, index: $0.index, startedAt: $0.startedAt) })
+    }
+
+    mutating func setState(key: String, _ state: String) {
+        surfaces[key]?.state = state
+    }
+
+    func surface(key: String) -> CmuxSurface? { surfaces[key] }
+
+    /// The main surface of the pill.
+    func surface(for taskId: String) -> CmuxSurface? {
+        guard let key = mainKeys[taskId] else { return nil }
+        return surfaces[key]
+    }
+
+    /// Surfaces of a pill, the main one first, then by index, start time and key.
+    func surfaces(ofTask taskId: String) -> [CmuxSurface] {
+        let mine = surfaces.values.filter { $0.taskId == taskId }
+        let main = mainKeys[taskId]
+        return mine.sorted { a, b in
+            if (a.key == main) != (b.key == main) { return a.key == main }
+            return CmuxRouting.surfaceOrder(a.key, a.index, a.startedAt, b.key, b.index, b.startedAt)
+        }
+    }
+
+    var taskIds: Set<String> { Set(surfaces.values.map { $0.taskId }) }
+
+    /// Most recent lastSeen of the surfaces of the pill.
+    func pillLastSeen(_ taskId: String) -> TimeInterval? {
+        surfaces.values.filter { $0.taskId == taskId }.map { $0.lastSeen }.max()
+    }
+
+    /// Folded state of the pill (see `CmuxRouting.foldedState`). nil when the pill has no surface.
+    func foldedState(ofTask taskId: String) -> String? {
+        let mine = surfaces.values.filter { $0.taskId == taskId }
+        guard !mine.isEmpty else { return nil }
+        return CmuxRouting.foldedState(mine.map { $0.state })
+    }
+
+    mutating func remove(key: String) {
+        guard let s = surfaces.removeValue(forKey: key) else { return }
+        refreshMain(taskId: s.taskId)
+    }
+
+    /// Every surface of the pill.
+    mutating func remove(taskId: String) {
+        for (k, s) in surfaces where s.taskId == taskId { surfaces[k] = nil }
+        mainKeys[taskId] = nil
+    }
 
     /// cmux quit: its tokens are dead. Entries and ids stay, so the next event restores them.
     mutating func clearCredentials() {
         for k in surfaces.keys { surfaces[k]?.capability = "" }
     }
 
-    /// Credential order: the target's own token, else the freshest live token, else the stored
-    /// password, else none. Only entries that can address a surface count.
+    /// Credential order: the target's own token (its main surface), else the freshest live token, else
+    /// the stored password, else none. Only entries that can address a surface count.
     func credential(for taskId: String?, hasPassword: Bool) -> CmuxCredential {
-        if let taskId, let own = surfaces[taskId], own.canFocusExactly { return .token(own) }
+        if let taskId, let own = surface(for: taskId), own.canFocusExactly { return .token(own) }
         let freshest = surfaces.values.filter { $0.canFocusExactly }
-            .max { ($0.lastSeen, $0.taskId) < ($1.lastSeen, $1.taskId) }
+            .max { ($0.lastSeen, $0.key) < ($1.lastSeen, $1.key) }
         if let freshest { return .token(freshest) }
         return hasPassword ? .password : CmuxCredential.none
     }
 
-    /// Credential for typing into `taskId`: its own token, else the freshest token on the same socket.
-    /// Never the password: only a token proves the caller belongs to the cmux that owns the socket.
+    /// Credential for typing into a surface: its own token, nothing else. Never the password, never a token of
+    /// another surface on the same socket, never the ids that discovery read: only a hook event of this very
+    /// surface proved that it runs an agent session and gave Coucou the token that goes with its ids.
+    func sendCredential(forKey key: String) -> CmuxCredential {
+        guard let target = surfaces[key], target.canType else { return CmuxCredential.none }
+        return .token(target)
+    }
+
+    /// Credential for typing into the main surface of a pill.
     func sendCredential(for taskId: String) -> CmuxCredential {
-        guard let target = surfaces[taskId] else { return CmuxCredential.none }
+        guard let key = mainKeys[taskId] else { return CmuxCredential.none }
+        return sendCredential(forKey: key)
+    }
+
+    /// Credential for bringing a surface to the front (select a workspace, focus a panel: nothing is typed): its
+    /// own token, else the freshest on the same socket. Never the password.
+    func jumpCredential(forKey key: String) -> CmuxCredential {
+        guard let target = surfaces[key] else { return CmuxCredential.none }
         if target.canFocusExactly { return .token(target) }
         guard !target.socketPath.isEmpty else { return CmuxCredential.none }
         let same = surfaces.values.filter { $0.canFocusExactly && $0.socketPath == target.socketPath }
-            .max { ($0.lastSeen, $0.taskId) < ($1.lastSeen, $1.taskId) }
+            .max { ($0.lastSeen, $0.key) < ($1.lastSeen, $1.key) }
         if let same { return .token(same) }
         return CmuxCredential.none
     }
 
-    /// Entries not seen for `staleAfter`, whatever the task state, except the `protected` ones
-    /// (a queued card, or the card on screen).
-    /// A `busy` id (mid turn, hooks can stay silent for a long time) is stale only after `busyStaleAfter`.
-    func staleTaskIds(now: TimeInterval, protected: Set<String>, busy: Set<String> = []) -> [String] {
+    /// Keys of the entries not seen for `staleAfter`, whatever their state, except those of a `protected`
+    /// pill or key (a queued card, the card on screen, the open reply view). A `busy` pill or key (mid turn,
+    /// hooks can stay silent for a long time) is stale only after `busyStaleAfter`. `only` narrows the
+    /// entries the rule may remove (with an authoritative tree, only the ones the tree cannot account for).
+    func staleTaskIds(now: TimeInterval, protected: Set<String>, busy: Set<String> = [],
+                      only: (CmuxSurface) -> Bool = { _ in true }) -> [String] {
         surfaces.values
             .filter {
-                let limit = busy.contains($0.taskId) ? CmuxRouting.busyStaleAfter : CmuxRouting.staleAfter
+                let isBusy = busy.contains($0.taskId) || busy.contains($0.key)
+                let limit = isBusy ? CmuxRouting.busyStaleAfter : CmuxRouting.staleAfter
                 return now - $0.lastSeen > limit && !protected.contains($0.taskId)
+                    && !protected.contains($0.key) && only($0)
             }
-            .map { $0.taskId }
+            .map { $0.key }
             .sorted()
     }
 
-    /// Task ids to evict so that count <= maxTasks. Only ids listed in `idle`, oldest lastSeen first, never `keep`.
+    /// Pill ids to evict so that the pill count <= maxTasks. Only ids listed in `idle`, oldest lastSeen
+    /// first, never `keep`.
     func evictionCandidates(idle: Set<String>, keep: String?) -> [String] {
-        let excess = surfaces.count - CmuxRouting.maxTasks
+        let pills = taskIds
+        let excess = pills.count - CmuxRouting.maxTasks
         guard excess > 0 else { return [] }
-        let candidates = surfaces.values
-            .filter { idle.contains($0.taskId) && $0.taskId != keep }
-            .sorted { $0.lastSeen < $1.lastSeen }
-            .map { $0.taskId }
+        let candidates = pills
+            .filter { idle.contains($0) && $0 != keep }
+            .sorted { (pillLastSeen($0) ?? 0, $0) < (pillLastSeen($1) ?? 0, $1) }
         return Array(candidates.prefix(excess))
     }
 }
@@ -941,29 +1505,37 @@ struct CmuxQueuedCard: Equatable {
     var tool: String
     var inputKey: String
     var arrivedAt: TimeInterval
+    /// Surface key of the session that asked. Defaults to the task id (one surface per pill).
+    var surfaceKey: String = ""
 }
 
 struct CmuxCardQueue {
     /// Older entries are not worth presenting (the hook gives up at 118 s).
     static let maxAge: TimeInterval = 110
     static let maxCards = 16
-    static let maxCardsPerTask = 2
+    static let maxCardsPerSurface = 2
+    static let maxCardsPerPill = 6
     private(set) var cards: [CmuxQueuedCard] = []
     private var nextId = 1
 
-    /// False when the queue is full (16 in total, 2 per task): the request is answered "ask" at once.
-    func canAccept(taskId: String) -> Bool {
-        cards.count < Self.maxCards && cards.filter { $0.taskId == taskId }.count < Self.maxCardsPerTask
+    /// False when the queue is full (16 in total, 2 per surface, 6 per pill): the request is answered
+    /// "ask" at once. Without a surface key the task id stands for it.
+    func canAccept(taskId: String, surfaceKey: String? = nil) -> Bool {
+        let key = surfaceKey ?? taskId
+        return cards.count < Self.maxCards
+            && cards.filter { $0.surfaceKey == key }.count < Self.maxCardsPerSurface
+            && cards.filter { $0.taskId == taskId }.count < Self.maxCardsPerPill
     }
 
     @discardableResult
     mutating func enqueue(kind: CmuxCardKind, taskId: String, sessionId: String, tool: String,
                           inputKey: String, now: TimeInterval, atFront: Bool = false,
-                          arrivedAt: TimeInterval? = nil) -> Int {
+                          arrivedAt: TimeInterval? = nil, surfaceKey: String? = nil) -> Int {
         let id = nextId
         nextId += 1
         let card = CmuxQueuedCard(id: id, kind: kind, taskId: taskId, sessionId: sessionId,
-                                  tool: tool, inputKey: inputKey, arrivedAt: arrivedAt ?? now)
+                                  tool: tool, inputKey: inputKey, arrivedAt: arrivedAt ?? now,
+                                  surfaceKey: surfaceKey ?? taskId)
         if atFront { cards.insert(card, at: 0) } else { cards.append(card) }
         return id
     }
@@ -1012,7 +1584,15 @@ struct CmuxCardQueue {
         return ids
     }
 
+    mutating func removeAll(surfaceKey: String) -> [Int] {
+        let ids = cards.filter { $0.surfaceKey == surfaceKey }.map { $0.id }
+        cards.removeAll { $0.surfaceKey == surfaceKey }
+        return ids
+    }
+
     func hasCards(for taskId: String) -> Bool { cards.contains { $0.taskId == taskId } }
+
+    func hasCards(forSurface key: String) -> Bool { cards.contains { $0.surfaceKey == key } }
 }
 
 #endif

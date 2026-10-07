@@ -34,10 +34,20 @@ struct ConversationStore<Value> {
 
     mutating func set(_ id: ConversationID, _ value: Value) { items[id] = value }
 
-    /// Changes one conversation in place; the others are untouched.
+    /// Changes one conversation in place, creating it when it has none; the others are untouched.
     mutating func mutate(_ id: ConversationID, _ body: (inout Value) -> Void) {
         let fallback = empty
         body(&items[id, default: fallback])
+    }
+
+    /// Changes one conversation in place only when it exists. Bookkeeping of a request that may outlive its
+    /// conversation (a turn of a removed agent ending) goes through here: it must never bring one back.
+    /// False when there was nothing to change.
+    @discardableResult
+    mutating func mutateIfPresent(_ id: ConversationID, _ body: (inout Value) -> Void) -> Bool {
+        guard items[id] != nil else { return false }
+        body(&items[id]!)
+        return true
     }
 
     mutating func remove(_ id: ConversationID) { items[id] = nil }
@@ -49,6 +59,34 @@ struct ConversationStore<Value> {
         for name in gone { items[.hermes(name)] = nil }
         return gone.sorted()
     }
+}
+
+/// Generations of the conversations. A request keeps the generation it started under and writes back only while
+/// `isCurrent`: a conversation that was cleared or dropped since has another generation (or none), so a stale turn
+/// never touches the new one. The counter is global and never reused, and only `ensure` and `renew` create a
+/// generation: reading or finishing a request never does.
+struct ConversationGenerations {
+    private var counter = 0
+    private var current: [ConversationID: Int] = [:]
+
+    /// The generation of the conversation, a fresh one when it has none.
+    mutating func ensure(_ id: ConversationID) -> Int {
+        if let g = current[id] { return g }
+        counter += 1
+        current[id] = counter
+        return counter
+    }
+
+    /// A new generation: whatever started under the old one is stale from now on.
+    mutating func renew(_ id: ConversationID) {
+        counter += 1
+        current[id] = counter
+    }
+
+    /// The conversation is gone: no request of it is current any more.
+    mutating func drop(_ id: ConversationID) { current[id] = nil }
+
+    func isCurrent(_ id: ConversationID, _ generation: Int) -> Bool { current[id] == generation }
 }
 
 /// Display names of Hermes agents. The identity (`HermesAgent.name`) never changes: Keychain binding, pill id,
