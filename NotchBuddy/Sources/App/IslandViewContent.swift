@@ -31,6 +31,7 @@ struct IslandViewContent: View {
         case .settings:  SettingsIslandView(state: state)
         case .greeting:  EmptyView()  // GreetingCanvasView overlaid in IslandRootView
         case .wardrobe:  WardrobeView(state: state)
+        case .recap:     WeeklyRecapCardView(state: state)
         }
     }
 }
@@ -136,8 +137,14 @@ struct OverviewView: View {
                 #if !APPSTORE
                 if state.showingPlanDetail {
                     CardBackground(wash: nil)
-                    ClaudePlanCardView(usage: state.claudePlanUsage)
-                        .transition(.opacity)
+                    Group {
+                        if state.planDetailIsCodex {
+                            CodexPlanCardView(usage: state.codexPlanUsage)
+                        } else {
+                            ClaudePlanCardView(usage: state.claudePlanUsage)
+                        }
+                    }
+                    .transition(.opacity)
                 }
                 #endif
 
@@ -275,7 +282,10 @@ struct OverviewView: View {
                 NSWorkspace.shared.openApplication(at: url, configuration: .init(), completionHandler: nil)
             }
             #endif
-        case "agent_gemini", "agent_antigravity":
+        case "agent_claude-desktop":
+            openClaudeDesktopApp()
+        case "agent_gemini", "agent_antigravity",
+             "agent_copilot", "agent_muse", "agent_opencode", "agent_amp":
             #if !APPSTORE
             let terminalBundleIds = ["com.apple.Terminal", "com.googlecode.iterm2",
                                      "net.kovidgoyal.kitty", "com.mitchellh.ghostty"]
@@ -369,8 +379,11 @@ struct ApprovalView: View {
                     PrimaryButton("Allow") {
                         HookServer.shared.sendApprovalDecision("allow")
                     }
-                    // Codex rejects updatedPermissions, so "Always" is not offered
-                    if approval?.pillId != "agent_codex" {
+                    // Codex, Copilot CLI and Muse Code do not support updatedPermissions
+                    let hideAlways = approval?.pillId == "agent_codex"
+                        || approval?.pillId == "agent_copilot"
+                        || approval?.pillId == "agent_muse"
+                    if !hideAlways {
                         SecondaryButton("Always") {
                             HookServer.shared.sendApprovalDecision("always")
                         }
@@ -413,9 +426,6 @@ struct QuestionView: View {
     private static func advanceTitle(_ isLast: Bool) -> String {
         isLast ? String(localized: "Send") : String(localized: "Next")
     }
-    private static func advanceKey(_ isLast: Bool) -> LocalizedStringKey {
-        isLast ? "Send" : "Next"
-    }
 
     var body: some View {
         ZStack {
@@ -455,7 +465,7 @@ struct QuestionView: View {
                     Text(item.question)
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(Color(hex: "#F5F6F8"))
-                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                     // Options (wrapping) or "Other…" compact inline row
                     if curOther {
                         HStack(spacing: 6) {
@@ -488,6 +498,42 @@ struct QuestionView: View {
                             }
                             .buttonStyle(.plain)
                             .foregroundColor(Color(hex: "#6B7079"))
+                        }
+                    } else if item.hasDescriptions {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(Array(item.options.enumerated()), id: \.offset) { idx, opt in
+                                let isSelected = curSel.contains(opt.label)
+                                Button {
+                                    if isMulti {
+                                        toggleSelection(qi: qi, label: opt.label)
+                                    } else {
+                                        selectAndProceed(q: q, qi: qi, label: opt.label, isLast: isLast)
+                                    }
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(opt.label)
+                                            .font(.system(size: 12, weight: .medium))
+                                            .foregroundColor(isSelected ? Color(hex: "#67E8F9") : Color(hex: "#F5F6F8"))
+                                        if !opt.description.isEmpty {
+                                            Text(opt.description)
+                                                .font(.system(size: 11))
+                                                .foregroundColor(Color(hex: "#9AA0A8"))
+                                                .multilineTextAlignment(.leading)
+                                                .fixedSize(horizontal: false, vertical: true)
+                                        }
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.horizontal, 10).padding(.vertical, 6)
+                                    .background(isSelected ? Color(hex: "#22D3EE").opacity(0.22) : Color.white.opacity(0.07))
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(isSelected ? Color(hex: "#22D3EE").opacity(0.55) : Color.white.opacity(0.1), lineWidth: 1))
+                                }
+                                .buttonStyle(.plain)
+                                .keyboardShortcut(KeyEquivalent(Character(String(idx + 1))), modifiers: [])
+                            }
+                            SecondaryButton("Other…") {
+                                if qi < showOther.count { showOther[qi] = true }
+                            }
                         }
                     } else {
                         ChipFlowLayout(spacing: 6) {
@@ -522,7 +568,7 @@ struct QuestionView: View {
                     }
                     // Send/Next — only for multi-select (and not while "Other…" field is open)
                     if isMulti && !curOther {
-                        PrimaryButton(Self.advanceKey(isLast)) {
+                        PrimaryButton(verbatim: Self.advanceTitle(isLast)) {
                             proceedFromQuestion(q: q, qi: qi, isLast: isLast)
                         }
                         .disabled(!canProceed)
@@ -616,6 +662,15 @@ struct ErrorView: View {
     }
 }
 
+/// Brings the Claude desktop app forward (or launches it) — target of the Claude Desktop pill.
+private let claudeDesktopBundleId = "com.anthropic.claudefordesktop"
+
+private func openClaudeDesktopApp() {
+    if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: claudeDesktopBundleId) {
+        NSWorkspace.shared.openApplication(at: url, configuration: .init(), completionHandler: nil)
+    }
+}
+
 // MARK: - Finished
 
 struct FinishedView: View {
@@ -636,25 +691,40 @@ struct FinishedView: View {
                     .truncationMode(.tail)
                 HStack(spacing: 8) {
                     #if !APPSTORE
-                    if let t = state.focusTask, CmuxRouting.isCmuxTaskId(t.id) {
-                        PrimaryButton("Reply") { CmuxHub.open(.reply(taskId: t.id)) }
-                        SecondaryButton("Open terminal") {
-                            _ = CmuxJump.jump(for: t)
+                    let finishedInCmux = state.focusTask.map { CmuxRouting.isCmuxTaskId($0.id) } ?? false
+                    #else
+                    let finishedInCmux = false
+                    #endif
+                    if finishedInCmux {
+                        #if !APPSTORE
+                        if let t = state.focusTask {
+                            PrimaryButton("Reply") { CmuxHub.open(.reply(taskId: t.id)) }
+                            SecondaryButton("Open terminal") {
+                                _ = CmuxJump.jump(for: t)
+                                NotificationCenter.default.post(name: .islandCollapse, object: nil)
+                            }
+                        }
+                        #endif
+                    } else if state.focusTask?.id == "agent_claude-desktop" {
+                        // Sessions from the Claude desktop app live there, not in a terminal.
+                        PrimaryButton("Open Claude") {
+                            openClaudeDesktopApp()
                             NotificationCenter.default.post(name: .islandCollapse, object: nil)
                         }
                     } else {
-                    PrimaryButton("Open terminal") {
-                        let terminalBundleIds = ["com.apple.Terminal", "com.googlecode.iterm2", "net.kovidgoyal.kitty", "com.mitchellh.ghostty"]
-                        let activated = terminalBundleIds.compactMap { id in
-                            NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == id }
-                        }.first.map { $0.activate(options: .activateIgnoringOtherApps) }
-                        if activated == nil {
-                            NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"))
+                        #if !APPSTORE
+                        PrimaryButton("Open terminal") {
+                            let terminalBundleIds = ["com.apple.Terminal", "com.googlecode.iterm2", "net.kovidgoyal.kitty", "com.mitchellh.ghostty"]
+                            let activated = terminalBundleIds.compactMap { id in
+                                NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == id }
+                            }.first.map { $0.activate(options: .activateIgnoringOtherApps) }
+                            if activated == nil {
+                                NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"))
+                            }
+                            NotificationCenter.default.post(name: .islandCollapse, object: nil)
                         }
-                        NotificationCenter.default.post(name: .islandCollapse, object: nil)
+                        #endif
                     }
-                    }
-                    #endif
                     SecondaryButton("OK") {
                         NotificationCenter.default.post(name: .islandCollapse, object: nil)
                     }
@@ -969,7 +1039,7 @@ struct UploadingView: View {
                             .foregroundColor(Color(hex: "#34D399"))
                             .lineLimit(1).truncationMode(.middle)
                     } else {
-                        Text("Uploading \(Text(verbatim: state.droppedFile?.name ?? String(localized: "file")))")
+                        Text(String(format: String(localized: "Uploading %@"), state.droppedFile?.name ?? "file"))
                             .font(.system(size: 12.5))
                             .foregroundColor(Color(hex: "#A9ADB5"))
                             .lineLimit(1).truncationMode(.middle)
@@ -1000,8 +1070,9 @@ struct ChooseView: View {
         ZStack(alignment: .leading) {
             CardBackground(wash: nil)
             VStack(alignment: .leading, spacing: 8) {
-                let fileName = state.droppedFile?.name ?? String(localized: "file")
-                Text("\(Text(verbatim: fileName)) is ready.").font(.system(size: 14, weight: .semibold))
+                let fileName = state.droppedFile?.name ?? "file"
+                Text(String(format: String(localized: "file.ready %@"), fileName))
+                    .font(.system(size: 14, weight: .semibold))
                 Text("What do you want to do with it?").font(.system(size: 12.5)).foregroundColor(Color(hex: "#9398A1"))
                 HStack(spacing: 8) {
                     PrimaryButton("Ask a question") { state.view = .prompt }
@@ -1031,8 +1102,8 @@ struct MailView: View {
                 HStack(spacing: 6) {
                     Text("New email").font(.system(size: 12, weight: .semibold))
                     if let name = state.droppedFile?.name {
-                        Text("with").font(.system(size: 12)).foregroundColor(Color(hex: "#8E939C"))
-                        Text(name).font(.system(size: 12)).foregroundColor(Color(hex: "#8E939C"))
+                        Text(String(format: String(localized: "mail.with %@"), name))
+                            .font(.system(size: 12)).foregroundColor(Color(hex: "#8E939C"))
                             .lineLimit(1).truncationMode(.middle)
                     }
                 }
@@ -1056,7 +1127,7 @@ struct MailView: View {
                 }
 
                 HStack(spacing: 8) {
-                    PrimaryButton(isSending ? "Sending…" : "Send") {
+                    PrimaryButton(verbatim: isSending ? String(localized: "Sending…") : String(localized: "Send")) {
                         guard !isSending else { return }
                         sendMail()
                     }
@@ -1581,9 +1652,9 @@ struct SearchingView: View {
 
     var label: String {
         switch state.promptContext {
-        case .window(_, let title, _): return String(localized: "Claude is reading \(title)…")
-        case .file(let name, _): return String(localized: "Claude is reading \(name)…")
-        case nil: return String(localized: "Claude is searching…")
+        case .window(_, let title, _): return String(format: String(localized: "Claude is reading %@…"), title)
+        case .file(let name, _):       return String(format: String(localized: "Claude is reading %@…"), name)
+        case nil:                      return String(localized: "Claude is searching…")
         }
     }
 
@@ -1687,20 +1758,15 @@ struct IntegrationCardView: View {
 
     private var isConfigured: Bool {
         switch task.id {
-        case "integration_claude":
-            #if APPSTORE
-            // Sandboxed: can't read ~/.claude directly — check install flag set by HookServer
-            return UserDefaults.standard.bool(forKey: "coucouHooksInstalled")
+        // Cursor sessions are Claude Code running in Cursor's integrated terminal,
+        // so the Cursor pill is set up exactly when the Claude Code hooks are.
+        case "integration_claude", "agent_cursor":
+            return HookServer.claudeHooksInstalled()
+        case "agent_codex":
+            #if !APPSTORE
+            return HookServer.codexHooksInstalled()
             #else
-            let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/settings.json")
-            guard let data = try? Data(contentsOf: url),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let hooks = json["hooks"] as? [String: Any],
-                  let ss = hooks["SessionStart"] as? [[String: Any]] else { return false }
-            return ss.contains { ($0["hooks"] as? [[String: Any]])?.contains {
-                let cmd = $0["command"] as? String
-                return cmd?.contains("NotchBuddy") == true || cmd?.contains("coucou") == true
-            } ?? false }
+            return false
             #endif
         case "agent_gemini":
             #if !APPSTORE
@@ -1714,14 +1780,44 @@ struct IntegrationCardView: View {
             #else
             return false
             #endif
-        case "agent_cursor", "agent_codex":
-            return false  // coming soon
         case "integration_cmux":
             #if !APPSTORE
             return CmuxHub.isInstalled()
             #else
             return false
             #endif
+        case "agent_copilot":
+            #if !APPSTORE
+            return HookServer.copilotHooksInstalled()
+            #else
+            return false
+            #endif
+        case "agent_muse":
+            #if !APPSTORE
+            return HookServer.museHooksInstalled()
+            #else
+            return false
+            #endif
+        case "agent_opencode":
+            #if !APPSTORE
+            return HookServer.openCodePluginInstalled()
+            #else
+            return false
+            #endif
+        case "agent_amp":
+            #if !APPSTORE
+            return HookServer.ampPluginInstalled()
+            #else
+            return false
+            #endif
+        case "agent_hermes":
+            #if !APPSTORE
+            return HookServer.hermesPluginInstalled()
+            #else
+            return false
+            #endif
+        case "agent_claude-desktop":
+            return true  // nothing to install: the relay tags desktop sessions on its own
         case "integration_music":
             #if !APPSTORE
             return true  // Apple Music is always installed on macOS
@@ -1845,7 +1941,7 @@ struct IntegrationCardView: View {
         }
         if task.id == "integration_music" {
             if appState.musicAutomationDenied { return String(localized: "Automation not allowed") }
-            if appState.musicPlaying { return String(localized: "Playing · \(MusicController.shared.trackTitle ?? String(localized: "Unknown"))") }
+            if appState.musicPlaying { return String(format: String(localized: "Playing · %@"), MusicController.shared.trackTitle ?? String(localized: "Unknown")) }
             return String(localized: "Not playing")
         }
         #endif
@@ -1854,10 +1950,19 @@ struct IntegrationCardView: View {
                    : task.id == "integration_calcom"  ? appState.calcomError
                    : nil
         if let err = svcErr { return err }
-        let isHooks = task.id == "agent_gemini" || task.id == "agent_antigravity"
+        // Pills driven by hooks, never by a key: the idle card reports whether the
+        // hooks are in place. integration_claude read "Connected · loading…" with
+        // nothing left to load — a session replaces this card, it never resolves here.
+        let isHooks = task.id == "integration_claude" || task.id == "agent_gemini"
+                   || task.id == "agent_antigravity"  || task.id == "agent_cursor"
+                   || task.id == "agent_codex"        || task.id == "agent_copilot"
+                   || task.id == "agent_muse"         || task.id == "agent_opencode"
+                   || task.id == "agent_amp"          || task.id == "agent_hermes"
         let isAI    = ChatProvider(pillID: task.id) != nil
         if isConfigured {
             if isHooks { return String(localized: "Hooks installed") }
+            // No key or poller behind this pill: it only reflects hook events.
+            if task.id == "agent_claude-desktop" { return String(localized: "Ready · no setup needed") }
             if isAI {
                 let provider = ChatProvider(pillID: task.id)!
                 if provider == .hermes {
@@ -2043,7 +2148,7 @@ struct IntegrationCardView: View {
                         #endif
                     } else if let provider = ChatProvider(pillID: task.id) {
                         if isConfigured {
-                            Button("Chat with \(task.name)") {
+                            Button(String(format: String(localized: "Chat with %@"), task.name)) {
                                 switchChatProvider(provider)
                             }
                             .font(.system(size: 11, weight: .medium))
@@ -2525,7 +2630,7 @@ struct GitHubPulseCardView: View {
                 }()
                 GitHubStatRow(
                     icon: "arrow.triangle.pull", iconColor: ciColor(prWorst),
-                    label: "My PRs", value: prValue
+                    label: String(localized: "My PRs"), value: prValue
                 ) { onTapSection(.myPRs) }
 
                 // To review
@@ -2533,7 +2638,7 @@ struct GitHubPulseCardView: View {
                 GitHubStatRow(
                     icon: "eye",
                     iconColor: reviewCount > 0 ? "#8AB4F8" : "#6B7079",
-                    label: "To review",
+                    label: String(localized: "To review"),
                     value: "\(reviewCount)"
                 ) { onTapSection(.toReview) }
 
@@ -2554,7 +2659,7 @@ struct GitHubPulseCardView: View {
                 }()
                 GitHubStatRow(
                     icon: ciIcon, iconColor: ciIconColor,
-                    label: "Default branch CI", value: ciValue
+                    label: String(localized: "Default branch CI"), value: ciValue
                 ) { onTapSection(.mainCI) }
             }
             .padding(.top, 6)
@@ -2575,7 +2680,7 @@ struct GitHubPulseCardView: View {
 private struct GitHubStatRow: View {
     let icon: String
     let iconColor: String
-    let label: LocalizedStringKey
+    let label: String
     let value: String
     let action: () -> Void
 
@@ -4571,7 +4676,7 @@ extension CardBackground where Content == EmptyView {
 
 struct AgentWho: View {
     let task: AgentTask?
-    let label: LocalizedStringKey
+    let label: String
     /// Name of the session inside a cmux workspace that has several (the card of a helper).
     var origin: String? = nil
 
@@ -4581,7 +4686,7 @@ struct AgentWho: View {
                 Circle().fill(Color(hex: task.color)).frame(width: 8, height: 8)
                 Text(task.name).font(.system(size: 12, weight: .semibold)).foregroundColor(Color(hex: "#F5F6F8"))
             }
-            Text(label).font(.system(size: 12)).foregroundColor(Color(hex: "#8E939C"))
+            Text(LocalizedStringKey(label)).font(.system(size: 12)).foregroundColor(Color(hex: "#8E939C"))
             if let origin {
                 Text(verbatim: "· " + origin).font(.system(size: 12)).foregroundColor(Color(hex: "#8E939C")).lineLimit(1)
             }
@@ -4716,23 +4821,25 @@ struct ShimmerOverlay: View {
 // MARK: - Button styles
 
 struct PrimaryButton: View {
-    let title: Text
+    let title: String
+    let verbatim: Bool
     let kbd: String?
     let action: () -> Void
 
-    init(_ title: LocalizedStringKey, kbd: String? = nil, action: @escaping () -> Void) {
-        self.title = Text(title); self.kbd = kbd; self.action = action
+    init(_ title: String, kbd: String? = nil, action: @escaping () -> Void) {
+        self.title = title; self.verbatim = false; self.kbd = kbd; self.action = action
     }
 
-    /// For texts that are already final (they come from the model or the agent, or were localized by the caller).
     init(verbatim title: String, kbd: String? = nil, action: @escaping () -> Void) {
-        self.title = Text(verbatim: title); self.kbd = kbd; self.action = action
+        self.title = title; self.verbatim = true; self.kbd = kbd; self.action = action
     }
 
     var body: some View {
         Button(action: action) {
             HStack(spacing: 7) {
-                title.font(.system(size: 12.5, weight: .medium))
+                Group {
+                    if verbatim { Text(verbatim: title) } else { Text(LocalizedStringKey(title)) }
+                }.font(.system(size: 12.5, weight: .medium))
                 if let k = kbd {
                     Text(k).font(.system(size: 10.5))
                         .padding(.horizontal, 4)
@@ -4750,23 +4857,25 @@ struct PrimaryButton: View {
 }
 
 struct SecondaryButton: View {
-    let title: Text
+    let title: String
+    let verbatim: Bool
     let kbd: String?
     let action: () -> Void
 
-    init(_ title: LocalizedStringKey, kbd: String? = nil, action: @escaping () -> Void) {
-        self.title = Text(title); self.kbd = kbd; self.action = action
+    init(_ title: String, kbd: String? = nil, action: @escaping () -> Void) {
+        self.title = title; self.verbatim = false; self.kbd = kbd; self.action = action
     }
 
-    /// For texts that are already final (they come from the model or the agent, or were localized by the caller).
     init(verbatim title: String, kbd: String? = nil, action: @escaping () -> Void) {
-        self.title = Text(verbatim: title); self.kbd = kbd; self.action = action
+        self.title = title; self.verbatim = true; self.kbd = kbd; self.action = action
     }
 
     var body: some View {
         Button(action: action) {
             HStack(spacing: 7) {
-                title.font(.system(size: 12.5, weight: .medium))
+                Group {
+                    if verbatim { Text(verbatim: title) } else { Text(LocalizedStringKey(title)) }
+                }.font(.system(size: 12.5, weight: .medium))
                 if let k = kbd {
                     Text(k).font(.system(size: 10.5))
                         .padding(.horizontal, 4)
@@ -4851,7 +4960,7 @@ struct SettingsIslandView: View {
                         .font(.system(size: 12))
                         .foregroundColor(Color(hex: "#8E939C"))
                         .frame(width: 16)
-                    Text("Auto-close · \(Int(state.autoCloseInterval))s")
+                    Text(String(format: String(localized: "Auto-close · %llds"), Int64(state.autoCloseInterval)))
                         .font(.system(size: 12))
                         .foregroundColor(Color(hex: "#C5C8CD"))
                     Spacer()

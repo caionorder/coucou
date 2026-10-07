@@ -9,7 +9,7 @@ prints every literal that reaches the screen through a localizing API:
   - the title:/label: argument of the project's own components (SettingsSidebarRow, AgentWho,
     MailField, StatusBadge, ...);
   - the argument of the .help, .navigationTitle, .alert, .confirmationDialog modifiers;
-  - every String(localized:) call.
+  - every String(localized:) call, and the first argument of every NSLocalizedString( call (the menu bar).
 
 Interpolations become format placeholders (\\(x) -> %@, or %lld when the expression is clearly an
 integer). Text(verbatim:) is never localized and is skipped.
@@ -256,6 +256,14 @@ class Scanner:
                     if name == "String" and after.startswith("localized:"):
                         k = t.index("localized:", j) + len("localized:")
                         while t[k] in " \t":
+                            k += 1
+                        if t[k] == '"':
+                            key, _ = self.parse_string(k)
+                            if key is not None:
+                                results.append((key, self.line_of(k)))
+                    elif name == "NSLocalizedString":
+                        k = j + 1
+                        while t[k] in " \t\n":
                             k += 1
                         if t[k] == '"':
                             key, _ = self.parse_string(k)

@@ -76,6 +76,14 @@ final class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(soundEnabled, forKey: "soundEnabled") }
     }
 
+    // Weekly recap — persisted
+    @Published var recapEnabled: Bool = (UserDefaults.standard.object(forKey: "recapEnabled") as? Bool) ?? true {
+        didSet { UserDefaults.standard.set(recapEnabled, forKey: "recapEnabled") }
+    }
+    @Published var recapHideProjects: Bool = UserDefaults.standard.bool(forKey: "recapHideProjects") {
+        didSet { UserDefaults.standard.set(recapHideProjects, forKey: "recapHideProjects") }
+    }
+
     // Mochi outfit selection — persisted
     @Published var mochiOutfitSelection: Outfit = .auto {
         didSet { Outfit.stored = mochiOutfitSelection }
@@ -432,6 +440,13 @@ final class AppState: ObservableObject {
         }
     }
 
+    // Selected app language ("" = System, else BCP-47 code e.g. "fr")
+    @Published var appLanguage: String = {
+        let bundleId = Bundle.main.bundleIdentifier ?? "fr.louisraille.NotchBuddy"
+        let langs = UserDefaults.standard.persistentDomain(forName: bundleId)?["AppleLanguages"] as? [String]
+        return langs?.first ?? ""
+    }()
+
     // Context for prompt (window attach / file)
     @Published var promptContext: PromptContext? = nil
 
@@ -465,6 +480,11 @@ final class AppState: ObservableObject {
     }
     var hotkeyCode: UInt16 = 45 {  // 'n'
         didSet { UserDefaults.standard.set(Int(hotkeyCode), forKey: "hotkeyCode") }
+    }
+
+    // Screen hosting the island (notch screen by default) — persisted
+    @Published var islandDisplay: IslandDisplayChoice = .notch {
+        didSet { UserDefaults.standard.set(islandDisplay.storageValue, forKey: "islandDisplay") }
     }
 
     // Vercel project filter — empty = watch all projects
@@ -630,7 +650,7 @@ final class AppState: ObservableObject {
         from: UserDefaults.standard.double(forKey: ChatHeight.defaultsKey))
     /// Tallest the chat may be on the screen the island is on; the window controller keeps it current.
     @Published var chatMaxHeight: CGFloat = ChatHeight.defaultCap
-    /// Height of the island panel (320 until the chat has been stretched); the window controller keeps it current.
+    /// Height of the island panel (560 until the chat has been stretched); the window controller keeps it current.
     @Published var panelHeight: CGFloat = ChatHeight.basePanelHeight
     /// True while the grip is being dragged: the island follows the pointer without animation and stays open.
     @Published var chatResizing = false
@@ -666,7 +686,9 @@ final class AppState: ObservableObject {
     @Published var pendingApproval: ApprovalInfo? = nil
 
     // Pending AskUserQuestion from Claude Code hook
-    @Published var pendingQuestion: AskQuestion? = nil
+    @Published var pendingQuestion: AskQuestion? = nil {
+        didSet { QuestionLayout.height = pendingQuestion?.estimatedIslandHeight }
+    }
 
     // Per-pill flat list of FileDiffs, in order of reception.
     // Not @Published — steps[] changes already trigger redraws.
@@ -699,8 +721,8 @@ final class AppState: ObservableObject {
 
     private func resetSessionDiffTimer(for pillId: String) {
         sessionDiffTimers[pillId]?.cancel()
-        // The work item is main actor isolated (it is created here): it must run on the main queue.
-        // On a global queue the Swift 6 isolation check traps when it fires, an hour after the last diff.
+        // The closure is MainActor-isolated (AppState is @MainActor): it must run on the main
+        // queue. Scheduled on a global queue, Swift 6's isolation check traps and the app quits.
         let work = DispatchWorkItem { [weak self] in
             self?.clearSessionDiffs(for: pillId)
         }
@@ -728,10 +750,27 @@ final class AppState: ObservableObject {
     @Published var showPlanInNotch: Bool = false {
         didSet { UserDefaults.standard.set(showPlanInNotch, forKey: "showPlanInNotch") }
     }
+    // In-memory plan usage override for demo mode. Never persisted. Set by DemoEngine.
+    @Published var demoPlanUsageOverride: PlanUsage? = nil
     // Cached relay-installed state — updated at launch, after install/uninstall, on Settings open
     @Published var planRelayInstalled: Bool = false
     // Transient — reset when island closes or view changes
     @Published var showingPlanDetail: Bool = false
+
+    // Codex plan gauge (from `codex app-server`) — fetched when the pill shows
+    @Published var showCodexPlanInNotch: Bool = false {
+        didSet { UserDefaults.standard.set(showCodexPlanInNotch, forKey: "showCodexPlanInNotch") }
+    }
+    @Published var codexPlanUsage: CodexPlanUsage? = nil
+    // Which card showingPlanDetail opens
+    @Published var planDetailIsCodex: Bool = false
+
+    func refreshCodexPlanUsage() {
+        if let u = codexPlanUsage, Date().timeIntervalSince(u.updatedAt) < 60 { return }
+        Task {
+            if let u = await CodexPlanGauge.fetch() { codexPlanUsage = u }
+        }
+    }
 
     func refreshPlanRelayState() {
         planRelayInstalled = HookServer.statusLineInstalled()
@@ -766,6 +805,7 @@ final class AppState: ObservableObject {
         if let v = ud.object(forKey: "hotkeyEnabled") as? Bool  { hotkeyEnabled = v }
         if let v = ud.object(forKey: "hotkeyFlags")   as? Int   { hotkeyFlags = UInt(v) }
         if let v = ud.object(forKey: "hotkeyCode")    as? Int   { hotkeyCode = UInt16(v) }
+        if let v = ud.string(forKey: "islandDisplay") { islandDisplay = IslandDisplayChoice(storageValue: v) }
         if let d = ud.data(forKey: "vercelProjectFilter"),
            let a = try? JSONDecoder().decode([String].self, from: d) { vercelProjectFilter = Set(a) }
         if let d = ud.data(forKey: "n8nWorkflowFilter"),
@@ -780,6 +820,7 @@ final class AppState: ObservableObject {
            let u = try? JSONDecoder().decode(PlanUsage.self, from: d) { claudePlanUsage = u }
         #if !APPSTORE
         if let v = ud.object(forKey: "showPlanInNotch") as? Bool { showPlanInNotch = v }
+        if let v = ud.object(forKey: "showCodexPlanInNotch") as? Bool { showCodexPlanInNotch = v }
         planRelayInstalled = HookServer.statusLineInstalled()
         #endif
 

@@ -69,10 +69,10 @@ enum ChatHeightTests {
         check(ChatHeight.toggled(messageCount: 2, stored: 450, maximum: max) == nil, "in between → default")
         check(ChatHeight.toggled(messageCount: 2, stored: nil, maximum: 300) == nil, "no room: stays default")
 
-        // Panel height: 320 until stretched, then tall enough for the maximum, never below 320.
-        check(ChatHeight.panelHeight(everStretched: false, maximum: 900) == 320, "panel never stretched")
+        // Panel height: 560 until stretched, then tall enough for the maximum, never below 560.
+        check(ChatHeight.panelHeight(everStretched: false, maximum: 900) == 560, "panel never stretched")
         check(ChatHeight.panelHeight(everStretched: true, maximum: 900) == 900, "panel stretched")
-        check(ChatHeight.panelHeight(everStretched: true, maximum: 300) == 320, "panel small screen")
+        check(ChatHeight.panelHeight(everStretched: true, maximum: 300) == 560, "panel small screen")
         // The island always fits in the panel.
         for n in [0, 1, 2, 9] {
             for stored: CGFloat? in [nil, 260, 500, 5000] {
@@ -111,12 +111,12 @@ enum ChatHeightTests {
         check(ChatHeight.committedAfterDrag(height: 300, start: 450, startStored: 450, messageCount: 2) == nil, "dragged back to default")
 
         // Panel target: grows with the stretch, shrinks only when the screen changes.
-        check(ChatHeight.panelTarget(current: 320, everStretched: false, maximum: 900, allowShrink: false) == 320, "never stretched")
-        check(ChatHeight.panelTarget(current: 320, everStretched: false, maximum: 900, allowShrink: true) == 320, "never stretched, screen change")
-        check(ChatHeight.panelTarget(current: 320, everStretched: true, maximum: 900, allowShrink: false) == 900, "grows")
+        check(ChatHeight.panelTarget(current: 560, everStretched: false, maximum: 900, allowShrink: false) == 560, "never stretched")
+        check(ChatHeight.panelTarget(current: 560, everStretched: false, maximum: 900, allowShrink: true) == 560, "never stretched, screen change")
+        check(ChatHeight.panelTarget(current: 560, everStretched: true, maximum: 900, allowShrink: false) == 900, "grows")
         check(ChatHeight.panelTarget(current: 1400, everStretched: true, maximum: 900, allowShrink: false) == 1400, "never shrinks")
         check(ChatHeight.panelTarget(current: 1400, everStretched: true, maximum: 900, allowShrink: true) == 900, "shrinks on a new screen")
-        check(ChatHeight.panelTarget(current: 1400, everStretched: true, maximum: 300, allowShrink: true) == 320, "small screen keeps 320")
+        check(ChatHeight.panelTarget(current: 1400, everStretched: true, maximum: 300, allowShrink: true) == 560, "small screen keeps 560")
 
         // The resizing flag only lives while the drag is real.
         check(ChatHeight.resizeIsLive(resizing: true, primaryButtonDown: true, isChatView: true, isExpanded: true), "live drag")

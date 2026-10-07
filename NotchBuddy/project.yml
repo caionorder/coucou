@@ -5,8 +5,8 @@ options:
     macOS: "15.0"
   xcodeVersion: "27.0"
   createIntermediateGroups: true
-  # English is the development language; pt-BR is the one translation (Resources/Localizable.xcstrings).
-  # The Mac targets also declare both in their Info.plist (CFBundleLocalizations).
+  # English is the development language; the translations (10 languages in all) live in
+  # Resources/Localizable.xcstrings. The Mac targets declare them in their Info.plist (CFBundleLocalizations).
   developmentLanguage: en
 
 # DebugCloud = Debug, but signed with iCloud (CloudKit) and push entitlements
@@ -127,14 +127,11 @@ targets:
     info:
       path: Resources/Info.plist
       properties:
-        CFBundleLocalizations:
-          - en
-          - pt-BR
         CFBundleName: Coucou
         CFBundleDisplayName: Coucou
         CFBundleIdentifier: fr.louisraille.NotchBuddy
-        CFBundleVersion: "10"
-        CFBundleShortVersionString: "0.1.9"
+        CFBundleVersion: "12"
+        CFBundleShortVersionString: "0.2.1"
         CFBundlePackageType: APPL
         LSUIElement: YES
         NSHighResolutionCapable: YES
@@ -143,6 +140,17 @@ targets:
         NSAccessibilityUsageDescription: "Pour lire le titre de la fenêtre active et l'attacher comme contexte."
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+        CFBundleLocalizations:
+          - en
+          - ar
+          - bn
+          - es
+          - fr
+          - hi
+          - id
+          - pt-BR
+          - ru
+          - zh-Hans
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: fr.louisraille.NotchBuddy
@@ -186,13 +194,10 @@ targets:
     info:
       path: Resources/InfoAppStore.plist
       properties:
-        CFBundleLocalizations:
-          - en
-          - pt-BR
         CFBundleName: Coucou
         CFBundleDisplayName: Coucou
         CFBundleIdentifier: fr.louisraille.Coucou
-        CFBundleVersion: "5"
+        CFBundleVersion: "6"
         CFBundleShortVersionString: "1.1"
         CFBundlePackageType: APPL
         LSUIElement: YES
@@ -202,6 +207,17 @@ targets:
         ITSAppUsesNonExemptEncryption: NO
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+        CFBundleLocalizations:
+          - en
+          - ar
+          - bn
+          - es
+          - fr
+          - hi
+          - id
+          - pt-BR
+          - ru
+          - zh-Hans
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: fr.louisraille.Coucou

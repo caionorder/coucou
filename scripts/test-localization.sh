@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Checks the Mac app's String Catalog (NotchBuddy/Resources/Localizable.xcstrings):
 #  - every text the code can show (see scripts/extract-strings.py) is a key of the catalog;
-#  - every such key has a pt-BR value, unless the catalog marks it shouldTranslate = false;
+#  - every such key has a pt-BR value (plain, or one per plural case), unless the catalog marks it
+#    shouldTranslate = false;
 #  - every pt-BR value keeps the format placeholders of its key (%@, %lld, ...);
+#  - the other 8 languages (ar bn es fr hi id ru zh-Hans, translated upstream): a key has all of them or
+#    none (the fork's own screens are pt-BR only and fall back to English); a key that has them keeps its
+#    placeholders and has an `en` value too (dotted keys such as plan.waiting);
 #  - the extractor finds the String(localized:) / SwiftUI keys it is supposed to (sanity check).
 # Needs only python3.
 set -euo pipefail
@@ -28,6 +32,18 @@ def placeholders(text):
     """Conversion letters of the placeholders, positional or not, ignoring %%."""
     text = text.replace("%%", "")
     return sorted(m.group(1) for m in re.finditer(r"%(?:\d+\$)?(?:l{0,2}|h{0,2})([@dDiufsS])", text))
+
+OTHER_LANGS = ["ar", "bn", "es", "fr", "hi", "id", "ru", "zh-Hans"]
+
+def units(entry, lang):
+    """Translation units of a language: one stringUnit, or one per plural case. [] when absent."""
+    loc = entry.get("localizations", {}).get(lang)
+    if not loc:
+        return []
+    if "stringUnit" in loc:
+        return [loc["stringUnit"]]
+    plural = loc.get("variations", {}).get("plural", {})
+    return [case["stringUnit"] for case in plural.values() if "stringUnit" in case]
 
 def has_letters(key):
     return re.search(r"[A-Za-z]", re.sub(r"%(?:\d+\$)?(?:l{0,2}|h{0,2})[@dDiufsS]", "", key)) is not None
@@ -62,25 +78,46 @@ for cat_key, where in sorted(used.items()):
     entry = strings[cat_key]
     if entry.get("shouldTranslate") is False:
         continue
-    unit = entry.get("localizations", {}).get("pt-BR", {}).get("stringUnit", {})
-    value = unit.get("value", "")
-    if not value or unit.get("state") != "translated":
+    pt_units = units(entry, "pt-BR")
+    if not pt_units or any(not u.get("value") or u.get("state") != "translated" for u in pt_units):
         missing_pt.append((cat_key, where))
         continue
-    if placeholders(value) != placeholders(cat_key):
-        lost_placeholders.append((cat_key, value, where))
+    for u in pt_units:
+        if placeholders(u["value"]) != placeholders(cat_key):
+            lost_placeholders.append((cat_key, u["value"], where))
+            break
 
 # a status text is told apart by its leading symbol (the Settings status bar colors "❌" in red): keep it
 for cat_key, entry in strings.items():
-    value = entry.get("localizations", {}).get("pt-BR", {}).get("stringUnit", {}).get("value")
-    if value and cat_key[:1] in "❌✓" and value[:1] != cat_key[:1]:
-        failures.append("pt-BR value loses the leading symbol: %r -> %r" % (cat_key, value))
+    for u in units(entry, "pt-BR"):
+        value = u.get("value")
+        if value and cat_key[:1] in "❌✓" and value[:1] != cat_key[:1]:
+            failures.append("pt-BR value loses the leading symbol: %r -> %r" % (cat_key, value))
 
 # every catalog entry with a translation must also keep its placeholders (used or not)
 for cat_key, entry in strings.items():
-    value = entry.get("localizations", {}).get("pt-BR", {}).get("stringUnit", {}).get("value")
-    if value and placeholders(value) != placeholders(cat_key) and not any(cat_key == k for k, _, _ in lost_placeholders):
-        lost_placeholders.append((cat_key, value, "catalog"))
+    for u in units(entry, "pt-BR"):
+        value = u.get("value")
+        if value and placeholders(value) != placeholders(cat_key) and not any(cat_key == k for k, _, _ in lost_placeholders):
+            lost_placeholders.append((cat_key, value, "catalog"))
+
+# the other 8 languages: all or none, placeholders kept, `en` present
+fork_only = 0
+for cat_key, entry in strings.items():
+    present = [lang for lang in OTHER_LANGS if units(entry, lang)]
+    if not present:
+        if entry.get("shouldTranslate") is not False:
+            fork_only += 1
+        continue
+    if len(present) != len(OTHER_LANGS):
+        failures.append("partly translated, missing %s: %r" % (", ".join(l for l in OTHER_LANGS if l not in present), cat_key))
+    if not units(entry, "en"):
+        failures.append("translated key without an en value: %r" % cat_key)
+    for lang in present:
+        for u in units(entry, lang):
+            if u.get("state") == "translated" and placeholders(u.get("value", "")) != placeholders(cat_key):
+                failures.append("%s value changes the placeholders: %r -> %r" % (lang, cat_key, u.get("value")))
+                break
 
 print("keys")
 print("  catalog keys:            %d" % len(strings))
@@ -88,6 +125,7 @@ print("  keys found in the code:  %d" % len(extracted))
 print("  of which with a letter:  %d" % sum(1 for k in extracted if has_letters(k)))
 print("  keys without pt-BR:      %d" % len(missing_pt))
 print("  placeholder mismatches:  %d" % len(lost_placeholders))
+print("  note: %d keys have pt-BR only (the fork's own screens; the other 8 languages fall back to English)" % fork_only)
 unused = sorted(k for k in strings if k not in used)
 if unused:
     print("  note: %d catalog keys are not found by the extractor (compiler-only forms are fine): %s"
