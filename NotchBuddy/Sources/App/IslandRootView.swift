@@ -512,12 +512,14 @@ struct IslandHeader: View {
                 TabButton(icon: "house.fill", view: .overview, state: state)
                 TabButton(icon: "bubble.left.fill", view: .prompt, state: state, preAction: {
                     #if !APPSTORE
-                    // The chat tab always opens the normal chat, never a cmux reply.
-                    state.cmuxPrompt = nil
-                    if state.promptContext == nil {
+                    // A cmux reply takes no window context: nothing is captured when that is what opens.
+                    if state.promptContext == nil, !state.chatTabOpensCmuxReply {
                         state.promptContext = WindowContextCapture.captureActive(from: state.lastExternalApp)
                     }
                     #endif
+                }, open: {
+                    // What the slot shows follows the focused pill: its Hermes chat, its cmux reply, else the shared chat.
+                    state.showPromptSlot()
                 })
                 TabButton(icon: "plus", view: .upload, state: state)
             }
@@ -579,6 +581,8 @@ struct TabButton: View {
     let view: IslandView
     @ObservedObject var state: AppState
     var preAction: (() -> Void)? = nil
+    /// Replaces the plain switch to `view` (the chat tab decides what the slot shows).
+    var open: (() -> Void)? = nil
     @State private var isHovered = false
 
     private var isOn: Bool {
@@ -590,7 +594,7 @@ struct TabButton: View {
         Button(action: {
             preAction?()
             withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
-                state.view = view
+                if let open { open() } else { state.view = view }
             }
         }) {
             Image(systemName: icon)

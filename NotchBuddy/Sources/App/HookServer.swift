@@ -747,7 +747,7 @@ final class HookServer: @unchecked Sendable {
                 if !silentStop, let idx = state.tasks.firstIndex(where: { $0.id == agentId }) {
                     state.tasks[idx].finalLine = finalText
                     #if !APPSTORE
-                    if let key = cmuxKey { cmuxFinalLineKey[agentId] = key }
+                    cmuxFinalLineKey[agentId] = cmuxKey
                     #endif
                 }
             }
@@ -1461,6 +1461,20 @@ final class HookServer: @unchecked Sendable {
         return cmuxRegistry.surface(for: taskId)?.key
     }
 
+    /// The session whose answer is the final line of the pill (the one a Reply from the card should open), while it
+    /// lives and while the pill still shows that answer (a later prompt clears the line, not the remembered key).
+    @MainActor
+    func cmuxFinalSurface(for taskId: String) -> String? {
+        let shown = AppState.shared.tasks.first { $0.id == taskId }?.finalLine?.isEmpty == false
+        guard let key = PromptSlot.cardSurface(finalLineKey: cmuxFinalLineKey[taskId], finalLineShown: shown),
+              cmuxRegistry.surface(key: key)?.taskId == taskId else { return nil }
+        return key
+    }
+
+    /// The main session of the pill.
+    @MainActor
+    func cmuxMainSurface(for taskId: String) -> String? { cmuxRegistry.surface(for: taskId)?.key }
+
     /// The user picked a surface in the reply header. Remembered until that surface closes.
     @MainActor
     func setCmuxReplyChoice(_ key: String, for taskId: String) {
@@ -1566,7 +1580,7 @@ final class HookServer: @unchecked Sendable {
             self.cmuxPendingLaunch = nil
             let state = AppState.shared
             state.cmuxNotice = String(localized: "claude did not start in time.")
-            state.cmuxDraft = CmuxDraft(mode: .newChat, text: pending.prompt)
+            state.restoreDraft(pending.prompt, for: .cmuxNewChat, endsLaunch: true)
         }
     }
 
@@ -1749,7 +1763,17 @@ final class HookServer: @unchecked Sendable {
         for cardId in cmuxQueue.removeAll(surfaceKey: key) { dropCmuxHeld(cardId, leftOpen: false) }
         cmuxOpenDialogs[key] = nil
         state.cmuxTranscripts[key] = nil
+        // Through the path that refreshes an open field; the draft typed before the session was resolved goes too.
+        let closed = PromptSlot.Content.cmuxReply(taskId: taskId, surfaceKey: key)
+        let heldText = !state.promptDrafts.text(for: closed).isEmpty
+        state.clearDraft(for: closed)
+        state.clearDraft(for: .cmuxReply(taskId: taskId, surfaceKey: nil))
         if state.cmuxReplyChoice[taskId] == key { state.cmuxReplyChoice[taskId] = nil }
+        // The user is told here, where the session is cleaned up, not by the order of two view handlers: the text
+        // typed for that session is dropped, and its own reply was on screen. The reply that shows next owns the notice.
+        if PromptSlot.closedSessionNeedsNotice(rendered: state.cmuxRenderedContent, dropped: closed, draftWasEmpty: !heldText) {
+            state.showCmuxFailure(.sessionClosed, owner: .cmuxReply(taskId: taskId, surfaceKey: cmuxReplyTarget(for: taskId)))
+        }
     }
 
     /// Everything tied to a cmux pill that is gone (last SessionEnd, stale prune, eviction, closed workspace):
@@ -1761,6 +1785,7 @@ final class HookServer: @unchecked Sendable {
         let keys = cmuxRegistry.surfaces(ofTask: id).map { $0.key }
         cmuxRegistry.remove(taskId: id)
         for key in keys { cleanupCmuxSurface(key, taskId: id) }
+        state.clearDraft(for: .cmuxReply(taskId: id, surfaceKey: nil))
         for cardId in cmuxQueue.removeAll(taskId: id) { dropCmuxHeld(cardId, leftOpen: false) }
         state.cmuxReplyChoice[id] = nil
         cmuxMetaAt[id] = nil
@@ -1828,8 +1853,9 @@ final class HookServer: @unchecked Sendable {
         // The same focus rule as any new session: never take the screen from an open card.
         if CmuxRouting.launchMayTakeFocus(cardOpen: state.pendingApproval != nil || state.pendingQuestion != nil,
                                           promptIsNewChat: state.cmuxPrompt == .newChat) {
-            state.setFocus(agentId)
+            // The reply is set before the focus moves: the slot must already belong to the new pill when it does.
             state.cmuxPrompt = .reply(taskId: agentId)
+            state.setFocus(agentId)
             state.cmuxReplyChoice[agentId] = key
         }
         state.cmuxNotice = nil
@@ -1837,16 +1863,16 @@ final class HookServer: @unchecked Sendable {
         guard exact else {
             let sessionName = state.tasks.first { $0.id == agentId }?.name ?? ""
             state.cmuxNotice = CmuxRouting.folderDraftNotice(sessionName: sessionName)
-            state.cmuxDraft = CmuxDraft(mode: .reply(taskId: agentId), text: prompt)
+            state.restoreDraft(prompt, for: .cmuxReply(taskId: agentId, surfaceKey: key), endsLaunch: true)
             return
         }
         // Gives the claude TUI time to take input. The one and only deferred send.
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             CmuxControl.send(text: prompt, to: agentId, surfaceKey: key) { failure in
                 guard let failure else { return }
-                AppState.shared.showCmuxFailure(failure)
+                AppState.shared.showCmuxFailure(failure, owner: .cmuxReply(taskId: agentId, surfaceKey: key))
                 if failure != .enterNotSent {
-                    AppState.shared.cmuxDraft = CmuxDraft(mode: .reply(taskId: agentId), text: prompt)
+                    AppState.shared.restoreDraft(prompt, for: .cmuxReply(taskId: agentId, surfaceKey: key), endsLaunch: true)
                 }
             }
         }

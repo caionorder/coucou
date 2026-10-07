@@ -21,7 +21,7 @@ struct IslandViewContent: View {
         case .mail:      MailView(state: state)
         case .prompt:
             #if !APPSTORE
-            if let mode = state.cmuxPrompt { CmuxPromptView(state: state).id(mode) } else { PromptView(state: state) }
+            if let mode = state.cmuxPrompt { CmuxPromptView(state: state, bornMode: mode).id(mode) } else { PromptView(state: state) }
             #else
             PromptView(state: state)
             #endif
@@ -179,7 +179,7 @@ struct OverviewView: View {
                     #if !APPSTORE
                     // Reply to the focused cmux session, next to the jump button.
                     if let a = agent, CmuxRouting.isCmuxTaskId(a.id) {
-                        Button(action: { CmuxHub.open(.reply(taskId: a.id)) }) {
+                        Button(action: { CmuxHub.openReply(taskId: a.id) }) {
                             Image(systemName: "arrowshape.turn.up.left")
                                 .font(.system(size: 8, weight: .medium))
                                 .foregroundColor(Color(hex: "#5F646D"))
@@ -350,7 +350,7 @@ struct EmptyStateView: View {
                 }
                 Spacer()
                 PrimaryButton("Ask Claude") {
-                    state.view = .prompt
+                    state.showPromptSlot(carriesContext: true)
                 }
             }
             .padding(.leading, 118)
@@ -698,7 +698,7 @@ struct FinishedView: View {
                     if finishedInCmux {
                         #if !APPSTORE
                         if let t = state.focusTask {
-                            PrimaryButton("Reply") { CmuxHub.open(.reply(taskId: t.id)) }
+                            PrimaryButton("Reply") { CmuxHub.openReply(taskId: t.id) }
                             SecondaryButton("Open terminal") {
                                 _ = CmuxJump.jump(for: t)
                                 NotificationCenter.default.post(name: .islandCollapse, object: nil)
@@ -1075,7 +1075,7 @@ struct ChooseView: View {
                     .font(.system(size: 14, weight: .semibold))
                 Text("What do you want to do with it?").font(.system(size: 12.5)).foregroundColor(Color(hex: "#9398A1"))
                 HStack(spacing: 8) {
-                    PrimaryButton("Ask a question") { state.view = .prompt }
+                    PrimaryButton("Ask a question") { state.showPromptSlot(carriesContext: true) }
                     SecondaryButton("Send by email") { state.view = .mail }
                 }
             }
@@ -1273,10 +1273,41 @@ struct MailView: View {
 struct PromptView: View {
     @ObservedObject var state: AppState
     @State private var text: String = ""
+    /// The conversation the text in the field was loaded for; a send needs it to be the one on screen.
+    @State private var textOwner: PromptSlot.Content?
     @FocusState private var focused: Bool
     @State private var showModelPicker = false
     /// Follow the newest text unless the user scrolled up.
     @State private var pinned = true
+
+    /// The typing dots belong to the conversation on screen: a Hermes conversation shows them while one of its own
+    /// turns waits for text; the shared chat, while its own request runs (the override, unless it is a Hermes turn's).
+    private var typingShown: Bool {
+        let id = state.activeConversationID
+        if id.hermesAgent != nil { return ClaudeService.shared.isWaiting(id) }
+        return state.stateOverride != nil && !ClaudeService.shared.anyHermesWaiting
+    }
+
+    /// The field shows the draft of the conversation on screen. The owner of the text is set here, and only here.
+    private func loadDraft() {
+        // The chat view owns chat contents only: while a cmux prompt is open (its reply or new chat is on screen)
+        // it loads nothing and takes no owner, so it can never hold, or send, text meant for a cmux session.
+        guard let content = state.promptContent,
+              PromptSlot.chatMayLoadDraft(onScreen: content, cmuxPromptOpen: state.cmuxPromptIsOpenOrOpening) else { return }
+        textOwner = content
+        let draft = state.promptDrafts.text(for: content)
+        if text != draft { text = draft }
+    }
+
+    /// The field. An edit is filed under the owner of the text when it happens, not under what is on screen later.
+    private var fieldText: Binding<String> {
+        Binding(get: { text }, set: { setText($0) })
+    }
+
+    private func setText(_ new: String) {
+        text = new
+        if let owner = textOwner { state.promptDrafts.set(new, for: owner) }
+    }
 
     var body: some View {
         ZStack(alignment: .leading) {
@@ -1294,7 +1325,7 @@ struct PromptView: View {
                                 ForEach(state.chatHistory) { msg in
                                     ChatBubble(message: msg).id(msg.id)
                                 }
-                                if state.stateOverride != nil {
+                                if typingShown {
                                     HStack { TypingDotsView(); Spacer(minLength: 32) }
                                         .id("typing")
                                 }
@@ -1302,7 +1333,7 @@ struct PromptView: View {
                             .padding(.vertical, 2)
                         }
                         .pinnedScrollTracking($pinned) {
-                            if state.stateOverride != nil { proxy.scrollTo("typing", anchor: .bottom) }
+                            if typingShown { proxy.scrollTo("typing", anchor: .bottom) }
                             else if let last = state.chatHistory.last(where: { !$0.content.isEmpty }) {
                                 proxy.scrollTo(last.id, anchor: .bottom)
                             }
@@ -1313,9 +1344,9 @@ struct PromptView: View {
                                 proxy.scrollTo(last.id, anchor: .bottom)
                             }
                         }
-                        .onChange(of: state.stateOverride) { _, v in
+                        .onChange(of: typingShown) { _, shown in
                             guard pinned else { return }
-                            if v != nil {
+                            if shown {
                                 withAnimation { proxy.scrollTo("typing", anchor: .bottom) }
                             } else if let last = state.chatHistory.last(where: { !$0.content.isEmpty }) {
                                 withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
@@ -1373,7 +1404,7 @@ struct PromptView: View {
                 .padding(.horizontal, 10)
 
                 HStack(spacing: 8) {
-                    TextField(state.chatHistory.isEmpty ? String(localized: "Ask me anything…") : String(localized: "Continue…"), text: $text)
+                    TextField(state.chatHistory.isEmpty ? String(localized: "Ask me anything…") : String(localized: "Continue…"), text: fieldText)
                         .textFieldStyle(.plain)
                         .font(.system(size: 13))
                         .focused($focused)
@@ -1399,7 +1430,8 @@ struct PromptView: View {
         }
         .overlay(alignment: .bottom) { ChatResizeGrip(state: state) }
         .padding(.bottom, 10)
-        .onAppear { focused = true }
+        .onAppear { focused = true; loadDraft() }
+        .onChange(of: state.promptContent) { _, _ in loadDraft() }
         .onChange(of: state.view) { _, view in
             if view == .prompt {
                 state.fetchModelsIfNeeded(for: state.chatProvider)
@@ -1411,12 +1443,12 @@ struct PromptView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .islandSendMessage)) { _ in
-            guard state.view == .prompt else { return }
+            guard state.view == .prompt, !state.cmuxPromptIsOpenOrOpening else { return }
             sendMessage()
         }
         .onReceive(NotificationCenter.default.publisher(for: .islandNewConversation)) { _ in
             guard state.view == .prompt else { return }
-            text = ""
+            setText("")
             state.clearActiveConversation()
             focused = true
         }
@@ -1425,13 +1457,24 @@ struct PromptView: View {
     private func sendMessage() {
         let query = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return }
-        text = ""
+        // The text was typed for the conversation it was loaded for. If another one is on screen now, nothing
+        // is sent: the field takes that conversation's draft and the text stays with its own.
+        // A chat send needs a chat content as owner and on screen, and no cmux prompt open. The refusal reloads the
+        // field only when this view is the one on screen (loadDraft refuses for a cmux content).
+        guard let onScreen = state.promptContent,
+              PromptSlot.chatTextMayDeliver(owner: textOwner, onScreen: onScreen, cmuxPromptOpen: state.cmuxPromptIsOpenOrOpening) else {
+            if state.view == .prompt { loadDraft() }
+            return
+        }
+        // The conversation on screen now: the bubble and the request both go to it, whatever is shown later.
+        let target = state.activeConversationID
+        setText("")
         focused = false
         pinned = true
-        state.chatHistory.append(ChatMessage(role: .user, content: query))
+        state.updateChat(target) { $0.append(ChatMessage(role: .user, content: query)) }
         state.stateOverride = .thinking
         Task {
-            await ClaudeService.shared.chat(query: query, context: state.promptContext, state: state)
+            await ClaudeService.shared.chat(query: query, context: state.promptContext, state: state, target: target)
             await MainActor.run { focused = true }
         }
     }
@@ -1488,6 +1531,7 @@ struct ModelPickerView: View {
                         withAnimation(.spring(response: 0.25, dampingFraction: 0.7)) {
                             state.chatProvider = provider
                         }
+                        state.syncFocusToChat()
                         NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.surprised)
                         SoundEngine.shared.play("pop")
                     } label: {
@@ -1568,6 +1612,7 @@ struct ModelPickerView: View {
                             case .lmstudio:  state.lmstudioChatModel = model.id
                             case .hermes:    state.selectHermesAgent(model.id)
                             }
+                            state.syncFocusToChat()
                             isPresented = false
                             SoundEngine.shared.play("blip")
                         } label: {
@@ -3918,14 +3963,14 @@ struct AgentPillsView: View {
                 if task.id == "integration_music" {
                     MusicPill(task: task, state: state, swapping: $swapping) {
                         swapping = true
-                        state.setFocus(task.id)
+                        state.setFocus(task.id, byPointer: true)
                         SoundEngine.shared.play("blip")
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { swapping = false }
                     }
                 } else {
                     AgentPill(task: task, state: state, swapping: $swapping) {
                         swapping = true
-                        state.setFocus(task.id)
+                        state.setFocus(task.id, byPointer: true)
                         SoundEngine.shared.play("blip")
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { swapping = false }
                     }
@@ -3933,7 +3978,7 @@ struct AgentPillsView: View {
                 #else
                 AgentPill(task: task, state: state, swapping: $swapping) {
                     swapping = true
-                    state.setFocus(task.id)
+                    state.setFocus(task.id, byPointer: true)
                     SoundEngine.shared.play("blip")
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { swapping = false }
                 }
@@ -4006,8 +4051,7 @@ struct AgentPill: View {
 
     var body: some View {
         Button(action: {
-            onTap()
-            if HermesPills.isTaskId(task.id) { openHermesAgentChat(taskId: task.id) }
+            onTap()   // a Hermes pill opens its chat through setFocus(byPointer:)
         }) {
             ZStack(alignment: .topTrailing) {
                 ZStack {
@@ -5032,6 +5076,7 @@ func switchChatProvider(_ provider: ChatProvider) {
         SoundEngine.shared.play("pop")
     }
     state.view = .prompt
+    state.syncFocusToChat()
 }
 
 /// A Hermes agent pill: selects the Hermes provider and that agent (each agent keeps its own conversation),
