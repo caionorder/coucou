@@ -55,6 +55,8 @@ final class HookServer: @unchecked Sendable {
     // Bumped each time a card takes an fd, so a stale timer never dismisses a later card
     // that happens to reuse the same fd number.
     private var cardGeneration = 0
+    /// Set when a card takes the place of a card that was on screen (any build): clicks are ignored for a moment.
+    private var cardReplacedAt: TimeInterval? = nil
 
     #if !APPSTORE
     // cmux: per-surface registry (holds the capability token, memory only) and the queue of waiting cards.
@@ -204,6 +206,7 @@ final class HookServer: @unchecked Sendable {
             DemoEngine.shared.handleQuestionAnswered(answers: answers)
             return
         }
+        if cardReplacedLocked() { return }
         #if !APPSTORE
         if cmuxInputLocked() { return }
         #endif
@@ -253,6 +256,7 @@ final class HookServer: @unchecked Sendable {
     /// Called by QuestionView "Reply in terminal" button.
     @MainActor
     func sendQuestionAsk() {
+        if cardReplacedLocked() { return }
         #if !APPSTORE
         if cmuxInputLocked() { return }
         #endif
@@ -1015,6 +1019,10 @@ final class HookServer: @unchecked Sendable {
 
         let command = toolInput["command"] as? String ?? tool
 
+        // Read before a displaced or requeued card leaves the screen.
+        let cardWasVisible = CardInputLock.cardVisible(approvalFD: pendingApprovalFD, questionFD: pendingQuestionFD,
+                                                       approvalShown: state.pendingApproval != nil,
+                                                       questionShown: state.pendingQuestion != nil)
         var displacedKey: String? = nil
         var cmuxKeyOfRequest: String? = nil
         #if !APPSTORE
@@ -1045,6 +1053,7 @@ final class HookServer: @unchecked Sendable {
         cmuxShownArrival = arrivedAt ?? Date().timeIntervalSinceReferenceDate
         cmuxPromotedAt = nil   // presentNextCmuxCard sets it again when this card came out of the queue
         #endif
+        cardReplacedAt = CardInputLock.armedAt(cardWasVisible: cardWasVisible, now: Date().timeIntervalSinceReferenceDate)
 
         if pendingApprovalFD >= 0 {
             // Displace the previous request: write "ask" then cancel its source.
@@ -1153,6 +1162,7 @@ final class HookServer: @unchecked Sendable {
             return
         }
         var cardKey: String? = nil
+        if cardReplacedLocked() { return }
         #if !APPSTORE
         if cmuxInputLocked() { return }
         cardKey = cmuxShownKey
@@ -1257,6 +1267,10 @@ final class HookServer: @unchecked Sendable {
             return
         }
 
+        // Read before a displaced or requeued card leaves the screen.
+        let cardWasVisible = CardInputLock.cardVisible(approvalFD: pendingApprovalFD, questionFD: pendingQuestionFD,
+                                                       approvalShown: state.pendingApproval != nil,
+                                                       questionShown: state.pendingQuestion != nil)
         var displacedKey: String? = nil
         var cmuxKeyOfRequest: String? = nil
         #if !APPSTORE
@@ -1286,6 +1300,7 @@ final class HookServer: @unchecked Sendable {
         cmuxShownArrival = arrivedAt ?? Date().timeIntervalSinceReferenceDate
         cmuxPromotedAt = nil   // presentNextCmuxCard sets it again when this card came out of the queue
         #endif
+        cardReplacedAt = CardInputLock.armedAt(cardWasVisible: cardWasVisible, now: Date().timeIntervalSinceReferenceDate)
 
         // Displace any previous question waiting for an answer.
         if pendingQuestionFD >= 0 {
@@ -2236,6 +2251,12 @@ final class HookServer: @unchecked Sendable {
     }
 
     #endif
+
+    /// True while a card that replaced another card is too fresh to take a click (both builds).
+    @MainActor
+    private func cardReplacedLocked() -> Bool {
+        CardInputLock.isLocked(armedAt: cardReplacedAt, now: Date().timeIntervalSinceReferenceDate)
+    }
 
     // MARK: - Pill state helpers (both builds)
 
