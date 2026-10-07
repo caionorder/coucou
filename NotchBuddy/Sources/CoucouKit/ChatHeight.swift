@@ -9,7 +9,7 @@ enum ChatHeight {
     static let perMessage: CGFloat = 40
     static let defaultCap: CGFloat = 300
     /// Height of the island panel when the chat has never been stretched.
-    static let basePanelHeight: CGFloat = 320
+    static let basePanelHeight: CGFloat = 560
     /// Free space kept between the bottom of the stretched chat and the screen (or Dock).
     static let bottomMargin: CGFloat = 24
     /// Two heights closer than this are the same height.
@@ -77,7 +77,7 @@ enum ChatHeight {
         return isStretched(messageCount: messageCount, stored: stored, maximum: maximum) ? nil : maximum
     }
 
-    /// Height of the island panel. Today's 320 pt until the chat has been stretched; then tall enough
+    /// Height of the island panel. 560 pt until the chat has been stretched; then tall enough
     /// for the maximum (the panel stays transparent and click-through outside the island).
     static func panelHeight(everStretched: Bool, maximum: CGFloat) -> CGFloat {
         everStretched ? max(basePanelHeight, maximum) : basePanelHeight

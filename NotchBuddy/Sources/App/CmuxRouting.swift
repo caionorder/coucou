@@ -114,6 +114,11 @@ enum CmuxRouting {
         return isTrustedSocket(mode: UInt32(st.st_mode), owner: UInt32(st.st_uid), currentUid: UInt32(getuid()))
     }
 
+    /// Weekly recap: every cmux workspace counts as one agent ("cmux"), not one agent per workspace.
+    static func recapAgentKey(_ pillId: String) -> String {
+        isCmuxTaskId(pillId) ? taskPrefix : pillId
+    }
+
     // MARK: timing and lifecycle decisions
 
     /// True while a card shown through promotion must not take clicks yet.
