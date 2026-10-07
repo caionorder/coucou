@@ -360,7 +360,7 @@ struct ApprovalView: View {
         ZStack {
             CardBackground(wash: .amber)
             VStack(alignment: .leading, spacing: 5) {
-                AgentWho(task: state.focusTask, label: "needs permission")
+                AgentWho(task: state.focusTask, label: "needs permission", origin: cmuxCardOriginLabel())
                 CodeBlock(text: approval?.command ?? approval?.tool ?? "…")
                 HStack(spacing: 8) {
                     SecondaryButton("Deny") {
@@ -400,6 +400,16 @@ struct QuestionView: View {
 
     var question: AskQuestion? { state.pendingQuestion }
 
+    /// A cmux question names its workspace; every other source keeps the plain header.
+    private var cmuxQuestionPill: AgentTask? {
+        #if !APPSTORE
+        if let id = HookServer.shared.cmuxQuestionPillId, CmuxRouting.isCmuxTaskId(id) {
+            return state.tasks.first { $0.id == id }
+        }
+        #endif
+        return nil
+    }
+
     private static func advanceTitle(_ isLast: Bool) -> String {
         isLast ? String(localized: "Send") : String(localized: "Next")
     }
@@ -423,7 +433,7 @@ struct QuestionView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     // Header row: agent name + question counter + "Reply in terminal" link
                     HStack(spacing: 4) {
-                        AgentWho(task: nil, label: "Claude Code is asking")
+                        AgentWho(task: cmuxQuestionPill, label: "Claude Code is asking", origin: cmuxCardOriginLabel())
                         Spacer(minLength: 4)
                         if q.questions.count > 1 {
                             Text("\(qi + 1)/\(q.questions.count)")
@@ -1246,6 +1256,14 @@ struct PromptView: View {
                                 proxy.scrollTo(last.id, anchor: .bottom)
                             }
                         }
+                        // Another agent's chat keeps this scroll view: start at its last message, not where the
+                        // previous conversation was scrolled to.
+                        .onChange(of: state.activeConversationID) { _, _ in
+                            pinned = true
+                            if let last = state.chatHistory.last {
+                                proxy.scrollTo(last.id, anchor: .bottom)
+                            }
+                        }
                     }
                     .frame(maxHeight: .infinity)
                 } else {
@@ -1263,7 +1281,7 @@ struct PromptView: View {
                             Circle()
                                 .fill(Color(hex: state.chatProvider.accentHex))
                                 .frame(width: 6, height: 6)
-                            Text(state.activeChatModel)
+                            Text(state.activeChatModelLabel)
                                 .font(.system(size: 10.5, weight: .medium))
                                 .foregroundColor(Color(hex: "#7B8089"))
                             Image(systemName: "chevron.up.chevron.down")
@@ -1328,8 +1346,7 @@ struct PromptView: View {
         .onReceive(NotificationCenter.default.publisher(for: .islandNewConversation)) { _ in
             guard state.view == .prompt else { return }
             text = ""
-            state.chatHistory = []
-            ClaudeService.shared.clearConversation()
+            state.clearActiveConversation()
             focused = true
         }
     }
@@ -1822,7 +1839,7 @@ struct IntegrationCardView: View {
         #if !APPSTORE
         if task.id == CmuxRouting.hubPillId {
             if !CmuxHub.isInstalled() { return String(localized: "cmux not installed") }
-            let n = appState.tasks.filter { CmuxRouting.isCmuxTaskId($0.id) }.count
+            let n = HookServer.shared.cmuxSessionCount
             if n == 0 { return CmuxHub.isRunning() ? String(localized: "No session") : String(localized: "cmux is not running") }
             return n == 1 ? String(localized: "1 session") : String(localized: "\(String(n)) sessions")
         }
@@ -1844,7 +1861,7 @@ struct IntegrationCardView: View {
             if isAI {
                 let provider = ChatProvider(pillID: task.id)!
                 if provider == .hermes {
-                    return String(localized: "Connected · \(appState.activeHermesAgent?.name ?? "")")
+                    return String(localized: "Connected · \(appState.activeHermesAgent?.shownName ?? "")")
                 }
                 if provider.isLocal {
                     let model = provider == .ollama ? appState.ollamaChatModel : appState.lmstudioChatModel
@@ -3765,12 +3782,23 @@ struct AgentPillsView: View {
     @ObservedObject var state: AppState
     @State private var swapping = false
 
+    /// Pills the card shows besides the focused one. Up to 4 fill the card as before; more scroll (GitHub build).
+    private let visibleCount = 4
+
     private var others: [AgentTask] {
         state.tasks.filter { $0.id != state.focusId }
     }
 
-    private var displayTasks: [AgentTask] {
-        Array(others.prefix(4))
+    #if APPSTORE
+    // The App Store build shows the first four, exactly as before.
+    private var displayTasks: [AgentTask] { Array(others.prefix(visibleCount)) }
+    #else
+    private var displayTasks: [AgentTask] { others }
+    #endif
+
+    /// Pills that carry an approval badge, in display order: one that is off screen scrolls into view.
+    private var approvalIds: [String] {
+        others.filter { $0.pillBadge == .approval }.map { $0.id }
     }
 
     private let columns = [
@@ -3778,41 +3806,69 @@ struct AgentPillsView: View {
         GridItem(.flexible(), spacing: 4)
     ]
 
-    var body: some View {
-        VStack(spacing: 0) {
-            Spacer(minLength: 0)
-            LazyVGrid(columns: columns, spacing: 4) {
-                ForEach(displayTasks) { task in
-                    #if !APPSTORE
-                    if task.id == "integration_music" {
-                        MusicPill(task: task, state: state, swapping: $swapping) {
-                            swapping = true
-                            state.setFocus(task.id)
-                            SoundEngine.shared.play("blip")
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { swapping = false }
-                        }
-                    } else {
-                        AgentPill(task: task, state: state, swapping: $swapping) {
-                            swapping = true
-                            state.setFocus(task.id)
-                            SoundEngine.shared.play("blip")
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { swapping = false }
-                        }
+    private var grid: some View {
+        LazyVGrid(columns: columns, spacing: 4) {
+            ForEach(displayTasks) { task in
+                #if !APPSTORE
+                if task.id == "integration_music" {
+                    MusicPill(task: task, state: state, swapping: $swapping) {
+                        swapping = true
+                        state.setFocus(task.id)
+                        SoundEngine.shared.play("blip")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { swapping = false }
                     }
-                    #else
+                } else {
                     AgentPill(task: task, state: state, swapping: $swapping) {
                         swapping = true
                         state.setFocus(task.id)
                         SoundEngine.shared.play("blip")
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { swapping = false }
                     }
-                    #endif
+                }
+                #else
+                AgentPill(task: task, state: state, swapping: $swapping) {
+                    swapping = true
+                    state.setFocus(task.id)
+                    SoundEngine.shared.play("blip")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { swapping = false }
+                }
+                #endif
+            }
+        }
+        .padding(.horizontal, 8)
+    }
+
+    var body: some View {
+        if displayTasks.count <= visibleCount {
+            VStack(spacing: 0) {
+                Spacer(minLength: 0)
+                grid
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            // More pills than fit: the same grid scrolls, top aligned, with a short fade at the bottom as the
+            // only cue.
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: false) {
+                    grid.padding(.vertical, 8)
+                }
+                .mask(
+                    VStack(spacing: 0) {
+                        Rectangle()
+                        LinearGradient(colors: [.black, .clear], startPoint: .top, endPoint: .bottom)
+                            .frame(height: 10)
+                    }
+                )
+                .onChange(of: approvalIds) { _, ids in
+                    if let first = ids.first { withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(first, anchor: .center) } }
+                }
+                .onAppear {
+                    if let first = approvalIds.first { proxy.scrollTo(first, anchor: .center) }
                 }
             }
-            .padding(.horizontal, 8)
-            Spacer(minLength: 0)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -4516,6 +4572,8 @@ extension CardBackground where Content == EmptyView {
 struct AgentWho: View {
     let task: AgentTask?
     let label: LocalizedStringKey
+    /// Name of the session inside a cmux workspace that has several (the card of a helper).
+    var origin: String? = nil
 
     var body: some View {
         HStack(spacing: 7) {
@@ -4524,8 +4582,21 @@ struct AgentWho: View {
                 Text(task.name).font(.system(size: 12, weight: .semibold)).foregroundColor(Color(hex: "#F5F6F8"))
             }
             Text(label).font(.system(size: 12)).foregroundColor(Color(hex: "#8E939C"))
+            if let origin {
+                Text(verbatim: "· " + origin).font(.system(size: 12)).foregroundColor(Color(hex: "#8E939C")).lineLimit(1)
+            }
         }
     }
+}
+
+/// The session a cmux card belongs to, when its workspace has several. nil for every other card.
+@MainActor
+func cmuxCardOriginLabel() -> String? {
+    #if !APPSTORE
+    return HookServer.shared.cmuxCardOrigin
+    #else
+    return nil
+    #endif
 }
 
 struct CodeBlock: View {
@@ -4854,7 +4925,7 @@ func switchChatProvider(_ provider: ChatProvider) {
     state.view = .prompt
 }
 
-/// A Hermes agent pill: selects the Hermes provider and that agent (the usual clearing rules apply),
+/// A Hermes agent pill: selects the Hermes provider and that agent (each agent keeps its own conversation),
 /// then opens the chat prompt so the user can type to it at once.
 @MainActor
 func openHermesAgentChat(taskId: String) {

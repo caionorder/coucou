@@ -445,6 +445,10 @@ final class IslandWindowController: NSWindowController {
             setMode(.expanded)
         }
         state.lastActivity = .now
+        #if !APPSTORE
+        // The user is looking at the island: bring the cmux workspaces (names, new and closed ones) up to date.
+        HookServer.shared.requestCmuxDiscovery()
+        #endif
     }
 
     func collapse() {

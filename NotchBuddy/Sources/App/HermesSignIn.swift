@@ -159,7 +159,7 @@ enum HermesSignIn {
         guard agent.connection == .signIn, HermesChat.isValidAgent(agent),
               let r = sessions[agent.name], !r.accessToken.isEmpty,
               !r.baseURL.isEmpty, r.baseURL == agent.baseURL else {
-            return .failure(.signInNeeded(agent.name))
+            return .failure(.signInNeeded(agent.shownName))
         }
         return .success(r)
     }

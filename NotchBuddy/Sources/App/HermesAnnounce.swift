@@ -17,8 +17,14 @@ enum HermesAnnounce {
     /// - alertPending: an approval or question card is on screen, or cmux cards are queued.
     ///
     /// A cmux reply being typed counts like a card: the Hermes chat never replaces it, the badge brings the chat back.
-    static func decide(expanded: Bool, viewIsChat: Bool, cmuxPromptOpen: Bool, alertPending: Bool) -> Outcome {
-        if chatIsShown(expanded: expanded, viewIsChat: viewIsChat, cmuxPromptOpen: cmuxPromptOpen) { return .none }
+    ///
+    /// - chatIsOfThisAgent: the chat on screen (if any) is the conversation of the agent whose turn ended. When it is
+    ///   another conversation, the user is chatting elsewhere: sound and badge, but that chat keeps the screen.
+    static func decide(expanded: Bool, viewIsChat: Bool, cmuxPromptOpen: Bool, alertPending: Bool,
+                       chatIsOfThisAgent: Bool = true) -> Outcome {
+        if chatIsShown(expanded: expanded, viewIsChat: viewIsChat, cmuxPromptOpen: cmuxPromptOpen) {
+            return chatIsOfThisAgent ? .none : .badgeOnly
+        }
         return (alertPending || cmuxPromptOpen) ? .badgeOnly : .expand
     }
 

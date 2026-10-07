@@ -16,11 +16,17 @@ enum CmuxJump {
         guard let app = candidates.first else { return false }
         app.activate(options: .activateIgnoringOtherApps)
 
-        // Ids or token missing: cmux is in front on whatever surface it had.
-        guard let s = HookServer.shared.cmuxSurface(for: task.id), s.canFocusExactly,
+        // Ids or token missing: cmux is in front on whatever surface it had. The target is the surface of
+        // the card on screen or queued for that pill, else the busiest one, else the reply target. Its own
+        // token, else the freshest on the same socket, goes in the environment: bringing a window to the front
+        // types nothing, so this one may borrow (typing may not).
+        let server = HookServer.shared
+        guard let target = server.cmuxJumpTarget(for: task.id),
+              CmuxRouting.isValidId(target.surfaceId), CmuxRouting.isValidId(target.workspaceId),
+              case .token(let s) = server.cmuxJumpCredential(forKey: target.key),
               CmuxRouting.isValidSocketPath(s.socketPath) else { return true }
         let bundles = candidates.compactMap { $0.bundleURL }
-        let workspace = s.workspaceId, surface = s.surfaceId
+        let workspace = target.workspaceId, surface = target.surfaceId
         DispatchQueue.global(qos: .userInitiated).async {
             // The signature check hashes the bundle and the peer check blocks up to a second: keep both
             // off the main thread. Only a bundle that passes the check is ever executed, and the token

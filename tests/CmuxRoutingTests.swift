@@ -182,29 +182,30 @@ enum CmuxRoutingTests {
         // ── evictionCandidates ─────────────────────────────────────────────────
         print("CmuxRegistry.evictionCandidates")
         var big = CmuxRegistry()
-        for i in 1...6 {
+        for i in 1...12 {
             big.note(taskId: "t\(i)", surfaceId: "s", workspaceId: "w", socketPath: "/x.sock",
                      capability: "c", sessionId: "", now: TimeInterval(i))
         }
-        let all = Set((1...6).map { "t\($0)" })
-        check("none at 6", big.evictionCandidates(idle: all, keep: nil).isEmpty)
-        big.note(taskId: "t7", surfaceId: "s", workspaceId: "w", socketPath: "/x.sock",
-                 capability: "c", sessionId: "", now: 7)
-        let all7 = all.union(["t7"])
-        check("at 7 → oldest idle", big.evictionCandidates(idle: all7, keep: "t7") == ["t1"])
-        check("never returns keep", big.evictionCandidates(idle: all7, keep: "t1") == ["t2"])
-        check("nothing when all busy", big.evictionCandidates(idle: [], keep: "t7").isEmpty)
-        big.note(taskId: "t8", surfaceId: "s", workspaceId: "w", socketPath: "/x.sock",
-                 capability: "c", sessionId: "", now: 8)
-        big.note(taskId: "t9", surfaceId: "s", workspaceId: "w", socketPath: "/x.sock",
-                 capability: "c", sessionId: "", now: 9)
-        let all9 = all7.union(["t8", "t9"])
+        check("maxTasks is 12 pills", CmuxRouting.maxTasks == 12)
+        let all = Set((1...12).map { "t\($0)" })
+        check("none at 12", big.evictionCandidates(idle: all, keep: nil).isEmpty)
+        big.note(taskId: "t13", surfaceId: "s", workspaceId: "w", socketPath: "/x.sock",
+                 capability: "c", sessionId: "", now: 13)
+        let all13 = all.union(["t13"])
+        check("at 13 → oldest idle", big.evictionCandidates(idle: all13, keep: "t13") == ["t1"])
+        check("never returns keep", big.evictionCandidates(idle: all13, keep: "t1") == ["t2"])
+        check("nothing when all busy", big.evictionCandidates(idle: [], keep: "t13").isEmpty)
+        big.note(taskId: "t14", surfaceId: "s", workspaceId: "w", socketPath: "/x.sock",
+                 capability: "c", sessionId: "", now: 14)
+        big.note(taskId: "t15", surfaceId: "s", workspaceId: "w", socketPath: "/x.sock",
+                 capability: "c", sessionId: "", now: 15)
+        let all15 = all13.union(["t14", "t15"])
         check("excess 3 → three oldest idle in order",
-              big.evictionCandidates(idle: all9, keep: "t9") == ["t1", "t2", "t3"])
+              big.evictionCandidates(idle: all15, keep: "t15") == ["t1", "t2", "t3"])
         check("fewer idle than the excess → only the idle ones",
-              big.evictionCandidates(idle: ["t4", "t6"], keep: "t9") == ["t4", "t6"])
+              big.evictionCandidates(idle: ["t4", "t6"], keep: "t15") == ["t4", "t6"])
         check("mix of idle and busy skips the busy oldest",
-              big.evictionCandidates(idle: ["t3", "t5", "t8"], keep: "t9") == ["t3", "t5", "t8"])
+              big.evictionCandidates(idle: ["t3", "t5", "t8"], keep: "t15") == ["t3", "t5", "t8"])
 
         // ── queue ──────────────────────────────────────────────────────────────
         print("CmuxCardQueue")
@@ -577,7 +578,7 @@ enum CmuxRoutingTests {
         check("UUID under a result wrapper",
               CmuxRouting.workspaceId(forRef: "workspace:10", inListJSON: "{\"result\":\(listJSON)}") == wsUUID)
 
-        print("sendCredential (never the password)")
+        print("sendCredential (its own token only, never the password)")
         var sc = CmuxRegistry()
         sc.note(taskId: "a", surfaceId: "sa", workspaceId: "w", socketPath: "/s.sock", capability: "TA", sessionId: "", now: 10)
         sc.note(taskId: "b", surfaceId: "sb", workspaceId: "w", socketPath: "/s.sock", capability: "TB", sessionId: "", now: 20)
@@ -587,17 +588,21 @@ enum CmuxRoutingTests {
         sc.clearCredentials()
         check("no token anywhere: none, even with a password stored", sc.sendCredential(for: "a") == CmuxCredential.none)
         sc.note(taskId: "b", surfaceId: "sb", workspaceId: "w", socketPath: "/s.sock", capability: "TB2", sessionId: "", now: 40)
-        if case .token(let t) = sc.sendCredential(for: "a") { check("no own token: freshest on the same socket", t.taskId == "b") }
-        else { check("no own token: freshest on the same socket", false) }
+        check("no own token: none, the token of another surface on the same socket is never lent for typing",
+              sc.sendCredential(for: "a") == CmuxCredential.none)
+        if case .token(let t) = sc.sendCredential(for: "b") { check("the surface that reported again has its own token", t.capability == "TB2") }
+        else { check("the surface that reported again has its own token", false) }
+        if case .token(let t) = sc.jumpCredential(forKey: "a") { check("jump may borrow the freshest token on the same socket", t.taskId == "b") }
+        else { check("jump may borrow the freshest token on the same socket", false) }
         sc.note(taskId: "o", surfaceId: "so", workspaceId: "w", socketPath: "/other.sock", capability: "TO2", sessionId: "", now: 50)
-        if case .token(let t) = sc.sendCredential(for: "a") { check("a fresher token on another socket is not used", t.taskId == "b") }
-        else { check("a fresher token on another socket is not used", false) }
+        if case .token(let t) = sc.jumpCredential(forKey: "a") { check("jump: a fresher token on another socket is not used", t.taskId == "b") }
+        else { check("jump: a fresher token on another socket is not used", false) }
         var sd = CmuxRegistry()
         sd.note(taskId: "d", surfaceId: "", workspaceId: "", socketPath: "", capability: "", sessionId: "x", now: 1)
         sd.note(taskId: "e", surfaceId: "se", workspaceId: "w", socketPath: "/s.sock", capability: "TE", sessionId: "", now: 2)
-        check("entry that never had a socket: none", sd.sendCredential(for: "d") == CmuxCredential.none)
-        check("password is never a send credential",
-              ["a", "b", "o", "zzz"].allSatisfy { sc.sendCredential(for: $0) != .password })
+        check("entry that never had a socket: none", sd.sendCredential(for: "d") == CmuxCredential.none && sd.jumpCredential(forKey: "d") == CmuxCredential.none)
+        check("password is never a send or jump credential",
+              ["a", "b", "o", "zzz"].allSatisfy { sc.sendCredential(for: $0) != .password && sc.jumpCredential(forKey: $0) != .password })
 
         print("shouldFocusNewSession / nextFocus / canSend")
         let hub = CmuxRouting.hubPillId
@@ -646,9 +651,9 @@ enum CmuxRoutingTests {
               CmuxRouting.evictableIdle(["a", "b"], openReplyTask: "a") == ["b"]
               && CmuxRouting.evictableIdle(["a", "b"], openReplyTask: nil) == ["a", "b"])
         var ev = CmuxRegistry()
-        for i in 0..<7 { ev.note(taskId: "t\(i)", surfaceId: "s", workspaceId: "w", socketPath: "/x.sock", capability: "c", sessionId: "", now: Double(i)) }
+        for i in 0..<13 { ev.note(taskId: "t\(i)", surfaceId: "s", workspaceId: "w", socketPath: "/x.sock", capability: "c", sessionId: "", now: Double(i)) }
         check("eviction never picks the open reply task even when it is the oldest",
-              ev.evictionCandidates(idle: CmuxRouting.evictableIdle(["t0", "t1", "t2"], openReplyTask: "t0"), keep: "t6") == ["t1"])
+              ev.evictionCandidates(idle: CmuxRouting.evictableIdle(["t0", "t1", "t2"], openReplyTask: "t0"), keep: "t12") == ["t1"])
         check("stale prune never picks the open reply task",
               ev.staleTaskIds(now: 99999, protected: CmuxRouting.pruneProtected(holdingCard: [], openReplyTask: "t0")).contains("t0") == false)
         check("answer stays in the reply view of that session only",
@@ -691,8 +696,8 @@ enum CmuxRoutingTests {
         check("clean: one cluster of thousands of marks gives nil",
               CmuxRouting.cleanLabel("e" + String(repeating: "\u{301}", count: 5000)) == nil)
         check("clean: the 60 character cap still holds", CmuxRouting.cleanLabel(String(repeating: "é", count: 90))?.count == 60)
-        check("title: Cf in a tab title",
-              CmuxRouting.tabTitle(forSurface: "S", inListJSON: #"{"surfaces":[{"id":"S","title":"✳ Pro\u200Beus"}]}"#) == "Proeus")
+        func tabLabel(_ raw: String) -> String? { CmuxRouting.cleanLabel(CmuxRouting.stripLeadingGlyphs(raw)) }
+        check("title: Cf in a tab title", tabLabel("✳ Pro\u{200B}eus") == "Proeus")
         check("title: two live sessions with the same title get the suffix",
               CmuxRouting.displayName(base: "Proteus", taskId: "b", existing: [(id: "a", name: "Proteus"), (id: "b", name: "x")]) == "Proteus 2"
               && CmuxRouting.displayName(base: "Proteus", taskId: "c", existing: [(id: "a", name: "Proteus"), (id: "b", name: "Proteus 2")]) == "Proteus 3"
@@ -711,29 +716,17 @@ enum CmuxRoutingTests {
               && CmuxRouting.stripLeadingGlyphs("Hera") == "Hera"
               && CmuxRouting.stripLeadingGlyphs("3rd run") == "3rd run"
               && CmuxRouting.stripLeadingGlyphs("★ ✦") == "")
-        let sid = "786BDC8E-A27B-4555-83FE-2734DA1721CC"
-        let surfJSON = "{\"surfaces\":[{\"id\":\"11111111-1111-4111-8111-111111111111\",\"title\":\"other\"},{\"id\":\"\(sid)\",\"title\":\"✳ Hera (Code Reviewer) [re-review 2]\",\"focused\":true},{\"id\":\"22222222-2222-4222-8222-222222222222\"}]}"
-        check("title of the matching surface, glyph removed",
-              CmuxRouting.tabTitle(forSurface: sid, inListJSON: surfJSON) == "Hera (Code Reviewer) [re-review 2]")
-        check("surface id matched case insensitively",
-              CmuxRouting.tabTitle(forSurface: sid.lowercased(), inListJSON: surfJSON) == "Hera (Code Reviewer) [re-review 2]")
-        check("title: other surface, missing title, unknown id, empty id, bad JSON all nil",
-              CmuxRouting.tabTitle(forSurface: "22222222-2222-4222-8222-222222222222", inListJSON: surfJSON) == nil
-              && CmuxRouting.tabTitle(forSurface: "33333333-3333-4333-8333-333333333333", inListJSON: surfJSON) == nil
-              && CmuxRouting.tabTitle(forSurface: "", inListJSON: surfJSON) == nil
-              && CmuxRouting.tabTitle(forSurface: sid, inListJSON: "nope") == nil
-              && CmuxRouting.tabTitle(forSurface: sid, inListJSON: "{\"surfaces\":\"x\"}") == nil)
-        check("title that is only glyphs or control characters is nil",
-              CmuxRouting.tabTitle(forSurface: sid, inListJSON: "{\"surfaces\":[{\"id\":\"\(sid)\",\"title\":\"✳ \\u0007\"}]}") == nil)
+        check("title of a tab, glyph removed", tabLabel("✳ Hera (Code Reviewer) [re-review 2]") == "Hera (Code Reviewer) [re-review 2]")
+        check("title that is only glyphs or control characters is nil", tabLabel("✳ \u{0007}") == nil && tabLabel("") == nil)
         check("title: control characters removed and capped",
-              CmuxRouting.tabTitle(forSurface: sid, inListJSON: "{\"surfaces\":[{\"id\":\"\(sid)\",\"title\":\"A\\u001b[2Jb\\n\(String(repeating: "z", count: 90))\"}]}")?.count == 60
-              && CmuxRouting.tabTitle(forSurface: sid, inListJSON: "{\"surfaces\":[{\"id\":\"\(sid)\",\"title\":\"A\\u001b[2Jb\"}]}") == "A[2Jb")
-        check("title under a result wrapper",
-              CmuxRouting.tabTitle(forSurface: sid, inListJSON: "{\"result\":\(surfJSON)}") == "Hera (Code Reviewer) [re-review 2]")
-        check("surface.list params need a valid workspace id",
-              CmuxRouting.surfaceListParams(workspaceId: "ABC-1")?["workspace_id"] == "ABC-1"
-              && CmuxRouting.surfaceListParams(workspaceId: "") == nil
-              && CmuxRouting.surfaceListParams(workspaceId: "a b") == nil)
+              tabLabel("A\u{1b}[2Jb\n\(String(repeating: "z", count: 90))")?.count == 60 && tabLabel("A\u{1b}[2Jb") == "A[2Jb")
+        check("folder pill name: cleaned folder, else the fallback",
+              CmuxRouting.folderPillName(cwd: "/Users/x/proj", fallback: "Session") == "proj"
+              && CmuxRouting.folderPillName(cwd: "/Users/x/pro\u{202E}j\u{200B}", fallback: "Session") == "proj"
+              && CmuxRouting.folderPillName(cwd: "", fallback: "Session") == "Session"
+              && CmuxRouting.folderPillName(cwd: "/", fallback: "Session") == "Session"
+              && CmuxRouting.folderPillName(cwd: "/x/\u{202E}\u{200B}", fallback: "Session") == "Session"
+              && CmuxRouting.folderPillName(cwd: "/x/" + String(repeating: "q", count: 200), fallback: "S").count == 60)
         check("refresh throttled to once per 5 s",
               CmuxRouting.metaRefreshDue(last: nil, now: 10) && !CmuxRouting.metaRefreshDue(last: 10, now: 14.9)
               && CmuxRouting.metaRefreshDue(last: 10, now: 15) && CmuxRouting.metaRefreshDue(last: 10, now: 5))
@@ -1089,6 +1082,494 @@ enum CmuxRoutingTests {
         } else {
             print("  - fish NOT RUN: neither /opt/homebrew/bin/fish nor /usr/local/bin/fish exists on this machine")
         }
+
+        // ── workspaces: task id, folded state, main surface ────────────────────
+        let wsA = "11111111-2222-3333-4444-555555555555"
+        let wsB = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+        let sfA1 = "0A000000-0000-0000-0000-000000000001"
+        let sfA2 = "0A000000-0000-0000-0000-000000000002"
+        let sfB1 = "0B000000-0000-0000-0000-000000000001"
+        let sfShell = "0C000000-0000-0000-0000-000000000009"
+        print("CmuxRouting.taskId per workspace")
+        check("workspace id present → workspace key",
+              CmuxRouting.taskId(payload: ["cmux_surface_id": sfA1, "cmux_workspace_id": wsB, "session_id": "s"])
+                == "agent_cmux_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        check("two surfaces of one workspace → same id",
+              CmuxRouting.taskId(payload: ["cmux_surface_id": sfA1, "cmux_workspace_id": wsA])
+                == CmuxRouting.taskId(payload: ["cmux_surface_id": sfA2, "cmux_workspace_id": wsA]))
+        check("no workspace → old surface key",
+              CmuxRouting.taskId(payload: ["cmux_surface_id": sfA1]) == "agent_cmux_0a000000-0000-0000-0000-000000000001")
+        check("junk workspace id → old surface key",
+              CmuxRouting.taskId(payload: ["cmux_surface_id": sfA1, "cmux_workspace_id": "workspace:3"])
+                == "agent_cmux_0a000000-0000-0000-0000-000000000001")
+        check("workspace id but no usable surface or session → nil",
+              CmuxRouting.taskId(payload: ["cmux_workspace_id": wsA, "session_id": "unknown"]) == nil)
+        check("surfaceKey is the old per surface key",
+              CmuxRouting.surfaceKey(payload: ["cmux_surface_id": sfA2, "cmux_workspace_id": wsA]) == "0a000000-0000-0000-0000-000000000002"
+              && CmuxRouting.surfaceKey(payload: ["session_id": "s1"]) == nil)
+        check("workspaceKey lowercases a UUID only",
+              CmuxRouting.workspaceKey(wsB) == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" && CmuxRouting.workspaceKey("x") == nil)
+
+        print("CmuxRouting.foldedState")
+        let order = ["approval", "question", "working", "searching", "thinking", "error", "ratelimit", "finished", "idle"]
+        var orderOK = true
+        for i in 0..<order.count { for j in i..<order.count {
+            if CmuxRouting.foldedState([order[j], order[i]]) != order[i] || CmuxRouting.foldedState([order[i], order[j]]) != order[i] { orderOK = false }
+        } }
+        check("every pair follows the priority approval > question > working > searching > thinking > error > ratelimit > finished > idle", orderOK)
+        check("empty → idle", CmuxRouting.foldedState([]) == "idle")
+        check("unknown raw value → idle, and loses to a known state",
+              CmuxRouting.foldedState(["bogus"]) == "idle" && CmuxRouting.foldedState(["bogus", "finished"]) == "finished")
+
+        print("CmuxRouting.mainSurfaceKey")
+        let cand: [(key: String, index: Int?, startedAt: TimeInterval?)] = [("c", 2, 5), ("a", 1, 9), ("b", 0, 7)]
+        check("lowest index", CmuxRouting.mainSurfaceKey(current: nil, candidates: cand) == "b")
+        check("sticky while nobody sits at a lower index",
+              CmuxRouting.mainSurfaceKey(current: "b", candidates: cand) == "b"
+              && CmuxRouting.mainSurfaceKey(current: "x", candidates: [("x", 1, 9), ("y", 1, 3)]) == "x")
+        check("a lower index takes the main role back (a /clear in the main agent hands it to a helper and back)",
+              CmuxRouting.mainSurfaceKey(current: "a", candidates: cand) == "b")
+        check("current gone → first by order", CmuxRouting.mainSurfaceKey(current: "zzz", candidates: cand) == "b")
+        check("same index → oldest startedAt",
+              CmuxRouting.mainSurfaceKey(current: nil, candidates: [("x", 1, 9), ("y", 1, 3)]) == "y")
+        check("no index → startedAt, then key",
+              CmuxRouting.mainSurfaceKey(current: nil, candidates: [("x", nil, 9), ("y", nil, 3)]) == "y"
+              && CmuxRouting.mainSurfaceKey(current: nil, candidates: [("q", nil, nil), ("p", nil, nil)]) == "p")
+        check("no candidates → nil", CmuxRouting.mainSurfaceKey(current: "a", candidates: []) == nil)
+        check("a current without index yields to a surface with one",
+              CmuxRouting.mainSurfaceKey(current: "h", candidates: [("h", nil, 1), ("m", 0, 2)]) == "m")
+        check("a current without index stays when nobody has one",
+              CmuxRouting.mainSurfaceKey(current: "h", candidates: [("h", nil, 5), ("m", nil, 2)]) == "h")
+
+        print("CmuxRouting.discoveryDue / needsDialogMark / surfaceLabels")
+        check("first run is due", CmuxRouting.discoveryDue(last: nil, now: 0, inFlight: false))
+        check("inside 5 s is not due", !CmuxRouting.discoveryDue(last: 100, now: 104.9, inFlight: false))
+        check("at 5 s is due", CmuxRouting.discoveryDue(last: 100, now: 105, inFlight: false))
+        check("in flight is never due", !CmuxRouting.discoveryDue(last: nil, now: 500, inFlight: true))
+        check("clock going backwards is due", CmuxRouting.discoveryDue(last: 100, now: 50, inFlight: false))
+        check("heard surface: no mark", !CmuxRouting.needsDialogMark(heard: true))
+        check("never heard: mark, whatever the session file says about its lifecycle", CmuxRouting.needsDialogMark(heard: false))
+        check("labels: short title, fallback, numbered duplicates",
+              CmuxRouting.surfaceLabels(titles: ["Proteus (Swift) [x]", nil, "Proteus", nil], fallback: "Session")
+                == ["Proteus", "Session", "Proteus 2", "Session 2"])
+
+        // ── parseTree ──────────────────────────────────────────────────────────
+        print("CmuxRouting.parseTree")
+        func surfaceJSON(_ id: String, _ title: String, _ type: String = "terminal", _ index: Int) -> String {
+            "{\"id\":\"\(id)\",\"title\":\"\(title)\",\"type\":\"\(type)\",\"index\":\(index),\"focused\":false,\"tty\":\"ttys000\"}"
+        }
+        let treeJSON = """
+        {"active":{"window_id":"W"},"caller":{},"windows":[{"id":"w1","index":0,"workspaces":[
+          {"id":"\(wsA)","title":"core.joinads.me","index":0,"selected":true,"pinned":false,"layout":{"children":[]},
+           "panes":[{"id":"p1","surfaces":[\(surfaceJSON(sfA1, "✳ Diagnóstico e plano", "terminal", 0))]},
+                    {"id":"p2","surfaces":[\(surfaceJSON(sfA2, "Proteus (Swift) [names]", "terminal", 1)),\(surfaceJSON(sfShell, "~", "browser", 2))]}]},
+          {"id":"\(wsB)","title":"coucou","index":1,"selected":false,"panes":[{"surfaces":[\(surfaceJSON(sfB1, "claude", "terminal", 0))]}]}
+        ]}]}
+        """
+        let tree = CmuxRouting.parseTree(treeJSON)
+        check("real shape: two workspaces in order", tree?.map { $0.title } == ["core.joinads.me", "coucou"] && tree?.map { $0.index } == [0, 1])
+        check("surfaces of all panes, by workspace wide index", tree?.first?.surfaces.map { $0.index } == [0, 1, 2])
+        check("glyph prefix stripped from a title", tree?.first?.surfaces.first?.title == "Diagnóstico e plano")
+        check("non terminal surfaces are kept with their type", tree?.first?.surfaces.last?.type == "browser")
+        check("selected is read", tree?.first?.selected == true && tree?.last?.selected == false)
+        check("result wrapper is accepted",
+              CmuxRouting.parseTree("{\"ok\":true,\"result\":" + treeJSON + "}")?.count == 2)
+        let badIds = """
+        {"windows":[{"workspaces":[{"id":"not-a-uuid","title":"x","index":0,"panes":[]},
+          {"id":"\(wsA)","title":"ok","index":1,"panes":[{"surfaces":[{"id":"bad","type":"terminal","index":0},\(surfaceJSON(sfA1, "t", "terminal", 1))]}]}]}]}
+        """
+        let bad = CmuxRouting.parseTree(badIds)
+        check("a workspace or surface with a bad UUID is dropped", bad?.count == 1 && bad?.first?.surfaces.count == 1)
+        let dirty = CmuxRouting.parseTree("""
+        {"windows":[{"workspaces":[{"id":"\(wsA)","title":"a\\u202Eb\\u0007c\\u200Bd","index":0,"panes":[]}]}]}
+        """)
+        check("bidi, control and format characters are removed from titles", dirty?.first?.title == "abcd")
+        var manyWs = "{\"windows\":[{\"workspaces\":["
+        manyWs += (0..<80).map { i in
+            let id = String(format: "%08X-0000-0000-0000-000000000000", i + 1)
+            return "{\"id\":\"\(id)\",\"title\":\"w\(i)\",\"index\":\(i),\"panes\":[]}"
+        }.joined(separator: ",")
+        manyWs += "]}]}"
+        check("at most 64 workspaces", CmuxRouting.parseTree(manyWs)?.count == 64)
+        var manySf = "{\"windows\":[{\"workspaces\":[{\"id\":\"\(wsA)\",\"title\":\"w\",\"index\":0,\"panes\":[{\"surfaces\":["
+        manySf += (0..<50).map { i in surfaceJSON(String(format: "%08X-0000-0000-0000-000000000000", i + 1), "t", "terminal", i) }.joined(separator: ",")
+        manySf += "]}]}]}]}"
+        check("at most 32 surfaces per workspace", CmuxRouting.parseTree(manySf)?.first?.surfaces.count == 32)
+        check("garbage → nil",
+              CmuxRouting.parseTree("not json") == nil && CmuxRouting.parseTree("[1,2]") == nil
+              && CmuxRouting.parseTree("{\"foo\":1}") == nil && CmuxRouting.parseTree("") == nil)
+        check("an empty tree is a valid, empty answer", CmuxRouting.parseTree("{\"windows\":[]}")?.isEmpty == true)
+
+        // ── parseSessionFile ───────────────────────────────────────────────────
+        print("CmuxRouting.parseSessionFile")
+        func sessionJSON(_ sid: String, surface: String, ws: String, cwd: String = "/Users/x/proj", pid: Int = 4242, life: String = "idle", started: Double = 100) -> String {
+            "\"\(sid)\":{\"sessionId\":\"\(sid)\",\"surfaceId\":\"\(surface)\",\"workspaceId\":\"\(ws)\",\"cwd\":\"\(cwd)\",\"pid\":\(pid),\"pidStartSeconds\":777,\"agentLifecycle\":\"\(life)\",\"startedAt\":\(started),\"launchCommand\":{\"arguments\":[\"claude\"]}}"
+        }
+        let fileJSON = """
+        {"version":1,"sessions":{\(sessionJSON("s-old", surface: sfA1, ws: wsA, started: 10)),\(sessionJSON("s-new", surface: sfA1, ws: wsA, life: "running", started: 50)),
+        \(sessionJSON("s-helper", surface: sfA2, ws: wsA, started: 60)),\(sessionJSON("s-b", surface: sfB1, ws: wsB, cwd: "/Users/x/../etc", life: "needsInput"))},
+        "activeSessionsBySurface":{"\(sfA1)":{"sessionId":"s-new"},"\(sfA2)":{"sessionId":"s-helper"},"\(sfB1)":{"sessionId":"s-b"},"\(sfShell)":{"sessionId":"s-gone"}},
+        "activeSessionsByWorkspace":{}}
+        """
+        let parsed = CmuxRouting.parseSessionFile(Data(fileJSON.utf8))
+        check("only the current session of each surface is kept",
+              Set(parsed?.map { $0.sessionId } ?? []) == ["s-new", "s-helper", "s-b"])
+        check("fields are read", parsed?.first { $0.sessionId == "s-new" }.map { $0.lifecycle == "running" && $0.startedAt == 50 && $0.pid == 4242 && $0.pidStart == 777 && $0.cwd == "/Users/x/proj" } == true)
+        check("a cwd with .. is dropped, the session stays", parsed?.first { $0.sessionId == "s-b" }?.cwd == "")
+        check("a session of another surface than the one that points at it is ignored",
+              CmuxRouting.parseSessionFile(Data("""
+              {"sessions":{\(sessionJSON("s1", surface: sfA2, ws: wsA))},"activeSessionsBySurface":{"\(sfA1)":{"sessionId":"s1"}}}
+              """.utf8))?.isEmpty == true)
+        check("invalid ids are dropped",
+              CmuxRouting.parseSessionFile(Data("""
+              {"sessions":{\(sessionJSON("s/1", surface: sfA1, ws: wsA)),\(sessionJSON("s2", surface: "nope", ws: wsA)),\(sessionJSON("s3", surface: sfA2, ws: "bad"))},
+              "activeSessionsBySurface":{"\(sfA1)":{"sessionId":"s/1"},"\(sfA2)":{"sessionId":"s3"},"nope":{"sessionId":"s2"}}}
+              """.utf8))?.isEmpty == true)
+        check("a dead process (isLive false) is dropped",
+              CmuxRouting.parseSessionFile(Data(fileJSON.utf8), isLive: { pid, start in pid == 4242 && start == 999 })?.isEmpty == true)
+        check("liveness gets the pid and the start time",
+              { var seen: [(Int32, Int)] = []; _ = CmuxRouting.parseSessionFile(Data(fileJSON.utf8), isLive: { seen.append(($0, $1)); return true })
+                return seen.count == 3 && seen.allSatisfy { $0.0 == 4242 && $0.1 == 777 } }())
+        check("pid 0 or missing is dropped",
+              CmuxRouting.parseSessionFile(Data("""
+              {"sessions":{\(sessionJSON("s1", surface: sfA1, ws: wsA, pid: 0))},"activeSessionsBySurface":{"\(sfA1)":{"sessionId":"s1"}}}
+              """.utf8))?.isEmpty == true)
+        check("missing maps or garbage → nil",
+              CmuxRouting.parseSessionFile(Data("{\"sessions\":{}}".utf8)) == nil
+              && CmuxRouting.parseSessionFile(Data("{\"activeSessionsBySurface\":{}}".utf8)) == nil
+              && CmuxRouting.parseSessionFile(Data("nope".utf8)) == nil && CmuxRouting.parseSessionFile(Data()) == nil)
+        check("the file holds no token field the parser could return", !fileJSON.contains("capability"))
+        var bigFile = "{\"sessions\":{"
+        var bigActive = "\"activeSessionsBySurface\":{"
+        var bigParts: [String] = [], bigActiveParts: [String] = []
+        for i in 0..<300 {
+            let sf = String(format: "%08X-0000-0000-0000-00000000AAAA", i + 1)
+            bigParts.append(sessionJSON("s\(i)", surface: sf, ws: wsA))
+            bigActiveParts.append("\"\(sf)\":{\"sessionId\":\"s\(i)\"}")
+        }
+        bigFile += bigParts.joined(separator: ",") + "}," + bigActive + bigActiveParts.joined(separator: ",") + "}}"
+        check("at most 256 sessions", CmuxRouting.parseSessionFile(Data(bigFile.utf8))?.count == 256)
+
+        // ── reconcile ──────────────────────────────────────────────────────────
+        print("CmuxRouting.reconcile")
+        func entry(_ key: String, task: String, surface: String, heard: Bool, seen: TimeInterval = 10) -> CmuxSurface {
+            CmuxSurface(taskId: task, surfaceId: surface, workspaceId: "w", socketPath: "/x.sock", capability: "", sessionId: "",
+                        lastSeen: seen, key: key, heard: heard)
+        }
+        let kA1 = CmuxRouting.sanitize(sfA1), kA2 = CmuxRouting.sanitize(sfA2), kB1 = CmuxRouting.sanitize(sfB1)
+        let taskA = "agent_cmux_" + CmuxRouting.sanitize(wsA), taskB = "agent_cmux_" + CmuxRouting.sanitize(wsB)
+        let sessA1 = CmuxFileSession(sessionId: "s-new", surfaceId: sfA1, workspaceId: wsA, cwd: "/p/a", lifecycle: "idle", pid: 1, pidStart: 1, startedAt: 5)
+        let sessA2 = CmuxFileSession(sessionId: "s-helper", surfaceId: sfA2, workspaceId: wsA, cwd: "/p/a", lifecycle: "running", pid: 2, pidStart: 1, startedAt: 9)
+        let sessB1 = CmuxFileSession(sessionId: "s-b", surfaceId: sfB1, workspaceId: wsB, cwd: "/p/b", lifecycle: "needsInput", pid: 3, pidStart: 1, startedAt: 7)
+        let snap = CmuxSnapshot(tree: tree, sessions: [sessA1, sessA2, sessB1], socketPath: "/x.sock", startedAt: 1000)
+        let plan1 = CmuxRouting.reconcile(snapshot: snap, entries: [], protected: [])
+        check("new workspaces → one pill each, in tree order", plan1.workspaces.map { $0.taskId } == [taskA, taskB])
+        check("all agent surfaces fold into the workspace pill", plan1.workspaces.first?.surfaces.map { $0.key } == [kA1, kA2])
+        check("pill name is the workspace title, folder from the first surface",
+              plan1.workspaces.first?.title == "core.joinads.me" && plan1.workspaces.first?.cwd == "/p/a")
+        check("a non terminal surface and a shell surface give no agent surface",
+              plan1.workspaces.flatMap { $0.surfaces.map { $0.key } }.contains(CmuxRouting.sanitize(sfShell)) == false)
+        check("lifecycle and session id travel with the surface",
+              plan1.workspaces.last?.surfaces.first.map { $0.lifecycle == "needsInput" && $0.sessionId == "s-b" } == true)
+        let shellOnly = CmuxSnapshot(tree: tree, sessions: [], socketPath: "/x.sock", startedAt: 1000)
+        check("a workspace with no agent session gets no pill",
+              CmuxRouting.reconcile(snapshot: shellOnly, entries: [], protected: []).workspaces.isEmpty)
+        check("a surface the hooks reported counts as an agent even without a file session",
+              CmuxRouting.reconcile(snapshot: shellOnly, entries: [entry(kB1, task: taskB, surface: sfB1, heard: true)], protected: [])
+                .workspaces.map { $0.taskId } == [taskB])
+        check("an entry that was only discovered and whose session is gone is not an agent",
+              CmuxRouting.reconcile(snapshot: shellOnly, entries: [entry(kB1, task: taskB, surface: sfB1, heard: false)], protected: [])
+                .workspaces.isEmpty)
+        let gone = CmuxRouting.reconcile(snapshot: snap, entries: [
+            entry(kA1, task: taskA, surface: sfA1, heard: true), entry("zz-closed", task: taskA, surface: "0Z", heard: true)], protected: [])
+        check("a surface missing from the tree is removed, the pill stays", gone.removeKeys == ["zz-closed"] && gone.removeTasks.isEmpty)
+        let treeA = Array(tree!.prefix(1))
+        let lastGone = CmuxRouting.reconcile(snapshot: CmuxSnapshot(tree: treeA, sessions: [sessA1, sessA2], socketPath: "/x.sock", startedAt: 1000),
+                                             entries: [entry(kA1, task: taskA, surface: sfA1, heard: true), entry(kB1, task: taskB, surface: sfB1, heard: true)], protected: [])
+        check("last surface gone → the pill is removed", lastGone.removeKeys == [kB1] && lastGone.removeTasks == [taskB])
+        let prot = CmuxRouting.reconcile(snapshot: CmuxSnapshot(tree: treeA, sessions: [sessA1], socketPath: "/x.sock", startedAt: 1000),
+                                         entries: [entry(kB1, task: taskB, surface: sfB1, heard: true)], protected: [taskB])
+        check("a protected pill is kept with its surfaces", prot.removeKeys.isEmpty && prot.removeTasks.isEmpty)
+        let newer = CmuxRouting.reconcile(snapshot: CmuxSnapshot(tree: treeA, sessions: [sessA1], socketPath: "/x.sock", startedAt: 1000),
+                                          entries: [entry(kB1, task: taskB, surface: sfB1, heard: true, seen: 1001)], protected: [])
+        check("an entry heard after the snapshot began is newer than the tree: kept", newer.removeKeys.isEmpty && newer.removeTasks.isEmpty)
+        let unanchored = CmuxRouting.reconcile(snapshot: snap, entries: [entry("sess-only", task: "agent_cmux_sess-only", surface: "", heard: true)], protected: [])
+        check("an entry without a surface id is left to the time rule", unanchored.removeKeys.isEmpty)
+        let noTree = CmuxRouting.reconcile(snapshot: CmuxSnapshot(tree: nil, sessions: [sessA1, sessA2, sessB1], socketPath: "", startedAt: 1000),
+                                           entries: [entry("old", task: "agent_cmux_old", surface: "0Z", heard: true)], protected: [])
+        check("tree nil → nothing is removed", noTree.removeKeys.isEmpty && noTree.removeTasks.isEmpty)
+        check("tree nil → pills come from the session file, grouped by workspace, no title",
+              noTree.workspaces.map { $0.taskId } == [taskA, taskB] && noTree.workspaces.allSatisfy { $0.title == nil }
+              && noTree.workspaces.first?.surfaces.count == 2 && noTree.workspaces.first?.surfaces.allSatisfy { $0.index == nil } == true)
+        check("no tree and no session file → an empty plan",
+              CmuxRouting.reconcile(snapshot: CmuxSnapshot(tree: nil, sessions: nil, socketPath: "", startedAt: 0), entries: [entry("a", task: "t", surface: "s", heard: true)], protected: []) == CmuxReconcilePlan())
+        var manyTree: [CmuxTreeWorkspace] = [], manySess: [CmuxFileSession] = []
+        for i in 0..<20 {
+            let w = String(format: "%08X-0000-0000-0000-00000000BBBB", i + 1), sf = String(format: "%08X-0000-0000-0000-00000000CCCC", i + 1)
+            manyTree.append(CmuxTreeWorkspace(id: w, title: "w\(i)", index: i, selected: false, surfaces: [CmuxTreeSurface(id: sf, title: "t", type: "terminal", index: 0)]))
+            manySess.append(CmuxFileSession(sessionId: "s\(i)", surfaceId: sf, workspaceId: w, cwd: "", lifecycle: "idle", pid: 1, pidStart: 1, startedAt: Double(i)))
+        }
+        let capped = CmuxRouting.reconcile(snapshot: CmuxSnapshot(tree: manyTree, sessions: manySess, socketPath: "", startedAt: 0), entries: [], protected: [])
+        check("new pills stop at 12, lowest index first",
+              capped.workspaces.count == 12 && capped.workspaces.first?.title == "w0" && capped.workspaces.last?.title == "w11")
+        let cappedKeep = CmuxRouting.reconcile(snapshot: CmuxSnapshot(tree: manyTree, sessions: manySess, socketPath: "", startedAt: 0),
+            entries: [entry(CmuxRouting.sanitize(manySess[19].surfaceId), task: "agent_cmux_" + CmuxRouting.sanitize(manyTree[19].id), surface: manySess[19].surfaceId, heard: true)], protected: [])
+        check("a pill that exists already is kept past the cap", cappedKeep.workspaces.contains { $0.title == "w19" } && cappedKeep.workspaces.count == 12)
+
+        // ── registry per surface ───────────────────────────────────────────────
+        print("CmuxRegistry per surface")
+        var rr = CmuxRegistry()
+        rr.note(taskId: "P", key: "k1", surfaceId: "S1", workspaceId: "W", socketPath: "/x.sock", capability: "tok", sessionId: "a", now: 1)
+        check("note reports a new key", rr.lastNoteCreated)
+        rr.note(taskId: "P", key: "k1", surfaceId: "S1", workspaceId: "W", socketPath: "/x.sock", capability: "tok", sessionId: "a", now: 2)
+        check("note of a known key is not new", !rr.lastNoteCreated)
+        rr.note(taskId: "P", key: "k2", surfaceId: "S2", workspaceId: "W", socketPath: "/x.sock", capability: "tok2", sessionId: "b", now: 3)
+        check("two surfaces of one pill", rr.surfaces(ofTask: "P").count == 2 && rr.taskIds == ["P"])
+        check("a heard surface is marked heard", rr.surface(key: "k1")?.heard == true && rr.surface(key: "k2")?.heard == true)
+        rr.noteDiscovered(taskId: "P", key: "k1", surfaceId: "OTHER", workspaceId: "OTHERW", socketPath: "/y.sock", sessionId: "z",
+                          title: "Main", index: 0, startedAt: 5, now: 10)
+        check("noteDiscovered never replaces a token backed unit",
+              rr.surface(key: "k1")?.surfaceId == "S1" && rr.surface(key: "k1")?.socketPath == "/x.sock" && rr.surface(key: "k1")?.capability == "tok"
+              && rr.surface(key: "k1")?.workspaceId == "W")
+        check("noteDiscovered sets title, index, start time, session id and lastSeen",
+              rr.surface(key: "k1").map { $0.title == "Main" && $0.index == 0 && $0.startedAt == 5 && $0.sessionId == "z" } == true)
+        check("discovery does not refresh lastSeen of a heard entry", rr.surface(key: "k1")?.lastSeen == 2)
+        rr.noteDiscovered(taskId: "P", key: "k3", surfaceId: "S3", workspaceId: "W", socketPath: "/x.sock", sessionId: "c",
+                          title: nil, index: 2, startedAt: 9, now: 11)
+        check("a discovered surface has ids and socket but no token and is not heard",
+              rr.surface(key: "k3").map { $0.capability.isEmpty && $0.socketPath == "/x.sock" && !$0.heard && !$0.canFocusExactly } == true)
+        check("main surface: lowest index", rr.surface(for: "P")?.key == "k1")
+        check("surfaces(ofTask:) puts the main first", rr.surfaces(ofTask: "P").first?.key == "k1")
+        check("sendCredential(forKey:) gives a discovered surface nothing, whatever token sits on its socket",
+              rr.sendCredential(forKey: "k3") == CmuxCredential.none)
+        check("jumpCredential(forKey:) borrows the token on the same socket for it",
+              { if case .token(let t) = rr.jumpCredential(forKey: "k3") { return t.key == "k1" || t.key == "k2" } else { return false } }())
+        check("a discovered surface refreshes lastSeen (nothing else keeps it)", rr.surface(key: "k3")?.lastSeen == 11)
+        var otherSocket = rr
+        otherSocket.noteDiscovered(taskId: "P", key: "k4", surfaceId: "S4", workspaceId: "W", socketPath: "/other.sock", sessionId: "d",
+                                   title: nil, index: 3, startedAt: nil, now: 12)
+        check("no token on that socket: none, never the password",
+              otherSocket.sendCredential(forKey: "k4") == CmuxCredential.none && otherSocket.jumpCredential(forKey: "k4") == CmuxCredential.none)
+        var noSocket = CmuxRegistry()
+        noSocket.noteDiscovered(taskId: "P", key: "k9", surfaceId: "S9", workspaceId: "W", socketPath: "", sessionId: "", title: nil, index: 0, startedAt: nil, now: 1)
+        check("a discovered surface with no socket path has no credential",
+              noSocket.sendCredential(forKey: "k9") == CmuxCredential.none && noSocket.jumpCredential(forKey: "k9") == CmuxCredential.none)
+        check("unknown key: none", rr.sendCredential(forKey: "nope") == CmuxCredential.none)
+        rr.setState(key: "k2", "working")
+        rr.setState(key: "k1", "finished")
+        check("folded state of the pill", rr.foldedState(ofTask: "P") == "working" && rr.foldedState(ofTask: "none") == nil)
+        rr.clearCredentials()
+        check("clearCredentials keeps the entries and their ids", rr.surfaces.count == 3 && rr.surface(key: "k1")?.surfaceId == "S1" && rr.surface(key: "k1")?.capability == "")
+        var rm = rr
+        rm.remove(key: "k1")
+        check("remove(key:) moves the main surface to the next one", rm.surfaces(ofTask: "P").count == 2 && rm.surface(for: "P")?.key != "k1" && rm.surface(for: "P") != nil)
+        rm.remove(taskId: "P")
+        check("remove(taskId:) removes every surface of the pill", rm.surfaces.isEmpty && rm.surface(for: "P") == nil && rm.mainKeys.isEmpty)
+        var cap = CmuxRegistry()
+        for i in 0..<10 { cap.note(taskId: "P", key: "k\(i)", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", capability: "", sessionId: "", now: Double(i)) }
+        check("a pill holds at most 8 surfaces", cap.surfaces(ofTask: "P").count == CmuxRouting.maxSurfacesPerTask && CmuxRouting.maxSurfacesPerTask == 8)
+        check("a ninth discovered surface is refused", cap.noteDiscovered(taskId: "P", key: "kx", surfaceId: "S", workspaceId: "W", socketPath: "", sessionId: "", title: nil, index: nil, startedAt: nil, now: 1) == false)
+        var ev2 = CmuxRegistry()
+        for p in 1...13 { for s in 0..<2 { ev2.note(taskId: "p\(p)", key: "p\(p)s\(s)", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", capability: "", sessionId: "", now: Double(p)) } }
+        check("eviction counts pills, not surfaces", ev2.evictionCandidates(idle: ev2.taskIds, keep: "p13") == ["p1"])
+        var st2 = CmuxRegistry()
+        st2.note(taskId: "P", key: "main", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", capability: "", sessionId: "", now: 0)
+        st2.note(taskId: "P", key: "helper", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", capability: "", sessionId: "", now: 5000)
+        check("stale prune works per surface", st2.staleTaskIds(now: 4000, protected: []) == ["main"])
+        check("stale prune honours `only`", st2.staleTaskIds(now: 4000, protected: [], only: { _ in false }).isEmpty)
+        check("a protected pill keeps its surfaces", st2.staleTaskIds(now: 4000, protected: ["P"]).isEmpty)
+        check("a busy surface key lasts longer", st2.staleTaskIds(now: 4000, protected: [], busy: ["main"]).isEmpty)
+
+        print("CmuxCardQueue per surface and pill")
+        var qs2 = CmuxCardQueue()
+        _ = qs2.enqueue(kind: .approval, taskId: "P", sessionId: "s1", tool: "Bash", inputKey: "1", now: 0, surfaceKey: "a")
+        _ = qs2.enqueue(kind: .approval, taskId: "P", sessionId: "s1", tool: "Bash", inputKey: "2", now: 0, surfaceKey: "a")
+        check("two cards of a surface: refuses a third for it", !qs2.canAccept(taskId: "P", surfaceKey: "a"))
+        check("another surface of the same pill is still accepted", qs2.canAccept(taskId: "P", surfaceKey: "b"))
+        for (i, k) in ["b", "b", "c", "c"].enumerated() { _ = qs2.enqueue(kind: .approval, taskId: "P", sessionId: "s\(i)", tool: "Bash", inputKey: "k\(i)", now: 0, surfaceKey: k) }
+        check("six cards of a pill: refuses a seventh whatever the surface", !qs2.canAccept(taskId: "P", surfaceKey: "d") && qs2.canAccept(taskId: "Q", surfaceKey: "q"))
+        check("hasCards by surface and by pill", qs2.hasCards(forSurface: "a") && !qs2.hasCards(forSurface: "d") && qs2.hasCards(for: "P"))
+        let gone2 = qs2.removeAll(surfaceKey: "a")
+        check("removeAll(surfaceKey:) removes that surface only", gone2.count == 2 && !qs2.hasCards(forSurface: "a") && qs2.hasCards(forSurface: "b"))
+        var qres = CmuxCardQueue()
+        let c1 = qres.enqueue(kind: .approval, taskId: "P", sessionId: "s1", tool: "Bash", inputKey: "k", now: 0, surfaceKey: "a")
+        _ = qres.enqueue(kind: .approval, taskId: "P", sessionId: "s2", tool: "Bash", inputKey: "k", now: 0, surfaceKey: "b")
+        check("resolve is still by session", qres.resolve(event: "Stop", sessionId: "s1", tool: "", inputKey: "") == [c1] && qres.cards.count == 1)
+        check("a card without a surface key is keyed by its task",
+              { var q = CmuxCardQueue(); _ = q.enqueue(kind: .approval, taskId: "T", sessionId: "s", tool: "Bash", inputKey: "k", now: 0)
+                return q.cards.first?.surfaceKey == "T" }())
+
+        print("answerStaysInReply with surfaces")
+        check("only the targeted surface stays in place",
+              CmuxRouting.answerStaysInReply(prompt: .reply(taskId: "P"), taskId: "P", viewIsPrompt: true, surfaceKey: "a", targetKey: "a")
+              && !CmuxRouting.answerStaysInReply(prompt: .reply(taskId: "P"), taskId: "P", viewIsPrompt: true, surfaceKey: "b", targetKey: "a"))
+
+        // ── Aegis F1: only a hook event with a valid token makes a surface a typing target ──
+        print("typing proof (a surface is typable only after a hook event with a valid token for it)")
+        var fz = CmuxRegistry()
+        // A forged SessionStart with no token, naming the surface of a plain shell.
+        fz.note(taskId: "P", key: "shell", surfaceId: "", workspaceId: "", socketPath: "", capability: "", sessionId: "forged", now: 1)
+        check("a tokenless event creates an entry that was never heard", fz.surface(key: "shell").map { !$0.heard && $0.capability.isEmpty } == true)
+        check("and it reports the surface as not heard (nothing qualifies it as an agent)", fz.lastNoteCreated && !fz.lastNoteFirstHeard)
+        // Discovery then fills the ids from the tree, on the socket of the token in use.
+        fz.note(taskId: "P", key: "real", surfaceId: "SR", workspaceId: "W", socketPath: "/x.sock", capability: "tokR", sessionId: "s", now: 2)
+        fz.noteDiscovered(taskId: "P", key: "shell", surfaceId: "SH", workspaceId: "W", socketPath: "/x.sock", sessionId: "forged",
+                          title: nil, index: 0, startedAt: nil, now: 3)
+        check("discovery gives the shell ids and a socket", fz.surface(key: "shell").map { $0.surfaceId == "SH" && $0.socketPath == "/x.sock" } == true)
+        check("but the shell is not typable and gets no credential, although a live token sits on its socket",
+              fz.surface(key: "shell")?.canType == false && fz.sendCredential(forKey: "shell") == CmuxCredential.none
+              && fz.sendCredential(for: "shell") == CmuxCredential.none)
+        check("the surface that reported with a token is typable with its own token",
+              fz.surface(key: "real")?.canType == true
+              && { if case .token(let t) = fz.sendCredential(forKey: "real") { return t.key == "real" && t.capability == "tokR" } else { return false } }())
+        // A file-only surface (the user writable session file) is in the same position.
+        fz.noteDiscovered(taskId: "P", key: "filesess", surfaceId: "SF", workspaceId: "W", socketPath: "/x.sock", sessionId: "s2",
+                          title: nil, index: 2, startedAt: 5, now: 4)
+        check("a surface known only through the session file has no credential", fz.sendCredential(forKey: "filesess") == CmuxCredential.none)
+        // The first real event with a token proves it.
+        fz.note(taskId: "P", key: "shell", surfaceId: "SH", workspaceId: "W", socketPath: "/x.sock", capability: "tokH", sessionId: "s3", now: 5)
+        check("a hook event with a valid token for the very surface makes it typable", fz.surface(key: "shell")?.canType == true)
+        fz.clearCredentials()
+        check("cmux quit: every token is dead, nobody is typable until the next event",
+              fz.surface(key: "shell")?.canType == false && fz.sendCredential(forKey: "real") == CmuxCredential.none)
+        check("a hand built entry with ids and a token but never heard is not typable",
+              CmuxSurface(taskId: "t", surfaceId: "s", workspaceId: "w", socketPath: "/x.sock", capability: "c", sessionId: "", lastSeen: 0).canType == false)
+
+        // ── Hera M4: "new" means not heard before this event ──
+        print("first event of a surface (a discovered entry is still new)")
+        var fh = CmuxRegistry()
+        fh.noteDiscovered(taskId: "P", key: "k", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", sessionId: "s", title: nil, index: 0, startedAt: 1, now: 1)
+        fh.note(taskId: "P", key: "k", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", capability: "tok", sessionId: "s", now: 2)
+        check("discovery created the entry, then the first hook event reports first heard", !fh.lastNoteCreated && fh.lastNoteFirstHeard)
+        fh.note(taskId: "P", key: "k", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", capability: "tok", sessionId: "s", now: 3)
+        check("a second event of the same surface does not", !fh.lastNoteFirstHeard)
+        var fh2 = CmuxRegistry()
+        fh2.note(taskId: "P", key: "k", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", capability: "tok", sessionId: "s", now: 1)
+        check("an unknown surface's first event is created and first heard", fh2.lastNoteCreated && fh2.lastNoteFirstHeard)
+        var fh3 = CmuxRegistry()
+        fh3.note(taskId: "P", key: "k", surfaceId: "", workspaceId: "", socketPath: "", capability: "", sessionId: "s", now: 1)
+        check("a tokenless first event is created but not first heard", fh3.lastNoteCreated && !fh3.lastNoteFirstHeard)
+        fh3.note(taskId: "P", key: "k", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", capability: "tok", sessionId: "s", now: 2)
+        check("the first event with a token after a tokenless one is first heard", !fh3.lastNoteCreated && fh3.lastNoteFirstHeard)
+
+        // ── Aegis F2: the entry decides the pill; the tree re-homes ──
+        print("one source of truth for surface to pill")
+        var ph = CmuxRegistry()
+        ph.note(taskId: "agent_cmux_W1", key: "k", surfaceId: "S", workspaceId: "W1", socketPath: "/x.sock", capability: "t", sessionId: "s", now: 1)
+        check("pillId(forKey:) is the pill of the entry", ph.pillId(forKey: "k") == "agent_cmux_W1" && ph.pillId(forKey: "nope") == nil)
+        ph.note(taskId: "agent_cmux_W3", key: "k", surfaceId: "S", workspaceId: "W3", socketPath: "/x.sock", capability: "t", sessionId: "s", now: 2)
+        check("an event naming another workspace does not move the entry", ph.pillId(forKey: "k") == "agent_cmux_W1" && ph.taskIds == ["agent_cmux_W1"])
+        ph.noteDiscovered(taskId: "agent_cmux_W2", key: "k", surfaceId: "S", workspaceId: "W2", socketPath: "/x.sock", sessionId: "s", title: nil, index: 0, startedAt: nil, now: 3)
+        check("the tree moves the entry to its workspace's pill", ph.pillId(forKey: "k") == "agent_cmux_W2" && ph.taskIds == ["agent_cmux_W2"])
+        check("the old pill has no main surface left, the new one has it", ph.surface(for: "agent_cmux_W1") == nil && ph.surface(for: "agent_cmux_W2")?.key == "k")
+        var fullPill = CmuxRegistry()
+        for i in 0..<8 { fullPill.note(taskId: "T", key: "f\(i)", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", capability: "t", sessionId: "", now: 1) }
+        fullPill.note(taskId: "U", key: "m", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", capability: "t", sessionId: "", now: 1)
+        check("a move into a full pill is refused", fullPill.noteDiscovered(taskId: "T", key: "m", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", sessionId: "", title: nil, index: 0, startedAt: nil, now: 2) == false
+              && fullPill.pillId(forKey: "m") == "U")
+        // reconcile: the heard entry sits under another pill than the tree's workspace
+        let legacyTask = "agent_cmux_" + kB1
+        let rehome = CmuxRouting.reconcile(snapshot: CmuxSnapshot(tree: treeA + Array(tree!.suffix(1)), sessions: [sessA1, sessB1], socketPath: "/x.sock", startedAt: 1000),
+                                           entries: [entry(kB1, task: legacyTask, surface: sfB1, heard: true)], protected: [])
+        check("an entry filed under another pill is planned under the tree's workspace, and the old pill goes (no ghost pill)",
+              rehome.workspaces.first { $0.taskId == taskB }?.surfaces.map { $0.key } == [kB1] && rehome.removeTasks == [legacyTask] && rehome.removeKeys.isEmpty)
+        let rehomeProt = CmuxRouting.reconcile(snapshot: CmuxSnapshot(tree: treeA + Array(tree!.suffix(1)), sessions: [sessA1, sessB1], socketPath: "/x.sock", startedAt: 1000),
+                                               entries: [entry(kB1, task: legacyTask, surface: sfB1, heard: true)], protected: [legacyTask])
+        check("a protected pill is not re-homed and not removed",
+              rehomeProt.removeTasks.isEmpty && rehomeProt.removeKeys.isEmpty && !rehomeProt.workspaces.contains { $0.taskId == taskB })
+
+        // ── Hera M5(b), Aegis F7: only what this tree can speak for ──
+        print("reconcile: socket, truncation, unreadable session file")
+        func entryOn(_ key: String, task: String, surface: String, socket: String, heard: Bool = true) -> CmuxSurface {
+            CmuxSurface(taskId: task, surfaceId: surface, workspaceId: "w", socketPath: socket, capability: "", sessionId: "",
+                        lastSeen: 10, key: key, heard: heard)
+        }
+        let other = CmuxRouting.reconcile(snapshot: CmuxSnapshot(tree: treeA, sessions: [sessA1], socketPath: "/x.sock", startedAt: 1000),
+                                          entries: [entryOn("zz-other", task: "agent_cmux_zz", surface: "0Z", socket: "/other.sock")], protected: [])
+        check("an entry of another cmux socket is not removed by this tree", other.removeKeys.isEmpty && other.removeTasks.isEmpty)
+        let mine = CmuxRouting.reconcile(snapshot: CmuxSnapshot(tree: treeA, sessions: [sessA1], socketPath: "/x.sock", startedAt: 1000),
+                                         entries: [entryOn("zz-mine", task: "agent_cmux_zz", surface: "0Z", socket: "/x.sock")], protected: [])
+        check("an entry of this socket the tree no longer lists is removed", mine.removeKeys == ["zz-mine"] && mine.removeTasks == ["agent_cmux_zz"])
+        let cut = CmuxRouting.reconcile(snapshot: CmuxSnapshot(tree: treeA, sessions: [sessA1], socketPath: "/x.sock", startedAt: 1000, treeTruncated: true),
+                                        entries: [entryOn("zz-mine", task: "agent_cmux_zz", surface: "0Z", socket: "/x.sock")], protected: [])
+        check("a tree cut at a cap removes nothing", cut.removeKeys.isEmpty && cut.removeTasks.isEmpty && cut.workspaces.map { $0.taskId } == [taskA])
+        let noFile = CmuxRouting.reconcile(snapshot: CmuxSnapshot(tree: tree, sessions: nil, socketPath: "/x.sock", startedAt: 1000),
+                                           entries: [entry(kB1, task: taskB, surface: sfB1, heard: false)], protected: [])
+        check("an unreadable session file does not remove an unheard entry the tree still lists as a terminal",
+              noFile.removeKeys.isEmpty && noFile.removeTasks.isEmpty && noFile.workspaces.map { $0.taskId } == [taskB])
+        let noFileShell = CmuxRouting.reconcile(snapshot: CmuxSnapshot(tree: tree, sessions: nil, socketPath: "/x.sock", startedAt: 1000),
+                                                entries: [], protected: [])
+        check("with no file and no entry nothing is invented", noFileShell.workspaces.isEmpty)
+        let json65 = "{\"windows\":[{\"workspaces\":[" + (0..<70).map { i in
+            "{\"id\":\"\(String(format: "%08X-0000-0000-0000-000000000000", i + 1))\",\"title\":\"w\",\"index\":\(i),\"panes\":[]}" }.joined(separator: ",") + "]}]}"
+        check("parseTreeChecked: 70 workspaces are cut at 64 and flagged", CmuxRouting.parseTreeChecked(json65).map { $0.workspaces.count == 64 && $0.truncated } == true)
+        var many33 = "{\"windows\":[{\"workspaces\":[{\"id\":\"\(wsA)\",\"title\":\"w\",\"index\":0,\"panes\":[{\"surfaces\":["
+        many33 += (0..<40).map { i in surfaceJSON(String(format: "%08X-0000-0000-0000-000000000000", i + 1), "t", "terminal", i) }.joined(separator: ",")
+        many33 += "]}]}]}]}"
+        check("parseTreeChecked: 40 surfaces are cut at 32 and flagged", CmuxRouting.parseTreeChecked(many33).map { $0.workspaces[0].surfaces.count == 32 && $0.truncated } == true)
+        check("parseTreeChecked: a tree within the caps is not flagged", CmuxRouting.parseTreeChecked(treeJSON).map { !$0.truncated && $0.workspaces.count == 2 } == true)
+
+        // ── Hera m1: a session that just ended is not brought back by an older snapshot ──
+        print("reconcile: a session that just ended")
+        let endedPlan = CmuxRouting.reconcile(snapshot: CmuxSnapshot(tree: tree, sessions: [sessA1, sessA2, sessB1], socketPath: "/x.sock", startedAt: 1000),
+                                              entries: [], protected: [], ended: [kA2: 995])
+        check("the ended surface is not planned again within the grace", endedPlan.workspaces.first?.surfaces.map { $0.key } == [kA1])
+        let endedLater = CmuxRouting.reconcile(snapshot: CmuxSnapshot(tree: tree, sessions: [sessA1, sessA2, sessB1], socketPath: "/x.sock", startedAt: 1000),
+                                               entries: [], protected: [], ended: [kA2: 980])
+        check("after the grace it is planned if the file still lists it", endedLater.workspaces.first?.surfaces.map { $0.key } == [kA1, kA2])
+        let endedNoTree = CmuxRouting.reconcile(snapshot: CmuxSnapshot(tree: nil, sessions: [sessA1, sessA2], socketPath: "", startedAt: 1000),
+                                                entries: [], protected: [], ended: [kA2: 999])
+        check("same without a tree", endedNoTree.workspaces.first?.surfaces.map { $0.key } == [kA1])
+
+        // ── Hera M1: /clear in the main agent ──
+        print("main surface after /clear")
+        var cl = CmuxRegistry()
+        cl.note(taskId: "P", key: "M", surfaceId: "SM", workspaceId: "W", socketPath: "/x.sock", capability: "t", sessionId: "a", now: 1)
+        cl.note(taskId: "P", key: "H", surfaceId: "SH", workspaceId: "W", socketPath: "/x.sock", capability: "t", sessionId: "b", now: 2)
+        cl.noteDiscovered(taskId: "P", key: "M", surfaceId: "SM", workspaceId: "W", socketPath: "/x.sock", sessionId: "a", title: nil, index: 0, startedAt: 1, now: 3)
+        cl.noteDiscovered(taskId: "P", key: "H", surfaceId: "SH", workspaceId: "W", socketPath: "/x.sock", sessionId: "b", title: nil, index: 1, startedAt: 2, now: 3)
+        check("main is the surface at index 0", cl.surface(for: "P")?.key == "M")
+        cl.remove(key: "M")   // SessionEnd of /clear
+        check("while the main is away the helper holds the role", cl.surface(for: "P")?.key == "H")
+        cl.note(taskId: "P", key: "M", surfaceId: "SM", workspaceId: "W", socketPath: "/x.sock", capability: "t", sessionId: "a2", now: 4)   // SessionStart
+        check("the new session has no index yet: the helper still holds it", cl.surface(for: "P")?.key == "H")
+        cl.noteDiscovered(taskId: "P", key: "M", surfaceId: "SM", workspaceId: "W", socketPath: "/x.sock", sessionId: "a2", title: nil, index: 0, startedAt: 4, now: 5)
+        check("the next discovery gives it index 0 and the main role comes back", cl.surface(for: "P")?.key == "M")
+
+        // ── Hera M2, M3: alerts ──
+        print("alerts: silent stop and placement")
+        check("the main agent's Stop is never silent, even while a helper works",
+              !CmuxRouting.stopIsSilent(stoppingKey: "M", mainKey: "M", states: ["M": "finished", "H": "working"]))
+        check("a helper's Stop while the main works is silent",
+              CmuxRouting.stopIsSilent(stoppingKey: "H", mainKey: "M", states: ["M": "thinking", "H": "finished"]))
+        check("a helper's Stop while another helper searches is silent",
+              CmuxRouting.stopIsSilent(stoppingKey: "H1", mainKey: "M", states: ["M": "idle", "H1": "finished", "H2": "searching"]))
+        check("a helper's Stop alone alerts", !CmuxRouting.stopIsSilent(stoppingKey: "H", mainKey: "M", states: ["M": "idle", "H": "finished"]))
+        check("a sibling stuck in error, ratelimit, approval, question or finished does not silence anybody",
+              ["error", "ratelimit", "approval", "question", "finished", "idle"].allSatisfy {
+                  !CmuxRouting.stopIsSilent(stoppingKey: "H", mainKey: "M", states: ["M": $0, "H": "finished"]) })
+        check("no main known: a Stop is silent only while a sibling is busy",
+              !CmuxRouting.stopIsSilent(stoppingKey: "H", mainKey: nil, states: ["H": "finished"])
+              && CmuxRouting.stopIsSilent(stoppingKey: "H", mainKey: nil, states: ["H": "finished", "X": "working"]))
+        check("focused pill, no card: the view", CmuxRouting.alertPlacement(focused: true, cardOfPillOnScreen: false, pillHoldsCard: false) == .view)
+        check("a card of the pill on screen: the alert of a sibling never replaces it nor overwrites the badge",
+              CmuxRouting.alertPlacement(focused: true, cardOfPillOnScreen: true, pillHoldsCard: true) == .none
+              && CmuxRouting.alertPlacement(focused: false, cardOfPillOnScreen: true, pillHoldsCard: true) == .none)
+        check("not focused: the badge, unless the pill holds a queued card (its approval badge stays)",
+              CmuxRouting.alertPlacement(focused: false, cardOfPillOnScreen: false, pillHoldsCard: false) == .badge
+              && CmuxRouting.alertPlacement(focused: false, cardOfPillOnScreen: false, pillHoldsCard: true) == .none)
+
+        // ── Aegis F4: a heard session does not outlive its process ──
+        print("time rule")
+        let heardEntry = entry("hk", task: "T", surface: "S", heard: true)
+        check("a live process in the file keeps its entry whatever the hooks say",
+              !CmuxRouting.timeRuleApplies(entry: heardEntry, treeKnown: true, liveKeys: ["hk"]))
+        check("a heard entry with no live process in a readable file expires (tree known or not)",
+              CmuxRouting.timeRuleApplies(entry: heardEntry, treeKnown: true, liveKeys: []) && CmuxRouting.timeRuleApplies(entry: heardEntry, treeKnown: false, liveKeys: ["other"]))
+        check("no readable file: a known tree speaks only for entries with a surface id",
+              !CmuxRouting.timeRuleApplies(entry: heardEntry, treeKnown: true, liveKeys: nil)
+              && CmuxRouting.timeRuleApplies(entry: entry("n", task: "T", surface: "", heard: true), treeKnown: true, liveKeys: nil)
+              && CmuxRouting.timeRuleApplies(entry: heardEntry, treeKnown: false, liveKeys: nil))
 
         print(failures == 0 ? "\nAll cmux routing tests passed." : "\n\(failures) failure(s).")
         exit(failures == 0 ? 0 : 1)

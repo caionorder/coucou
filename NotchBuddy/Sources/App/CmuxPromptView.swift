@@ -45,9 +45,17 @@ struct CmuxPromptView: View {
         if !out.contains(folder) { folder = out.first ?? "" }
     }
 
+    /// The session a reply goes to: the one picked with the chips, else the main agent of the workspace.
+    private var targetKey: String? {
+        guard let t = replyTask else { return nil }
+        return HookServer.shared.cmuxReplyTarget(for: t.id)
+    }
+
+    /// Proof that the session runs an agent (it reported in with a token: a session Coucou only discovered has
+    /// none until its next prompt), and no card or dialog on it.
     private var sessionCanReceive: Bool {
-        guard let t = replyTask else { return false }
-        return HookServer.shared.cmuxCanSend(t.id)
+        guard let key = targetKey else { return false }
+        return HookServer.shared.cmuxCanSend(key: key)
     }
 
     private var canSubmit: Bool {
@@ -67,21 +75,24 @@ struct CmuxPromptView: View {
     }
 
     private var impliedFailure: CmuxControl.Failure? {
-        if isReply, let t = replyTask, !sessionCanReceive {
-            return HookServer.shared.cmuxDialogMayBeOpen(t.id)
-                ? CmuxControl.Failure.dialogMayBeOpen : CmuxControl.Failure.blockedByDialog
+        if isReply, let key = targetKey, !sessionCanReceive {
+            let server = HookServer.shared
+            if !server.cmuxCanType(key: key) { return CmuxControl.Failure.notReachableYet }
+            if server.cmuxDialogMayBeOpen(key: key) { return CmuxControl.Failure.dialogMayBeOpen }
+            return CmuxControl.Failure.blockedByDialog
         }
         return nil
     }
 
     private var transcript: [ChatMessage] {
-        if case .reply(let id) = mode { return state.cmuxTranscripts[id] ?? [] }
+        if isReply, let key = targetKey { return state.cmuxTranscripts[key] ?? [] }
         return []
     }
 
     private var typing: Bool {
-        guard let t = replyTask else { return false }
-        return [.thinking, .working, .searching].contains(t.state)
+        guard let key = targetKey, let raw = HookServer.shared.cmuxSurface(key: key)?.state,
+              let s = BotState(rawValue: raw) else { return false }
+        return [.thinking, .working, .searching].contains(s)
     }
 
     var body: some View {
@@ -100,8 +111,12 @@ struct CmuxPromptView: View {
                             .truncationMode(.tail)
                             .padding(.leading, 15)
                     }
+                    // Where the reply goes: the one agent, or chips to pick among several.
+                    if isReply, let t = replyTask { targetLine(for: t) }
                 }
                 .padding(.top, 4)
+
+                if isReply, let t = replyTask { targetChips(for: t) }
 
                 if isReply { replyBody } else { newChatBody }
 
@@ -111,10 +126,10 @@ struct CmuxPromptView: View {
                             .font(.system(size: 11))
                             .foregroundColor(Color(hex: "#8E939C"))
                             .lineLimit(2)
-                        if isReply, let t = replyTask, noticeFailure == .dialogMayBeOpen {
+                        if isReply, let key = targetKey, noticeFailure == .dialogMayBeOpen {
                             // Explicit click: the user says the request is gone (answered, then declined, in cmux).
                             Button("Answered") {
-                                HookServer.shared.clearCmuxDialogMark(t.id)
+                                HookServer.shared.clearCmuxDialogMark(key: key)
                                 state.cmuxNotice = nil
                                 state.objectWillChange.send()
                             }
@@ -177,6 +192,38 @@ struct CmuxPromptView: View {
         .onReceive(NotificationCenter.default.publisher(for: .islandSendMessage)) { _ in
             guard state.view == .prompt, state.cmuxPrompt != nil else { return }
             send()
+        }
+    }
+
+    // MARK: reply target
+
+    /// `To: <agent>` when the workspace has one agent session (the chips cover several).
+    @ViewBuilder private func targetLine(for task: AgentTask) -> some View {
+        let surfaces = HookServer.shared.cmuxSurfaces(for: task.id)
+        if surfaces.count == 1, let only = surfaces.first {
+            Text("To: \(only.label)")
+                .font(.system(size: 11))
+                .foregroundColor(Color(hex: "#8E939C"))
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .padding(.leading, 15)
+        }
+    }
+
+    /// One chip per agent session of the workspace, the main one first; the selected chip is the target.
+    @ViewBuilder private func targetChips(for task: AgentTask) -> some View {
+        let surfaces = HookServer.shared.cmuxSurfaces(for: task.id)
+        if surfaces.count > 1 {
+            let target = targetKey
+            ChipFlowLayout(spacing: 6) {
+                ForEach(surfaces, id: \.key) { s in
+                    Button { HookServer.shared.setCmuxReplyChoice(s.key, for: task.id) } label: {
+                        chipLabel(s.label, selected: s.key == target)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 10)
         }
     }
 
@@ -281,7 +328,7 @@ struct CmuxPromptView: View {
         state.cmuxNotice = nil
         switch mode {
         case .reply(let id):
-            CmuxControl.send(text: prompt, to: id) { failure in
+            CmuxControl.send(text: prompt, to: id, surfaceKey: targetKey) { failure in
                 if let failure {
                     state.showCmuxFailure(failure)
                     if failure != .enterNotSent { text = prompt } else { text = "" }

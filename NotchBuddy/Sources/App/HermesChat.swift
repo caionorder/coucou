@@ -21,6 +21,18 @@ struct HermesAgent: Codable, Equatable, Sendable {
     var modelName: String
     /// `nil` reads as `.apiKey` (agents stored before the sign-in kind existed).
     var connection: HermesConnection?
+    /// What the user reads instead of `name` (pill, chat, Settings). `nil` = the identity name. Not a secret; it never
+    /// takes part in the Keychain binding, the pill id or the conversation, so renaming never disconnects an agent.
+    var displayName: String?
+
+    /// The name shown everywhere the agent appears.
+    var shownName: String { displayName ?? name }
+
+    /// Same agent at the same destination: ignores the display name, which is only a label.
+    func sameDestination(as other: HermesAgent) -> Bool {
+        name == other.name && baseURL == other.baseURL && profile == other.profile
+            && modelName == other.modelName && connection == other.connection
+    }
 }
 
 enum HermesChatError: Error, Equatable {
@@ -55,17 +67,6 @@ enum HermesChatError: Error, Equatable {
         case .signInNeeded(let name): return String(localized: "Sign in to \(name) again in Settings → Chat.")
         case .signInFailed(let m): return m
         }
-    }
-}
-
-/// Refuses every redirect: the Authorization header must never follow a 30x to another host,
-/// and an SSO redirect means "not the API address" anyway.
-final class HermesNoRedirect: NSObject, URLSessionTaskDelegate, Sendable {
-    func urlSession(_ session: URLSession, task: URLSessionTask,
-                    willPerformHTTPRedirection response: HTTPURLResponse,
-                    newRequest request: URLRequest,
-                    completionHandler: @escaping (URLRequest?) -> Void) {
-        completionHandler(nil)
     }
 }
 
@@ -267,9 +268,203 @@ enum HermesChat {
         guard isValidAgent(agent),
               let r = keys[agent.name], !r.key.isEmpty,
               !r.baseURL.isEmpty, r.baseURL == agent.baseURL, r.profile == agent.profile else {
-            return .failure(.notBound(agent.name))
+            return .failure(.notBound(agent.shownName))
         }
         return .success(r.key)
+    }
+
+    // MARK: Connection retry
+
+    /// Retry policy for a connection that fails to OPEN. Pure data and functions: nothing here touches the network.
+    /// An HTTP answer of any status, and anything after the first response byte, is never retried.
+    struct ConnectRetry: Sendable, Equatable {
+        /// What a repeat of the request can cause on the server.
+        enum Rule: Sendable, Equatable {
+            /// GET, WebSocket handshake, ticket POST: repeating changes nothing (a ticket request only mints one more
+            /// single use ticket). Connect level errors and "connection lost" are retried.
+            case idempotent
+            /// A POST whose body has an effect (chat completions, token refresh): retried ONLY when it is certain that
+            /// no body byte left the machine (`bytesSent == 0`) and the error is a connect level one.
+            case sideEffects
+        }
+
+        /// Attempts in total (the first one included).
+        var attempts = 3
+        /// How long one attempt may wait for its connection to open (REST, WebSocket handshake, response headers).
+        var attemptTimeout: TimeInterval = 6
+        /// Wait before attempt 2, then before attempt 3.
+        var backoff: [TimeInterval] = [0.3, 1]
+        /// Total time one turn may spend opening connections (refresh, tickets, handshakes), ready waits excluded.
+        /// Three attempts of one step (3 x 6 s + 1.3 s of backoff = 19.3 s) plus about 10 s of round trips that
+        /// succeed (tickets) so that the third handshake attempt is still allowed on a real network.
+        var budget: TimeInterval = 30
+        static let standard = ConnectRetry()
+
+        /// The wait before the next attempt after attempt `n` (1 based) failed; nil when no attempt is left.
+        func delay(afterAttempt n: Int) -> TimeInterval? {
+            guard n >= 1, n < attempts else { return nil }
+            return backoff.isEmpty ? 0 : backoff[min(n - 1, backoff.count - 1)]
+        }
+
+        /// Whether a failure with `code` may be repeated. `bytesSent` is the number of request body bytes that left
+        /// the machine, read from the task at the moment of the error; nil when it could not be read (unknown).
+        /// - `.sideEffects`: "cannot connect", "cannot find host", DNS and TLS setup failures are retried unless the
+        ///   task is known to have sent body bytes; "timed out" and "connection lost" only when `bytesSent == 0`
+        ///   (known zero). Any error with bytes sent is final, whatever its code.
+        /// - `.idempotent`: those and "connection lost"; a timeout only when no body byte went out (a timeout after
+        ///   that means a slow server).
+        func isRetryable(_ code: URLError.Code, rule: Rule, bytesSent: Int64?) -> Bool {
+            switch code {
+            case .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed, .secureConnectionFailed:
+                if rule == .sideEffects, let n = bytesSent, n > 0 { return false }
+                return true
+            case .networkConnectionLost:
+                return rule == .idempotent || bytesSent == 0
+            case .timedOut:
+                return (bytesSent ?? (rule == .idempotent ? 0 : -1)) == 0
+            default:
+                return false
+            }
+        }
+
+        /// Whether another attempt may start now, given the turn's connect deadline (nil: no deadline).
+        func mayRetry(afterAttempt n: Int, now: ContinuousClock.Instant, deadline: ContinuousClock.Instant?) -> TimeInterval? {
+            guard let d = delay(afterAttempt: n) else { return nil }
+            if let deadline, now.advanced(by: .seconds(d + attemptTimeout)) > deadline { return nil }
+            return d
+        }
+    }
+
+    /// Step names and attempt counts only, never a URL, token or text. The app points it at nb.log.
+    enum Diagnostics {
+        private final class Sink: @unchecked Sendable {
+            let lock = NSLock()
+            var fn: (@Sendable (String) -> Void)?
+        }
+        private static let sink = Sink()
+        static func setSink(_ f: (@Sendable (String) -> Void)?) { sink.lock.withLock { sink.fn = f } }
+        static func log(_ message: String) {
+            let f = sink.lock.withLock { sink.fn }
+            f?(message)
+        }
+        static func failed(step: String, attempts: Int) { log("hermes connect failed step=\(step) attempts=\(attempts)") }
+        static func recovered(step: String, attempts: Int) { log("hermes connect recovered step=\(step) attempts=\(attempts)") }
+        /// A request that failed for a reason that is not "the connection could not be opened" (or that was not safe to
+        /// repeat): `sent` is true when body bytes had left the machine.
+        static func requestFailed(step: String, attempts: Int, sent: Bool) {
+            log("hermes request failed step=\(step) attempts=\(attempts) sent=\(sent)")
+        }
+    }
+
+    /// Thrown inside a retried operation for a failure that happened before the request could have had any effect.
+    struct ConnectFailure: Error { var code: URLError.Code }
+
+    /// Runs `operation` (given its 1 based attempt number) up to `policy.attempts` times while it throws
+    /// `ConnectFailure`. Any other error ends it at once. Cancellation is honoured before every attempt and during
+    /// every backoff.
+    static func withConnectRetry<T>(step: String, policy: ConnectRetry, deadline: ContinuousClock.Instant? = nil,
+                                    _ operation: (Int) async throws -> T) async throws -> T {
+        var attempt = 1
+        while true {
+            try Task.checkCancellation()
+            do {
+                let v = try await operation(attempt)
+                if attempt > 1 { Diagnostics.recovered(step: step, attempts: attempt) }
+                return v
+            } catch let f as ConnectFailure {
+                if Task.isCancelled { throw CancellationError() }
+                guard let wait = policy.mayRetry(afterAttempt: attempt, now: .now, deadline: deadline) else {
+                    Diagnostics.failed(step: step, attempts: attempt)
+                    throw f
+                }
+                try await Task.sleep(for: .seconds(wait))
+                attempt += 1
+            }
+        }
+    }
+
+    /// Task delegate for one request: refuses redirects and keeps the task, so that the number of body bytes that left
+    /// the machine is read from the task itself at the moment of an error (not from a delegate callback that may still
+    /// be queued). `didSendBodyData` only adds to that, as a second witness.
+    final class RequestGate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+        private let lock = NSLock()
+        private var task: URLSessionTask?
+        private var sentSeen = false
+        private var fired = false
+        /// Body bytes sent so far; nil when the task was never seen (unknown).
+        var bytesSent: Int64? {
+            lock.withLock {
+                if task == nil && !sentSeen { return nil }
+                return max(task?.countOfBytesSent ?? 0, sentSeen ? 1 : 0)
+            }
+        }
+        var watchdogFired: Bool { lock.withLock { fired } }
+        func markWatchdog() { lock.withLock { fired = true } }
+
+        func urlSession(_ session: URLSession, didCreateTask task: URLSessionTask) {
+            lock.withLock { self.task = task }
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            completionHandler(nil)
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didSendBodyData bytesSent: Int64,
+                        totalBytesSent: Int64, totalBytesExpectedToSend: Int64) {
+            lock.withLock { sentSeen = true; self.task = task }
+        }
+    }
+
+    /// The response headers of one request, plus the session that owns the byte stream (the caller invalidates it).
+    struct Opened: @unchecked Sendable {
+        let session: URLSession
+        let bytes: URLSession.AsyncBytes
+        let response: URLResponse
+    }
+
+    /// Opens `req` and returns at the response headers, retrying only connect level failures (see `ConnectRetry`).
+    /// `rule` says what a repeat can cause: the default `.sideEffects` repeats only when no body byte left the machine.
+    /// The connection gets `attemptTimeout` to open: until the body went out (a request that sent bytes is never cut
+    /// short or repeated). A request without a body (GET) cannot tell "connecting" from "waiting for the server", so
+    /// the first attempts are cut at `attemptTimeout` and the LAST one keeps the request's own timeout: a slow but
+    /// healthy server answers within its old allowance, as it did before retries existed.
+    /// Once a response arrived nothing is retried. Throws `unreachable(host)` or `CancellationError`.
+    static func open(_ req: URLRequest, step: String, host: String, policy: ConnectRetry,
+                     rule: ConnectRetry.Rule = .sideEffects,
+                     deadline: ContinuousClock.Instant? = nil,
+                     makeSession: @Sendable () -> URLSession) async throws -> Opened {
+        do {
+            return try await withConnectRetry(step: step, policy: policy, deadline: deadline) { attempt in
+                let s = makeSession()
+                let gate = RequestGate()
+                let task = Task { try await s.bytes(for: req, delegate: gate) }
+                let boundConnect = !(req.httpBody == nil && attempt >= policy.attempts)
+                let watchdog = Task {
+                    guard boundConnect else { return }
+                    try? await Task.sleep(for: .seconds(policy.attemptTimeout))
+                    if !Task.isCancelled, (gate.bytesSent ?? 0) == 0 { gate.markWatchdog(); task.cancel() }
+                }
+                defer { watchdog.cancel() }
+                do {
+                    let (bytes, response) = try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+                    return Opened(session: s, bytes: bytes, response: response)
+                } catch {
+                    // Decided here, from the task, at the moment of the error.
+                    let sent = gate.bytesSent
+                    s.invalidateAndCancel()
+                    if Task.isCancelled { throw CancellationError() }
+                    let code = gate.watchdogFired ? URLError.Code.timedOut : (error as? URLError)?.code
+                    if let code, policy.isRetryable(code, rule: rule, bytesSent: sent) { throw ConnectFailure(code: code) }
+                    Diagnostics.requestFailed(step: step, attempts: attempt, sent: (sent ?? 0) > 0)
+                    throw HermesChatError.unreachable(host)
+                }
+            }
+        } catch is ConnectFailure {
+            throw HermesChatError.unreachable(host)
+        }
     }
 
     // MARK: Network
@@ -284,6 +479,8 @@ enum HermesChat {
         /// Retry once with the ticket in the query when the subprotocol form is refused.
         var allowQueryTicketFallback = true
         var readyTimeout: TimeInterval = 15
+        /// How a connection that fails to open is retried (REST, WebSocket handshake, API key requests).
+        var connectRetry = ConnectRetry.standard
         var rpcTimeout: TimeInterval = 30
         var pingInterval: TimeInterval = 15
         /// Per turn budget of text frames and bytes (ignored frames count); over it the turn ends like the text cap.
@@ -308,14 +505,14 @@ enum HermesChat {
         var req = URLRequest(url: url, timeoutInterval: 10)
         req.httpMethod = "GET"
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        let s = session()
-        defer { s.finishTasksAndInvalidate() }
         var data = Data()
         let response: URLResponse
         do {
-            let (bytes, r) = try await s.bytes(for: req, delegate: HermesNoRedirect())
-            response = r
-            for try await b in bytes {
+            let opened = try await open(req, step: "models", host: hostLabel(baseURL), policy: limits.connectRetry,
+                                        rule: .idempotent, makeSession: { session() })
+            defer { opened.session.finishTasksAndInvalidate() }
+            response = opened.response
+            for try await b in opened.bytes {
                 data.append(b)
                 if data.count > limits.connectBodyBytes {
                     return .failure(.server(String(localized: "The server answer is too large for a Hermes API.")))
@@ -382,17 +579,20 @@ enum HermesChat {
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         req.httpBody = encodedBody
 
-        let s = session()
-        defer { s.finishTasksAndInvalidate() }
         let host = hostLabel(agent.baseURL)
-        let bytes: URLSession.AsyncBytes
-        let response: URLResponse
+        let opened: Opened
         do {
-            (bytes, response) = try await s.bytes(for: req, delegate: HermesNoRedirect())
+            // The POST has side effects (it starts an agent turn): repeated ONLY when no body byte left the machine.
+            // Only the opening is retried (never after the body went out); the stream keeps its long idle allowance.
+            opened = try await open(req, step: "chat", host: host, policy: limits.connectRetry,
+                                    rule: .sideEffects, makeSession: { session() })
         } catch {
             if Task.isCancelled { throw CancellationError() }
             throw HermesChatError.unreachable(host)
         }
+        defer { opened.session.finishTasksAndInvalidate() }
+        let bytes = opened.bytes
+        let response = opened.response
 
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if status != 200 {

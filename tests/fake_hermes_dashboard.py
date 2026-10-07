@@ -27,6 +27,15 @@ CONFIG
   profiles_redirect     /api/profiles answers 302 to /api/captured
   ready_delay           seconds to wait before gateway.ready (cancellation while the socket is not ready yet)
   omit_stored_id        session.create answers without stored_session_id
+  ticket_drop           accept the next N ticket requests and close the connection without answering (counted)
+  ticket_status         answer every ticket request with this HTTP status (0 = normal)
+  refresh_drop          accept the next N refresh requests, READ THE WHOLE BODY, then close without answering (the token
+                        is not rotated; the request reached the server, so the client must not send it again)
+  ws_drop               accept the next N WebSocket handshakes and close without answering (ticket not consumed)
+  ws_stall              hold the next N WebSocket handshakes for ws_stall_seconds, then close without answering
+  ws_stall_seconds      how long a stalled handshake is held (default 2)
+  profiles_drop         accept the next N /api/profiles requests and close without answering
+  ticket_delay          seconds every ticket request waits before it answers (round trip latency)
 
 WebSocket prompt scenarios (the prompt text picks one): hello, error, error-partial, bare-error, close,
 approval, withdrawn, busy, queued, queued-early, queued-noterm, queued-start-first, binary, binary-flood, steered, redirected, early-terminal, early-error, submit-slow,
@@ -67,10 +76,24 @@ DEFAULT_CONFIG = {
     "expires_in": 3600, "no_refresh": False, "authorize_mode": "ok", "refresh_mode": "ok",
     "ticket_401": 0, "reject_subprotocol": False, "profiles_redirect": False,
     "ready_delay": 0, "omit_stored_id": False,
+    "ticket_drop": 0, "ticket_status": 0, "refresh_drop": 0, "ws_drop": 0, "ws_stall": 0, "ws_stall_seconds": 2,
+    "profiles_drop": 0, "ticket_delay": 0,
 }
+
 
 LOCK = threading.RLock()
 CONFIG = dict(DEFAULT_CONFIG)
+
+
+def take(key):
+    """True while the counter CONFIG[key] still has failures to hand out (and uses one up)."""
+    with LOCK:
+        if CONFIG[key] > 0:
+            CONFIG[key] -= 1
+            return True
+    return False
+
+
 STATE = {}
 
 
@@ -487,6 +510,9 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 STATE["profiles_count"] += 1
                 redirect = CONFIG["profiles_redirect"]
+            if take("profiles_drop"):
+                self.close_connection = True
+                return
             if redirect:
                 return self.send_json(302, {}, {"Location": "/api/captured"})
             if self.authed() is None:
@@ -517,6 +543,16 @@ class Handler(BaseHTTPRequestHandler):
             self.body_json()
             with LOCK:
                 STATE["ticket_count"] += 1
+            if take("ticket_drop"):
+                self.close_connection = True
+                return
+            with LOCK:
+                delay = CONFIG["ticket_delay"]
+            if delay:
+                time.sleep(delay)
+            with LOCK:
+                if CONFIG["ticket_status"]:
+                    return self.send_json(CONFIG["ticket_status"], {"error": "boom"})
                 if CONFIG["ticket_401"] > 0:
                     CONFIG["ticket_401"] -= 1
                     return self.send_json(401, {"error": "session_expired", "reason": "invalid_or_expired_session"})
@@ -569,6 +605,9 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             STATE["refresh_count"] += 1
             mode = CONFIG["refresh_mode"]
+        if take("refresh_drop"):
+            self.close_connection = True
+            return
         if not rt:
             return self.send_json(400, {"detail": "refresh_token required"})
         if mode == "503":
@@ -598,6 +637,15 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.close_connection = True
 
+        if take("ws_drop"):
+            self.close_connection = True
+            return
+        if take("ws_stall"):
+            with LOCK:
+                hold = CONFIG["ws_stall_seconds"]
+            time.sleep(hold)
+            self.close_connection = True
+            return
         if not key or self.headers.get("Origin"):
             return refuse()
         protocols = [p.strip() for p in (self.headers.get("Sec-WebSocket-Protocol") or "").split(",") if p.strip()]
