@@ -223,6 +223,8 @@ final class IslandWindowController: NSWindowController {
         // notchWidth/hasNotch are not @Published: tell the views to resize the island.
         NotificationCenter.default.post(name: .islandScreenChanged, object: nil)
         state.objectWillChange.send()
+        // The new screen has its own room for a stretched chat: measure again, shrinking the panel if needed.
+        refreshChatRoom(screenChanged: true)
     }
 
     /// Follow-the-mouse mode: hop to the cursor's screen while the island is not open,

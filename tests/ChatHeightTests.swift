@@ -118,6 +118,11 @@ enum ChatHeightTests {
         check(ChatHeight.panelTarget(current: 1400, everStretched: true, maximum: 900, allowShrink: true) == 900, "shrinks on a new screen")
         check(ChatHeight.panelTarget(current: 1400, everStretched: true, maximum: 300, allowShrink: true) == 560, "small screen keeps 560")
 
+        // Island moved to a smaller screen (relocate): the stored stretch is clamped and the panel shrinks with it.
+        check(ChatHeight.resolve(messageCount: 2, stored: 1200, maximum: 700) == 700, "stretch clamped on the smaller screen")
+        check(ChatHeight.panelTarget(current: 1300, everStretched: true, maximum: 700, allowShrink: true) == 700, "panel shrinks to the new maximum")
+        check(ChatHeight.panelTarget(current: 1300, everStretched: true, maximum: 700, allowShrink: false) == 1300, "no shrink without a screen change")
+
         // The resizing flag only lives while the drag is real.
         check(ChatHeight.resizeIsLive(resizing: true, primaryButtonDown: true, isChatView: true, isExpanded: true), "live drag")
         check(!ChatHeight.resizeIsLive(resizing: true, primaryButtonDown: false, isChatView: true, isExpanded: true), "button released")
