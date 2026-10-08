@@ -1464,6 +1464,9 @@ struct PromptView: View {
         }
         // The conversation on screen now: the bubble and the request both go to it, whatever is shown later.
         let target = state.activeConversationID
+        // The demo does not talk to a Hermes agent. Refused here, like the refusal above: the text stays in the
+        // field, no bubble is added, no state changes, nothing is sent.
+        guard DemoGuard.mayChatSend(demoActive: DemoEngine.shared.isActive, targetIsHermesAgent: target.hermesAgent != nil) else { return }
         setText("")
         focused = false
         pinned = true

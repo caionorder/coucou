@@ -153,6 +153,9 @@ final class AppState: ObservableObject {
         set { chatHistories.set(activeConversationID, newValue) }
     }
 
+    /// The messages of one conversation, shown or not (a missing one reads as empty).
+    func chatMessages(_ id: ConversationID) -> [ChatMessage] { chatHistories[id] }
+
     /// Changes the messages of one conversation, shown or not (a turn may finish while another chat is on screen).
     /// A turn that outlives its conversation (the agent was removed) passes `createIfMissing: false`: it must not
     /// bring an empty conversation back.
@@ -162,6 +165,7 @@ final class AppState: ObservableObject {
 
     /// Clears one conversation: its messages, its stored server session and its running turns, nothing else.
     func clearConversation(_ id: ConversationID) {
+        ChatFolds.memory.forget(chatHistories[id].map(\.id))
         chatHistories.remove(id)
         ClaudeService.shared.clearConversation(id)
         // Cancelled turns end by themselves and release their own count in `hermesTurnsRunning`.
@@ -176,6 +180,7 @@ final class AppState: ObservableObject {
     /// An agent that is gone: its conversation and its running turns go with it.
     private func discardHermesConversations(of names: [String]) {
         for name in names {
+            ChatFolds.memory.forget(chatHistories[.hermes(name)].map(\.id))
             chatHistories.remove(.hermes(name))
             hermesCards[name]?.discard()
             ClaudeService.shared.dropConversation(.hermes(name))
@@ -915,6 +920,8 @@ final class AppState: ObservableObject {
     /// Drafts of the prompt slot by content. Memory only, capped. Not published: the views write it on every
     /// keystroke; a writer outside the views uses `writeDraft` so the open view picks the text up.
     var promptDrafts = PromptDrafts()
+    /// First prompts of a new chat that could not go back to their field (see PromptStash). Memory only.
+    var promptStash = PromptStash()
     /// Bumped by `writeDraft` only, never by the typing of the user: an open view that sees it reloads its draft.
     @Published var draftRevision = 0
     /// Bumped by the writers that end a launch (timeout, folder match, failed first prompt): only these lower `launching`.

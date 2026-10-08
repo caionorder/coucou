@@ -3,6 +3,12 @@ import SwiftUI
 // What a chat shows for an agent: one block per turn, with the speaker's name and colour, over the rows of the
 // turn (text, tool steps, notes). The user's message stays a `ChatBubble`. In both builds, no flag.
 
+/// The fold state of the turns of this app session. Not observable on purpose: a toggle changes one block's own
+/// state and redraws no other turn.
+@MainActor enum ChatFolds {
+    static var memory = ChatFoldMemory<UUID>()
+}
+
 // MARK: - The block of one agent turn
 
 /// Header (dot, name, label), the work of the turn (steps and interim sentences: rows, a live box while it runs, or
@@ -18,21 +24,25 @@ struct AgentTurnBlock: View, Equatable {
     /// with nothing alive on screen (only a note, say) shows the dots in its own block.
     var running = false
     var label: ChatTurnHeader.Label = .none
+    /// The message this block draws: what the user opened is remembered under it for the app session.
+    var messageID: UUID? = nil
 
     /// Folded groups that start open (a snapshot or a preview); the user's clicks do the rest.
     @State private var expanded: Set<Int>
     @State private var touched: Bool
 
     init(speaker: ChatSpeaker, showsHeader: Bool, segments: [ChatSegment], typing: Bool = false, running: Bool = false,
-         label: ChatTurnHeader.Label = .none, initiallyExpanded: Set<Int> = []) {
+         label: ChatTurnHeader.Label = .none, messageID: UUID? = nil, initiallyExpanded: Set<Int> = []) {
         self.speaker = speaker
         self.showsHeader = showsHeader
         self.segments = segments
         self.typing = typing
         self.running = running
         self.label = label
-        _expanded = State(initialValue: initiallyExpanded)
-        _touched = State(initialValue: !initiallyExpanded.isEmpty)
+        self.messageID = messageID
+        let remembered = messageID.flatMap { ChatFolds.memory.entry(for: $0) }
+        _expanded = State(initialValue: remembered?.expanded ?? initiallyExpanded)
+        _touched = State(initialValue: remembered?.touched ?? !initiallyExpanded.isEmpty)
     }
 
     nonisolated static func == (a: AgentTurnBlock, b: AgentTurnBlock) -> Bool {
@@ -88,6 +98,7 @@ struct AgentTurnBlock: View, Equatable {
             }
         }
         if expanded.contains(id) { expanded.remove(id) } else { expanded.insert(id) }
+        if let messageID { ChatFolds.memory.set(.init(expanded: expanded, touched: true), for: messageID) }
     }
 
     /// A card is a report (verdict style for its first paragraph) when work with steps comes before it.
@@ -430,7 +441,8 @@ struct ChatTurnList: View {
                                 label: ChatTurnHeader.label(
                                     running: running,
                                     isNotice: message.isNotice,
-                                    hasAnswer: ChatTurnHeader.hasAnswer(segments: message.segments, content: message.content)))
+                                    hasAnswer: ChatTurnHeader.hasAnswer(segments: message.segments, content: message.content)),
+                                messageID: message.id)
                                 .equatable()
                         }
                     }

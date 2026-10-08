@@ -56,7 +56,7 @@ struct ChatMarkdownView: View, Equatable {
     private func blockView(_ block: MDBlock, isFirst: Bool) -> some View {
         switch block {
         case .heading(let level, let text):
-            Text(inlineAttributed(text))
+            LinkedText(inlineAttributed(text))
                 .font(.system(size: Self.headingSize(level), weight: level <= 2 ? .bold : .semibold))
                 .foregroundColor(Color(hex: "#F1F2F4"))
                 .fixedSize(horizontal: false, vertical: true)
@@ -64,7 +64,7 @@ struct ChatMarkdownView: View, Equatable {
                 .padding(.top, isFirst ? 0 : 4)
 
         case .paragraph(let text):
-            Text(inlineAttributed(text))
+            LinkedText(inlineAttributed(text))
                 .font(.system(size: bodySize))
                 .lineSpacing(2)
                 .foregroundColor(textColor)
@@ -80,7 +80,7 @@ struct ChatMarkdownView: View, Equatable {
                     .font(.system(size: 12.5).monospacedDigit())
                     .foregroundColor(Color(hex: "#6B7079"))
                     .frame(minWidth: prefix.count > 2 ? Self.longMarkerWidth : Self.markerWidth, alignment: .leading)
-                Text(inlineAttributed(text))
+                LinkedText(inlineAttributed(text))
                     .font(.system(size: bodySize))
                     .lineSpacing(2)
                     .foregroundColor(textColor)
@@ -96,7 +96,7 @@ struct ChatMarkdownView: View, Equatable {
                     .foregroundColor(Color(hex: checked ? "#22C55E" : "#6B7079"))
                     .frame(minWidth: Self.markerWidth, alignment: .leading)
                     .padding(.top, 1)
-                Text(inlineAttributed(text))
+                LinkedText(inlineAttributed(text))
                     .font(.system(size: bodySize))
                     .lineSpacing(2)
                     .foregroundColor(textColor)
@@ -111,7 +111,7 @@ struct ChatMarkdownView: View, Equatable {
                     .fill(Color(hex: "#4B5563"))
                     .frame(width: 2)
                     .clipShape(Capsule())
-                Text(inlineAttributed(text))
+                LinkedText(inlineAttributed(text))
                     .font(.system(size: 12.5))
                     .foregroundColor(Color(hex: "#8A8F98"))
                     .fixedSize(horizontal: false, vertical: true)
@@ -198,6 +198,83 @@ struct ChatMarkdownView: View, Equatable {
     }
 }
 
+// MARK: - Links
+
+/// Text with markdown links. Hovering it shows the real host of each link that can open (the standard help
+/// tooltip; none at all when the text has no link). Each link is judged in its context (`linkGroups`): the text around it
+/// up to the nearest whitespace is the label. A destination that is not known to open at once asks first
+/// (`LinkConfirmation`); a link whose destination `safeWebURL` rejects loses its click. The text itself looks the same
+/// in every case.
+private struct LinkedText: View {
+    let attributed: AttributedString
+
+    init(_ attributed: AttributedString) { self.attributed = attributed }
+
+    var body: some View {
+        var shown = attributed
+        let runs = Array(attributed.runs)
+        let groups = linkGroups(runs.map { LinkRun(text: String(attributed[$0.range].characters), destination: $0.link?.absoluteString) })
+        var labels: [String: String] = [:]       // destination -> its label as drawn, for the dialog
+        for group in groups {
+            for position in group.runs {
+                if group.outcome == .discard { shown[runs[position].range].link = nil }
+            }
+            for destination in group.destinations where labels[destination] == nil { labels[destination] = group.label }
+        }
+        let opens = linkDestinationsThatOpen(groups)
+        let tooltip = linkTooltip(destinations: groups.flatMap { $0.destinations })
+        return Group {
+            if tooltip.isEmpty { Text(shown) } else { Text(shown).help(tooltip) }
+        }
+        .environment(\.openURL, OpenURLAction { url in
+            guard let safe = safeWebURL(url.absoluteString) else { return .discarded }
+            // Only a destination known to open at once opens; anything else, a missed lookup included, asks.
+            if opens.contains(url.absoluteString) {
+                NSWorkspace.shared.open(safe)
+                return .handled
+            }
+            LinkConfirmation.ask(destination: safe, label: labels[url.absoluteString] ?? "")
+            return .handled
+        })
+    }
+}
+
+/// The system confirmation of a link that is not known to go where its label says. Cancel has Escape and Return; `Open`
+/// has no key at all. Closing the dialog any other way opens nothing. Shown only from a click on a link, after the click
+/// handler has returned (so SwiftUI is not inside the modal loop); hook connections are on other queues and are not held.
+@MainActor
+enum LinkConfirmation {
+    private static var asking = false
+
+    static func ask(destination: URL, label: String) {
+        guard !asking else { return }
+        asking = true
+        DispatchQueue.main.async {
+            defer { asking = false }
+            NSApp.activate(ignoringOtherApps: true)
+            // The host first and alone, then a short plain label: nothing in the label can push the host out of sight.
+            let parts = linkDialogParts(destination: destination.absoluteString, label: label)
+            let alert = NSAlert()
+            alert.messageText = String(localized: "Open \(parts.host)?")
+            alert.informativeText = String(localized: "It goes to \(parts.host). The link is shown as “\(parts.label)”.")
+            alert.alertStyle = .warning
+            let cancel = alert.addButton(withTitle: String(localized: "Cancel"))
+            let open = alert.addButton(withTitle: String(localized: "Open"))
+            // One key per button: Escape on Cancel, Return cancelled by the monitor below, nothing on Open.
+            cancel.keyEquivalent = "\u{1b}"
+            open.keyEquivalent = ""
+            let monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                // Only a Return typed in the dialog itself; a key for any other window of the app goes on untouched.
+                guard event.window === alert.window, event.keyCode == 36 || event.keyCode == 76 else { return event }
+                NSApp.stopModal(withCode: .alertFirstButtonReturn)
+                return nil
+            }
+            defer { if let monitor { NSEvent.removeMonitor(monitor) } }
+            if alert.runModal() == .alertSecondButtonReturn { NSWorkspace.shared.open(destination) }
+        }
+    }
+}
+
 // MARK: - Code block
 
 /// Header strip (language, Copy) over the code. Long lines scroll sideways; each line is cut for display at
@@ -279,7 +356,7 @@ private struct ChatTableView: View {
             Grid(alignment: .topLeading, horizontalSpacing: 0, verticalSpacing: 0) {
                 GridRow {
                     ForEach(Array(header.enumerated()), id: \.offset) { column, cell in
-                        Text(headerAttributed(cell))
+                        LinkedText(headerAttributed(cell))
                             .font(.system(size: 11.5, weight: .semibold))
                             .foregroundColor(Color(hex: "#F1F2F4"))
                             .multilineTextAlignment(textAlignment(column))
@@ -295,7 +372,7 @@ private struct ChatTableView: View {
                     Color.white.opacity(0.06).frame(height: 1).gridCellUnsizedAxes(.horizontal)
                     GridRow {
                         ForEach(Array(row.enumerated()), id: \.offset) { column, cell in
-                            Text(bodyAttributed(cell))
+                            LinkedText(bodyAttributed(cell))
                                 .font(.system(size: 12.5))
                                 .foregroundColor(bodyColor)
                                 .multilineTextAlignment(textAlignment(column))
@@ -509,14 +586,14 @@ private struct ChatCardItemView: View, Equatable {
         case .hairline:
             Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1).padding(.vertical, 13)
         case .verdict(let text):
-            Text(ChatCardText.attributed(text, size: 14.5, marks: !open))
+            LinkedText(ChatCardText.attributed(text, size: 14.5, marks: !open))
                 .font(.system(size: 14.5)).lineSpacing(5).foregroundColor(bright)
                 .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
         case .section(let lead, let lines):
             // Computed here, in the Equatable item: once when the paragraph closes, not while a later block streams.
             let strip = ChatAnswerRules.showsStatusStrip ? ChatAnswerRules.statusStrip(lines: lines) : []
             VStack(alignment: .leading, spacing: 0) {
-                Text(ChatCardText.attributed(lead, size: 13.5, marks: false, strong: title))
+                LinkedText(ChatCardText.attributed(lead, size: 13.5, marks: false, strong: title))
                     .font(.system(size: 13.5, weight: .semibold)).foregroundColor(title)
                     .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
                 if !strip.isEmpty { StatusStrip(words: strip).padding(.top, 7) }
@@ -532,7 +609,7 @@ private struct ChatCardItemView: View, Equatable {
                 Image(systemName: "questionmark.bubble.fill")
                     .font(.system(size: 14)).foregroundColor(Color(hex: "#F5A524"))
                     .accessibilityHidden(true)
-                Text(ChatCardText.attributed(text, size: 13, marks: true))
+                LinkedText(ChatCardText.attributed(text, size: 13, marks: true))
                     .font(.system(size: 13)).lineSpacing(4).foregroundColor(bright)
                     .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
             }
@@ -547,7 +624,7 @@ private struct ChatCardItemView: View, Equatable {
     }
 
     private func bodyText(_ text: String, marks: Bool, color: Color? = nil) -> some View {
-        Text(ChatCardText.attributed(text, size: 13, marks: marks && !open))
+        LinkedText(ChatCardText.attributed(text, size: 13, marks: marks && !open))
             .font(.system(size: 13)).lineSpacing(4).foregroundColor(color ?? body13)
             .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
     }
@@ -557,7 +634,7 @@ private struct ChatCardItemView: View, Equatable {
         case .paragraph(let text):
             bodyText(text, marks: marks)
         case .heading(let level, let text):
-            Text(ChatCardText.attributed(text, size: level <= 2 ? 15 : 13.5, marks: false, strong: title))
+            LinkedText(ChatCardText.attributed(text, size: level <= 2 ? 15 : 13.5, marks: false, strong: title))
                 .font(.system(size: level <= 2 ? 15 : 13.5, weight: level <= 2 ? .bold : .semibold))
                 .foregroundColor(title)
                 .fixedSize(horizontal: false, vertical: true).textSelection(.enabled)
@@ -659,7 +736,7 @@ private struct ChatCardTable: View {
         return Grid(alignment: .leading, horizontalSpacing: 0, verticalSpacing: 0) {
             GridRow {
                 ForEach(Array(header.enumerated()), id: \.offset) { column, cell in
-                    Text(ChatCardText.attributed(cell, size: 11, marks: false))
+                    LinkedText(ChatCardText.attributed(cell, size: 11, marks: false))
                         .font(.system(size: 11, weight: .semibold))
                         .foregroundColor(Color(hex: "#8E939C"))
                         .multilineTextAlignment(textAlignment(column))
@@ -690,7 +767,7 @@ private struct ChatCardTable: View {
             StatusCapsule(word: status.word, kind: status.kind, size: 10, dot: false, selectable: true)
                 .modifier(CellWidth(fits: fits, stretch: column == stretch, alignment: alignment(column)))
         } else {
-            Text(ChatCardText.attributed(cell, size: 12.5, marks: marks))
+            LinkedText(ChatCardText.attributed(cell, size: 12.5, marks: marks))
                 .font(.system(size: 12.5))
                 .foregroundColor(Color(hex: "#C9CDD4"))
                 .multilineTextAlignment(textAlignment(column))

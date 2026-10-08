@@ -241,7 +241,7 @@ struct CmuxPromptView: View {
         }
         // A draft written from outside (a launch that timed out, a prompt that could not be typed, a send that ended).
         // Keyed on the write counter, not on the text: the typing of the user also stores its draft.
-        .onChange(of: state.draftRevision) { _, _ in loadDraft() }
+        .onChange(of: state.draftRevision) { _, _ in loadDraft(takesStash: false) }
         // Only a launch outcome (timeout, folder match, failed first prompt) lets Send work again while a launch waits.
         .onChange(of: state.launchEndedRevision) { _, _ in launching = false }
         .onReceive(NotificationCenter.default.publisher(for: .islandSendMessage)) { _ in
@@ -391,7 +391,9 @@ struct CmuxPromptView: View {
 
     /// The field takes the draft stored for what is rendered (empty when that content has none: the text typed
     /// belongs to the other content, where it stays as a draft). The owner of the text is set here, and only here.
-    private func loadDraft() {
+    /// `takesStash`: the field is being loaded (it appears, or its content changed). A reload caused by a writer, such as
+    /// the end of a send, never puts a stashed prompt back.
+    private func loadDraft(takesStash: Bool = true) {
         let content = renderedContent
         // The session moved under typed text without the user doing it: say so. The text stays the draft of the
         // session it was typed for (every edit was filed under its owner); the field takes the new one.
@@ -400,8 +402,13 @@ struct CmuxPromptView: View {
         }
         if textOwner != content { chipClicked = false }
         textOwner = content
-        let draft = state.promptDrafts.text(for: content)
-        if draft != text { text = draft }
+        let loaded = state.draftForField(content, takesStash: takesStash)
+        if loaded.text != text { text = loaded.text }
+        // The prompt that waited in the stash is in the field now: say it is there, with the notice that exists for it.
+        if loaded.restoredStash, PromptSlot.restoredNoticeFits(content: content, noticeInUse: state.cmuxNotice != nil),
+           case .cmuxReply(let taskId, _) = content {
+            state.cmuxNotice = CmuxRouting.folderDraftNotice(sessionName: state.tasks.first { $0.id == taskId }?.name ?? "")
+        }
     }
 
     /// A send ended: the text goes (sent, or typed in cmux) or comes back (failed), in the draft of the content it

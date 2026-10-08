@@ -29,19 +29,34 @@ extension AppState {
 
     /// A writer outside the views (a launch that ended, a failed send, a closed session): the open view reloads.
     /// `endsLaunch`: the writer is a launch outcome, the only thing that lets Send work again while a launch waits.
+    /// The stash is not touched here: a stashed prompt is never put back in the turn that ends a send.
     func writeDraft(_ text: String, for content: PromptSlot.Content, endsLaunch: Bool = false) {
         promptDrafts.set(text, for: content)
         draftRevision &+= 1
         if endsLaunch { launchEndedRevision &+= 1 }
     }
 
-    /// A send failed: the prompt goes back to the draft of its content unless the draft still holds it.
-    func restoreDraft(_ prompt: String, for content: PromptSlot.Content, endsLaunch: Bool = false) {
-        writeDraft(PromptSlot.draftAfterFailure(draft: promptDrafts.text(for: content), prompt: prompt), for: content, endsLaunch: endsLaunch)
+    /// A send failed: the prompt goes back to the draft of its content when the draft is empty or blank. Other text
+    /// stays as typed. `stashIfReplaced`: a first prompt of a new chat must not be lost, so it waits in the stash
+    /// until that field is empty again.
+    func restoreDraft(_ prompt: String, for content: PromptSlot.Content, endsLaunch: Bool = false, stashIfReplaced: Bool = false) {
+        let draft = promptDrafts.text(for: content)
+        if stashIfReplaced, PromptSlot.failureLosesPrompt(draft: draft, prompt: prompt) { promptStash.keep(prompt, for: content) }
+        writeDraft(PromptSlot.draftAfterFailure(draft: draft, prompt: prompt), for: content, endsLaunch: endsLaunch)
     }
 
-    /// Removes a draft through the path that also refreshes an open field.
+    /// The draft a field shows when it is loaded (it appears, or its content changes): the stored one, or the fresh
+    /// stashed prompt when the stored one is blank. A reload caused by a writer (`takesStash: false`) never takes it.
+    func draftForField(_ content: PromptSlot.Content, takesStash: Bool = true) -> PromptSlot.LoadedDraft {
+        let stored = promptDrafts.text(for: content)
+        let loaded = PromptSlot.loadDraft(stored: stored, stash: &promptStash, for: content, takesStash: takesStash)
+        if loaded.restoredStash { promptDrafts.set(loaded.text, for: content) }
+        return loaded
+    }
+
+    /// Removes a draft through the path that also refreshes an open field. A session that is gone keeps no stashed prompt.
     func clearDraft(for content: PromptSlot.Content) {
+        if case .cmuxReply(let taskId, _) = content { promptStash.forgetReplies(ofTask: taskId) }
         guard !promptDrafts.text(for: content).isEmpty else { return }
         writeDraft("", for: content)
     }
