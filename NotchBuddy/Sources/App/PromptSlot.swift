@@ -126,12 +126,44 @@ enum PromptSlot {
         return lastSharedKnown ? .backToShared : .hermesChat(agent: activeAgent)
     }
 
-    /// After a failed send the prompt goes back to the draft only when the draft no longer holds it. Text typed
-    /// meanwhile is never overwritten: it stays, after the prompt.
+    /// After a failed send the prompt goes back to the draft only when the draft is empty; a draft of spaces and
+    /// newlines only is empty to the eye and counts as empty. Text typed meanwhile stays exactly as typed, without
+    /// the prompt in front of it (the one line field could hide it, and the next Return would send both).
     static func draftAfterFailure(draft: String, prompt: String) -> String {
-        if prompt.isEmpty || draft.contains(prompt) { return draft }
-        return draft.isEmpty ? prompt : prompt + " " + draft
+        isBlank(draft) ? prompt : draft
     }
+
+    /// The failed prompt is left out of the field: other text stays there. The caller then stashes the prompt
+    /// (`PromptStash`) when it cannot be lost (a first prompt of a new chat).
+    static func failureLosesPrompt(draft: String, prompt: String) -> Bool {
+        !isBlank(prompt) && !isBlank(draft) && draft.trimmingCharacters(in: .whitespacesAndNewlines) != prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// What a field shows when it is loaded: the stored draft, or the stashed prompt when the stored one is blank.
+    struct LoadedDraft: Equatable { let text: String; let restoredStash: Bool }
+
+    static func draftForLoad(stored: String, stashed: String?) -> LoadedDraft {
+        guard isBlank(stored), let stashed else { return LoadedDraft(text: stored, restoredStash: false) }
+        return LoadedDraft(text: stashed, restoredStash: true)
+    }
+
+    /// Loads a field: the stash is taken only when the stored draft is blank (and the reload is not a writer's), so a
+    /// load over other text leaves the stashed prompt for the next load of the empty field.
+    static func loadDraft(stored: String, stash: inout PromptStash, for content: Content, takesStash: Bool = true) -> LoadedDraft {
+        draftForLoad(stored: stored, stashed: takesStash && isBlank(stored) ? stash.take(for: content) : nil)
+    }
+
+    /// The existing notice for a restored prompt ("claude started in X. Check the prompt and press Send.") fits a reply
+    /// field that shows no other notice. Nothing else has such a notice.
+    static func restoredNoticeFits(content: Content, noticeInUse: Bool) -> Bool {
+        if case .cmuxReply = content { return !noticeInUse }
+        return false
+    }
+
+    /// The prompt is what the field holds: the only case where "check the prompt and press Send" is true.
+    static func promptIsInField(draft: String, prompt: String) -> Bool { !isBlank(prompt) && draft == prompt }
+
+    private static func isBlank(_ text: String) -> Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 
     /// A session was cleaned up and its draft dropped: the user is told when that session's own reply was on
     /// screen and held text. Decided where the session is cleaned up, not by the order of two view handlers.
@@ -205,4 +237,56 @@ struct PromptDrafts: Equatable {
             return !keep
         }
     }
+}
+
+/// Prompts that could not go back to their field because other text was there: first prompts of a new chat whose
+/// launch timed out or whose deferred send failed. One per content, put back the next time that field is loaded (never
+/// in the turn that ends a send), never merged with other text, and only while fresh (one hour). Memory only, capped,
+/// forgotten with the session or the conversation and at quit.
+struct PromptStash: Equatable {
+    static let maxEntries = 8
+    static let maxLength = PromptDrafts.maxLength
+    /// A stashed prompt older than this is typed text nobody remembers: it is dropped, not put back.
+    static let maxAge: TimeInterval = 3600
+
+    /// The age rule, with the clock as a parameter. A stamp from the future (the clock moved back) is not fresh.
+    static func isFresh(storedAt: Date, now: Date) -> Bool {
+        let age = now.timeIntervalSince(storedAt)
+        return age >= 0 && age <= maxAge
+    }
+
+    private var texts: [PromptSlot.Content: (text: String, storedAt: Date)] = [:]
+    /// Oldest kept first.
+    private var order: [PromptSlot.Content] = []
+
+    var count: Int { texts.count }
+
+    static func == (lhs: PromptStash, rhs: PromptStash) -> Bool {
+        lhs.order == rhs.order && lhs.order.allSatisfy { lhs.texts[$0]?.text == rhs.texts[$0]?.text && lhs.texts[$0]?.storedAt == rhs.texts[$0]?.storedAt }
+    }
+
+    /// A blank prompt is not kept. A newer prompt of the same content replaces the older one and restarts the age.
+    mutating func keep(_ prompt: String, for content: PromptSlot.Content, at now: Date = Date()) {
+        guard !prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        order.removeAll { $0 == content }
+        order.append(content)
+        texts[content] = (prompt.count > Self.maxLength ? String(prompt.prefix(Self.maxLength)) : prompt, now)
+        while order.count > Self.maxEntries { texts[order.removeFirst()] = nil }
+    }
+
+    /// The stashed prompt of a content, removed from the stash. A stale one is removed and not returned.
+    mutating func take(for content: PromptSlot.Content, at now: Date = Date()) -> String? {
+        guard let entry = texts.removeValue(forKey: content) else { return nil }
+        order.removeAll { $0 == content }
+        return Self.isFresh(storedAt: entry.storedAt, now: now) ? entry.text : nil
+    }
+
+    /// A cmux session is gone: its replies keep nothing, whatever surface they named.
+    mutating func forgetReplies(ofTask taskId: String) {
+        let gone = order.filter { if case .cmuxReply(let id, _) = $0 { return id == taskId } else { return false } }
+        for content in gone { texts[content] = nil }
+        order.removeAll { gone.contains($0) }
+    }
+
+    mutating func removeAll() { texts = [:]; order = [] }
 }

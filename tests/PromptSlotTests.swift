@@ -218,10 +218,106 @@ enum PromptSlotTests {
               PromptSlot.draftAfterFailure(draft: "hi", prompt: "hi") == "hi"
               && PromptSlot.draftAfterFailure(draft: "hi there", prompt: "hi") == "hi there"
               && PromptSlot.draftAfterFailure(draft: "oh hi", prompt: "hi") == "oh hi")
-        check("58. failed send: the draft is empty, the prompt comes back; other newer text is kept with it, nothing is lost",
+        check("58. failed send: the draft is empty, the prompt comes back; other newer text stays exactly as typed, without the prompt in front",
               PromptSlot.draftAfterFailure(draft: "", prompt: "hi") == "hi"
-              && PromptSlot.draftAfterFailure(draft: "new", prompt: "hi") == "hi new"
-              && PromptSlot.draftAfterFailure(draft: "new", prompt: "") == "new")
+              && PromptSlot.draftAfterFailure(draft: "new", prompt: "hi") == "new"
+              && PromptSlot.draftAfterFailure(draft: " new ", prompt: "hi") == " new "
+              && PromptSlot.draftAfterFailure(draft: "new", prompt: "") == "new"
+              && PromptSlot.draftAfterFailure(draft: "", prompt: "") == "")
+
+        // ── failed prompt and a draft that cannot be seen (Hera I4) ─────────
+        check("59. failed send: a draft of spaces or newlines only counts as empty, the prompt comes back; real text stays untouched",
+              PromptSlot.draftAfterFailure(draft: " ", prompt: "hi") == "hi"
+              && PromptSlot.draftAfterFailure(draft: " \n\t ", prompt: "hi") == "hi"
+              && PromptSlot.draftAfterFailure(draft: "  new  ", prompt: "hi") == "  new  ")
+        check("60. the prompt is stashed only when other text stays in the field",
+              PromptSlot.failureLosesPrompt(draft: "new", prompt: "hi")
+              && PromptSlot.failureLosesPrompt(draft: " new ", prompt: "hi")
+              && !PromptSlot.failureLosesPrompt(draft: "", prompt: "hi")
+              && !PromptSlot.failureLosesPrompt(draft: "  ", prompt: "hi")
+              && !PromptSlot.failureLosesPrompt(draft: "hi", prompt: "hi")
+              && !PromptSlot.failureLosesPrompt(draft: " hi ", prompt: "hi")
+              && !PromptSlot.failureLosesPrompt(draft: "new", prompt: " "))
+        check("61. the notice that says to check the prompt needs the prompt in the field",
+              PromptSlot.promptIsInField(draft: "hi", prompt: "hi")
+              && !PromptSlot.promptIsInField(draft: "other", prompt: "hi")
+              && !PromptSlot.promptIsInField(draft: "", prompt: "hi"))
+        do {
+            let reply = PromptSlot.Content.cmuxReply(taskId: "t", surfaceKey: "k")
+            var stash = PromptStash()
+            stash.keep("first", for: .cmuxNewChat)
+            check("62. a stashed prompt comes back once, for its own content only",
+                  stash.take(for: reply) == nil && stash.take(for: .cmuxNewChat) == "first" && stash.take(for: .cmuxNewChat) == nil)
+            stash.keep("one", for: .cmuxNewChat); stash.keep("two", for: .cmuxNewChat)
+            check("63. a newer prompt of the same content replaces the older, never merged",
+                  stash.take(for: .cmuxNewChat) == "two")
+            stash.keep("   ", for: .cmuxNewChat)
+            check("64. a blank prompt is not stashed", stash.count == 0)
+            for i in 0..<(PromptStash.maxEntries + 5) { stash.keep("p\(i)", for: .cmuxReply(taskId: "t\(i)", surfaceKey: nil)) }
+            check("65. the stash is capped, oldest dropped first",
+                  stash.count == PromptStash.maxEntries
+                  && stash.take(for: .cmuxReply(taskId: "t0", surfaceKey: nil)) == nil
+                  && stash.take(for: .cmuxReply(taskId: "t\(PromptStash.maxEntries + 4)", surfaceKey: nil)) != nil)
+            stash.removeAll()
+            stash.keep("a", for: reply); stash.keep("b", for: .cmuxReply(taskId: "t", surfaceKey: nil)); stash.keep("c", for: .cmuxReply(taskId: "u", surfaceKey: "k"))
+            stash.forgetReplies(ofTask: "t")
+            check("66. the end of a session forgets the stashed prompts of its replies, whatever their surface",
+                  stash.take(for: reply) == nil && stash.take(for: .cmuxReply(taskId: "t", surfaceKey: nil)) == nil
+                  && stash.take(for: .cmuxReply(taskId: "u", surfaceKey: "k")) == "c")
+            stash.keep("x", for: .cmuxNewChat); stash.keep("y", for: reply)
+            stash.removeAll()
+            check("67. clearing the conversation or the app session empties the stash", stash.count == 0)
+            stash.keep(String(repeating: "a", count: PromptStash.maxLength + 50), for: .cmuxNewChat)
+            check("68. a long prompt is cut to the cap, not dropped",
+                  stash.take(for: .cmuxNewChat)?.count == PromptStash.maxLength)
+        }
+
+        // ── the stash comes back when the field is next loaded, and ages out (Aegis L3) ──
+        do {
+            let t0 = Date(timeIntervalSince1970: 1_000_000)
+            check("69. the age rule takes the clock as a parameter: fresh up to one hour, never from the future",
+                  PromptStash.maxAge == 3600
+                  && PromptStash.isFresh(storedAt: t0, now: t0)
+                  && PromptStash.isFresh(storedAt: t0, now: t0.addingTimeInterval(3600))
+                  && !PromptStash.isFresh(storedAt: t0, now: t0.addingTimeInterval(3601))
+                  && !PromptStash.isFresh(storedAt: t0, now: t0.addingTimeInterval(-1)))
+            var stash = PromptStash()
+            stash.keep("first", for: .cmuxNewChat, at: t0)
+            check("70. a stashed prompt older than an hour is not put back, and is dropped",
+                  stash.take(for: .cmuxNewChat, at: t0.addingTimeInterval(3601)) == nil && stash.count == 0)
+            stash.keep("first", for: .cmuxNewChat, at: t0)
+            check("71. a fresh one comes back once",
+                  stash.take(for: .cmuxNewChat, at: t0.addingTimeInterval(3599)) == "first" && stash.take(for: .cmuxNewChat, at: t0) == nil)
+            stash.keep("old", for: .cmuxNewChat, at: t0)
+            stash.keep("new", for: .cmuxNewChat, at: t0.addingTimeInterval(3000))
+            check("72. a newer prompt of the same content restarts the age",
+                  stash.take(for: .cmuxNewChat, at: t0.addingTimeInterval(6000)) == "new")
+            check("73. the field loads the stash only when the stored draft is blank",
+                  PromptSlot.draftForLoad(stored: "", stashed: "first") == PromptSlot.LoadedDraft(text: "first", restoredStash: true)
+                  && PromptSlot.draftForLoad(stored: " \n", stashed: "first") == PromptSlot.LoadedDraft(text: "first", restoredStash: true)
+                  && PromptSlot.draftForLoad(stored: "typed", stashed: "first") == PromptSlot.LoadedDraft(text: "typed", restoredStash: false)
+                  && PromptSlot.draftForLoad(stored: "", stashed: nil) == PromptSlot.LoadedDraft(text: "", restoredStash: false)
+                  && PromptSlot.draftForLoad(stored: "typed", stashed: nil) == PromptSlot.LoadedDraft(text: "typed", restoredStash: false))
+            // Aegis L3: loading a field that holds other text must leave the stash where it is
+            var loadStash = PromptStash()
+            loadStash.keep("P1", for: .cmuxNewChat)
+            let keptText = PromptSlot.loadDraft(stored: "D other text", stash: &loadStash, for: .cmuxNewChat)
+            check("73b. a load over other text does not take the stash",
+                  keptText == PromptSlot.LoadedDraft(text: "D other text", restoredStash: false) && loadStash.count == 1)
+            let laterLoad = PromptSlot.loadDraft(stored: "", stash: &loadStash, for: .cmuxNewChat)
+            check("73c. a later load of the empty field gets it, once",
+                  laterLoad == PromptSlot.LoadedDraft(text: "P1", restoredStash: true) && loadStash.count == 0)
+            loadStash.keep("P2", for: .cmuxNewChat)
+            let noTake = PromptSlot.loadDraft(stored: "", stash: &loadStash, for: .cmuxNewChat, takesStash: false)
+            check("73d. a reload caused by a writer never takes it",
+                  noTake == PromptSlot.LoadedDraft(text: "", restoredStash: false) && loadStash.count == 1)
+            let reply = PromptSlot.Content.cmuxReply(taskId: "t", surfaceKey: "k")
+            check("74. the restored notice fits a reply field with no other notice, and nothing else",
+                  PromptSlot.restoredNoticeFits(content: reply, noticeInUse: false)
+                  && !PromptSlot.restoredNoticeFits(content: reply, noticeInUse: true)
+                  && !PromptSlot.restoredNoticeFits(content: .cmuxNewChat, noticeInUse: false)
+                  && !PromptSlot.restoredNoticeFits(content: .sharedChat, noticeInUse: false))
+        }
 
         // ── session closed under typed text (Hera N5) ──────────────────────────
         print("session closed notice")

@@ -36,6 +36,12 @@ jobs:
       - name: Test link filter
         run: bash scripts/test-safe-links.sh
 
+      - name: Test chat fold memory
+        run: bash scripts/test-chat-fold.sh
+
+      - name: Test demo guard
+        run: bash scripts/test-demo-guard.sh
+
       - name: Test Claude response text
         run: bash scripts/test-claude-response.sh
 

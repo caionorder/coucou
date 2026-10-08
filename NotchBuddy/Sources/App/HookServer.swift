@@ -204,8 +204,10 @@ final class HookServer: @unchecked Sendable {
         // Only intercept a demo question — real questions always have a live fd.
         if DemoEngine.shared.isActive, pendingQuestionFD < 0 {
             AppState.shared.pendingQuestion = nil
-            AppState.shared.isPinned = false
-            AppState.shared.view = AppState.shared.tasks.isEmpty ? .empty : .overview
+            if DemoGuard.mayChangeView(DemoEngine.shared.realPending) {
+                AppState.shared.isPinned = false
+                AppState.shared.view = AppState.shared.tasks.isEmpty ? .empty : .overview
+            }
             DemoEngine.shared.handleQuestionAnswered(answers: answers)
             return
         }
@@ -1220,8 +1222,10 @@ final class HookServer: @unchecked Sendable {
            pendingApprovalFD < 0 {
             let s = AppState.shared
             s.pendingApproval = nil
-            s.isPinned = false
-            s.view = s.tasks.isEmpty ? .empty : .overview
+            if DemoGuard.mayChangeView(DemoEngine.shared.realPending) {
+                s.isPinned = false
+                s.view = s.tasks.isEmpty ? .empty : .overview
+            }
             DemoEngine.shared.handleApprovalDecision(decision)
             return
         }
@@ -1643,7 +1647,7 @@ final class HookServer: @unchecked Sendable {
             self.cmuxPendingLaunch = nil
             let state = AppState.shared
             state.cmuxNotice = String(localized: "claude did not start in time.")
-            state.restoreDraft(pending.prompt, for: .cmuxNewChat, endsLaunch: true)
+            state.restoreDraft(pending.prompt, for: .cmuxNewChat, endsLaunch: true, stashIfReplaced: true)
         }
     }
 
@@ -1925,9 +1929,14 @@ final class HookServer: @unchecked Sendable {
         state.cmuxNotice = nil
         let prompt = pending.prompt
         guard exact else {
-            let sessionName = state.tasks.first { $0.id == agentId }?.name ?? ""
-            state.cmuxNotice = CmuxRouting.folderDraftNotice(sessionName: sessionName)
-            state.restoreDraft(prompt, for: .cmuxReply(taskId: agentId, surfaceKey: key), endsLaunch: true)
+            let replyContent = PromptSlot.Content.cmuxReply(taskId: agentId, surfaceKey: key)
+            state.restoreDraft(prompt, for: replyContent, endsLaunch: true, stashIfReplaced: true)
+            // "Check the prompt and press Send" is true only when the prompt is in the field. If other text kept
+            // the field, the prompt waits in the stash and there is no notice about it.
+            if PromptSlot.promptIsInField(draft: state.promptDrafts.text(for: replyContent), prompt: prompt) {
+                let sessionName = state.tasks.first { $0.id == agentId }?.name ?? ""
+                state.cmuxNotice = CmuxRouting.folderDraftNotice(sessionName: sessionName)
+            }
             return
         }
         // Gives the claude TUI time to take input. The one and only deferred send.
@@ -1936,7 +1945,7 @@ final class HookServer: @unchecked Sendable {
                 guard let failure else { return }
                 AppState.shared.showCmuxFailure(failure, owner: .cmuxReply(taskId: agentId, surfaceKey: key))
                 if failure != .enterNotSent {
-                    AppState.shared.restoreDraft(prompt, for: .cmuxReply(taskId: agentId, surfaceKey: key), endsLaunch: true)
+                    AppState.shared.restoreDraft(prompt, for: .cmuxReply(taskId: agentId, surfaceKey: key), endsLaunch: true, stashIfReplaced: true)
                 }
             }
         }

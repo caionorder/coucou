@@ -7447,6 +7447,22 @@
         }
       }
     },
+    "Open %@?" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Open %@?"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abrir %@?"
+          }
+        }
+      }
+    },
     "Open / close current diff" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -10996,6 +11012,22 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "A chave é enviada sem criptografia na sua rede local para quem responder a este nome. Use https:// ou um endereço IP de confiança."
+          }
+        }
+      }
+    },
+    "It goes to %@. The link is shown as “%@”." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "It goes to %@. The link is shown as “%@”."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Leva a %@. O link aparece como “%@”."
           }
         }
       }

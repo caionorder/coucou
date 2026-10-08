@@ -299,6 +299,8 @@ final class ClaudeService {
     /// that one, never to whatever is on screen when this runs.
     func chat(query: String, context: PromptContext?, state: AppState, target: ConversationID) async {
         if DemoEngine.shared.isActive {
+            // A message for a Hermes agent never gets here during the demo: the caller refuses it first
+            // (DemoGuard.mayChatSend), before the field is emptied or a bubble is added.
             state.stateOverride = .thinking
             await DemoEngine.shared.streamChatResponse(for: query)
             state.stateOverride = nil
