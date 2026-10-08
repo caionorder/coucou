@@ -11005,6 +11005,17 @@
         }
       }
     },
+    "The chat opened in cmux, but Coucou could not match it, so your message was not typed. It is back in the field." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O chat abriu no cmux, mas o Coucou não conseguiu associá-lo, então sua mensagem não foi digitada. Ela voltou para o campo."
+          }
+        }
+      }
+    },
     "The key is sent unencrypted on your local network to whoever answers this name. Use https:// or an IP address you trust." : {
       "extractionState" : "manual",
       "localizations" : {

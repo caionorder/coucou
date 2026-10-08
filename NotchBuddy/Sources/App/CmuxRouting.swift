@@ -354,6 +354,15 @@ extension CmuxRouting {
         return String(tokens[1])
     }
 
+    /// `--id-format` values tried, in order, for the `workspace.list` that resolves a new workspace.
+    /// `uuids` is not among them: since cmux 0.64.25 it drops `ref`, which is the only thing that can be
+    /// matched safely. `both` keeps the UUID id and adds the ref; nil is the default form (same fields).
+    static let workspaceListIdFormats: [String?] = ["both", nil]
+
+    static func workspaceListArguments(idFormat: String?) -> [String] {
+        (idFormat.map { ["--id-format", $0] } ?? []) + ["rpc", "workspace.list", "{}"]
+    }
+
     /// UUID of the workspace with this `ref` in the JSON of the rpc `workspace.list`
     /// (`{"workspaces":[{"id":…,"ref":"workspace:10",…}]}`, optionally under `result`).
     static func workspaceId(forRef ref: String, inListJSON json: String) -> String? {
@@ -1509,6 +1518,10 @@ struct CmuxPendingLaunch: Equatable {
 
     /// The prompt may be typed without a click only when the workspace and the socket are both known.
     var autoSendable: Bool { !workspaceId.isEmpty && !socketPath.isEmpty }
+
+    /// A token launch whose workspace was not resolved: no SessionStart can ever match it (the folder
+    /// fallback is for the password mode only), so waiting for it would only end in the timeout.
+    var cannotBeMatched: Bool { workspaceId.isEmpty && !socketPath.isEmpty }
 
     private func fresh(isNewTask: Bool, now: TimeInterval) -> Bool {
         isNewTask && now >= createdAt && now - createdAt <= CmuxRouting.launchTimeout

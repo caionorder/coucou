@@ -12,7 +12,7 @@ enum CmuxControl {
     static let passwordKey = "cmux-socket-password"
 
     enum Failure: Error, Equatable {
-        case notRunning, notVerified, noCredential, blockedByDialog, dialogMayBeOpen, notReachableYet, sessionClosed, invalidInput, enterNotSent, busy, promptNotAccepted, launchFilesUnavailable
+        case notRunning, notVerified, noCredential, blockedByDialog, dialogMayBeOpen, notReachableYet, sessionClosed, invalidInput, enterNotSent, busy, promptNotAccepted, launchFilesUnavailable, workspaceNotResolved
         case cli(Int32)
 
         var message: String {
@@ -27,6 +27,7 @@ enum CmuxControl {
             case .invalidInput:    return String(localized: "Check the folder / command in Settings.")
             case .promptNotAccepted: return String(localized: "This agent can't take a first prompt that starts with \"-\" or is only a command name. Reword it.")
             case .launchFilesUnavailable: return String(localized: "Coucou couldn't prepare a private folder for this launch. Nothing was started.")
+            case .workspaceNotResolved: return String(localized: "The chat opened in cmux, but Coucou could not match it, so your message was not typed. It is back in the field.")
             case .busy:            return String(localized: "Still sending, try again in a moment.")
             case .enterNotSent:    return String(localized: "Text is in the prompt, press Return in cmux.")
             case .cli(let code):   return String(localized: "cmux refused the command (code \(String(code))).")
@@ -327,10 +328,16 @@ enum CmuxControl {
                     case .success(let created):
                         state.cmuxRecentFolders = CmuxRouting.recentFolders(adding: folder, to: state.cmuxRecentFolders)
                         if launcher.reportsSessionStart {
-                            HookServer.shared.setCmuxPendingLaunch(
-                                CmuxPendingLaunch(workspaceId: created.workspaceId, socketPath: created.socketPath,
-                                                  cwd: folder, prompt: prepared,
-                                                  createdAt: Date().timeIntervalSinceReferenceDate))
+                            let pending = CmuxPendingLaunch(workspaceId: created.workspaceId, socketPath: created.socketPath,
+                                                            cwd: folder, prompt: prepared,
+                                                            createdAt: Date().timeIntervalSinceReferenceDate)
+                            if pending.cannotBeMatched {
+                                // Nothing can claim this launch: say so now (the draft goes back) instead of after 90 s.
+                                appendAppLog("nb.log", "cmux new chat: workspace not resolved")
+                                completion(.workspaceNotResolved)
+                                return
+                            }
+                            HookServer.shared.setCmuxPendingLaunch(pending)
                         } else {
                             state.showCmuxStarted(String(localized: "\(launcher.name) started in cmux. Its session won't appear as a pill here."))
                         }
@@ -361,9 +368,12 @@ enum CmuxControl {
         // stdout is `OK workspace:N`, a short ref. Its UUID comes from workspace.list on the same credential.
         var workspaceId = ""
         if let ref = CmuxRouting.workspaceRef(inNewWorkspaceOutput: r.output) {
-            let list = run(cli: cli, args: ["--id-format", "uuids", "rpc", "workspace.list", "{}"],
-                           env: env, timeout: 3, captureOutput: true)
-            if list.status == 0 { workspaceId = CmuxRouting.workspaceId(forRef: ref, inListJSON: list.output) ?? "" }
+            // Items need the UUID id and the ref: `--id-format uuids` has no ref since cmux 0.64.25.
+            for format in CmuxRouting.workspaceListIdFormats where workspaceId.isEmpty {
+                let list = run(cli: cli, args: CmuxRouting.workspaceListArguments(idFormat: format),
+                               env: env, timeout: 3, captureOutput: true)
+                if list.status == 0 { workspaceId = CmuxRouting.workspaceId(forRef: ref, inListJSON: list.output) ?? "" }
+            }
         }
         return .success(Created(workspaceId: workspaceId, socketPath: socket))
     }
