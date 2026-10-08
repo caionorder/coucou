@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         DemoEngine.shared.stop()
         HotKeyCenter.shared.unregisterAll()
+        ChatMediaStore.shared.shutdown()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -18,6 +19,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Warm up Keychain cache on main thread BEFORE any poller or view touches it
         _ = KeychainStore.shared
         _ = AppLanguage.launched
+        // What a crashed run left in the private media folder goes away before anything is fetched.
+        ChatMediaStore.shared.sweepStale()
         HermesChat.Diagnostics.setSink { appendAppLog("nb.log", $0) }
         NSApp.setActivationPolicy(.accessory)
         setupMenuBarItem()

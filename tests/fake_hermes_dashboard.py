@@ -10,6 +10,7 @@ HTTP
   POST /auth/native/token       {"code","code_verifier"}: single use code, PKCE verified, else 400
   POST /auth/native/refresh     {"refresh_token","provider"}: rotates; unknown or reused RT -> 401 session_expired
   GET  /api/auth/me, GET /api/profiles, POST /api/auth/ws-ticket   bearer required, else 401 session_expired
+  GET  /api/files/download?path=   bearer required; serves made up bytes by files_mode (see CONFIG); logs what it saw
   GET  /api/ws                  WebSocket (JSON-RPC 2.0 text frames), ticket in subprotocol or in the query
 Test control
   POST /_test/reset             back to defaults
@@ -36,6 +37,13 @@ CONFIG
   ws_stall_seconds      how long a stalled handshake is held (default 2)
   profiles_drop         accept the next N /api/profiles requests and close without answering
   ticket_delay          seconds every ticket request waits before it answers (round trip latency)
+  files_mode            ok (a few bytes with a real Ogg header) | png | big (files_size bytes of a PNG) | 403 | 404 | 413 | 415
+                        | declared_big (Content-Length 200 MB, a few bytes sent) | endless (no length, never ends)
+                        | redirect (302 to /api/captured) | short (declares 5000, sends 100, closes) | html (HTML named by the test)
+  files_size            size of the body of files_mode big (default 1 MB)
+  files_401             answer the next N download requests with 401 whatever the token (the refresh test)
+  files_delay           seconds a download waits before it answers (a fetch that is still running when the test acts)
+  (files_mode also: realpng = a valid 8x8 PNG, realwav = a valid 0.5 s WAVE; state: files_inflight, files_max_inflight)
 
 WebSocket prompt scenarios (the prompt text picks one): hello, error, error-partial, bare-error, close,
 approval, withdrawn, busy, queued, queued-early, queued-noterm, queued-start-first, binary, binary-flood, steered, redirected, early-terminal, early-error, submit-slow,
@@ -103,6 +111,7 @@ DEFAULT_CONFIG = {
     "ready_delay": 0, "omit_stored_id": False,
     "ticket_drop": 0, "ticket_status": 0, "refresh_drop": 0, "ws_drop": 0, "ws_stall": 0, "ws_stall_seconds": 2,
     "profiles_drop": 0, "ticket_delay": 0,
+    "files_mode": "ok", "files_size": 1 << 20, "files_401": 0, "files_delay": 0,
 }
 
 
@@ -132,6 +141,7 @@ def reset():
             "refresh_count": 0, "authorize_count": 0, "token_count": 0, "ticket_count": 0, "profiles_count": 0,
             "ticket_bearers": [], "ws": [], "rpc": [], "interrupts": [], "rejections": [], "pings": 0,
             "closes": 0, "captured_hits": 0, "captured_with_auth": 0, "counter": 0,
+            "downloads": [], "files_inflight": 0, "files_max_inflight": 0,
         })
 
 
@@ -654,6 +664,118 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return token
 
+    OGG = b"OggS\x00\x02" + b"\x00" * 20 + b"OpusHead" + b"fake audio bytes"
+    PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + b"\x00" * 40
+
+    @staticmethod
+    def real_png():
+        import zlib, struct
+        def chunk(tag, data):
+            body = tag + data
+            return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+        raw = b"".join(b"\x00" + b"".join(bytes([(x * 30) % 256, (y * 30) % 256, 160]) for x in range(8)) for y in range(8))
+        return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 8, 8, 2, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+    @staticmethod
+    def real_wav():
+        import struct, math
+        rate = 8000
+        pcm = b"".join(struct.pack("<h", int(6000 * math.sin(2 * math.pi * 440 * i / rate))) for i in range(rate // 2))
+        return (b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVEfmt " + struct.pack("<IHHIIHH", 16, 1, 1, rate, rate * 2, 2, 16)
+                + b"data" + struct.pack("<I", len(pcm)) + pcm)
+
+    def files_download(self, url):
+        with LOCK:
+            STATE["files_inflight"] += 1
+            STATE["files_max_inflight"] = max(STATE["files_max_inflight"], STATE["files_inflight"])
+            delay = CONFIG["files_delay"]
+        try:
+            if delay:
+                time.sleep(delay)
+            return self.files_download_inner(url)
+        finally:
+            with LOCK:
+                STATE["files_inflight"] -= 1
+
+    def files_download_inner(self, url):
+        q = parse_qs(url.query)
+        with LOCK:
+            STATE["downloads"].append({
+                "path": (q.get("path") or [""])[0], "query_keys": sorted(q.keys()), "raw_query": url.query,
+                "authorization": self.headers.get("Authorization", ""), "accept_encoding": self.headers.get("Accept-Encoding", ""),
+                "has_cookie": bool(self.headers.get("Cookie")),
+            })
+            mode = CONFIG["files_mode"]
+            size = CONFIG["files_size"]
+        if take("files_401"):
+            return self.send_json(401, {"error": "session_expired", "reason": "invalid_or_expired_session"})
+        if mode == "redirect":
+            return self.send_json(302, {}, {"Location": "/api/captured"})
+        if self.authed() is None:
+            return
+        if mode in ("403", "404", "413", "415"):
+            return self.send_json(int(mode), {"error": "no"})
+        if mode == "declared_big":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(200 << 20))
+            self.end_headers()
+            try:
+                self.wfile.write(self.OGG)
+                time.sleep(0.5)
+            except OSError:
+                pass
+            self.close_connection = True
+            return
+        if mode == "endless":
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/ogg")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            chunk = self.OGG + b"\x00" * 65000
+            sent = 0
+            try:
+                while sent < (400 << 20):
+                    self.wfile.write(chunk)
+                    sent += len(chunk)
+            except OSError:
+                pass
+            with LOCK:
+                STATE["endless_sent"] = sent
+            self.close_connection = True
+            return
+        if mode == "short":
+            self.send_response(200)
+            self.send_header("Content-Length", "5000")
+            self.end_headers()
+            try:
+                self.wfile.write(self.OGG)
+            except OSError:
+                pass
+            self.close_connection = True
+            return
+        if mode == "html":
+            body = b"<!doctype html><script>alert(1)</script>"
+        elif mode == "png":
+            body = self.PNG
+        elif mode == "realpng":
+            body = self.real_png()
+        elif mode == "realwav":
+            body = self.real_wav()
+        elif mode == "big":
+            body = (self.PNG + b"\x00" * size)[:size]
+        else:
+            body = self.OGG
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass            # the app cancelled the fetch (the chat folded, the conversation was cleared)
+
     def do_GET(self):
         url = urlparse(self.path)
         q = {k: v[0] for k, v in parse_qs(url.query).items()}
@@ -668,6 +790,8 @@ class Handler(BaseHTTPRequestHandler):
                 snap["sessions"] = {k: len(v["prompts"]) for k, v in STATE["sessions"].items()}
                 snap["live_refresh_tokens"] = sum(1 for v in STATE["refresh"].values() if v)
             return self.send_json(200, snap)
+        if path == "/api/files/download":
+            return self.files_download(url)
         if path == "/api/captured":
             with LOCK:
                 STATE["captured_hits"] += 1
@@ -860,7 +984,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    class QuietServer(ThreadingHTTPServer):
+        def handle_error(self, request, client_address):
+            # A client that cancels or resets its connection (the app does, on purpose) is not an error of the fake.
+            if isinstance(sys.exc_info()[1], OSError):
+                return
+            super().handle_error(request, client_address)
+
+    server = QuietServer(("127.0.0.1", 0), Handler)
     server.daemon_threads = True
     with open(sys.argv[1], "w") as f:
         f.write(str(server.server_address[1]))

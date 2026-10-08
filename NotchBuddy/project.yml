@@ -156,6 +156,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: fr.louisraille.NotchBuddy
         PRODUCT_NAME: Coucou
         INFOPLIST_FILE: Resources/Info.plist
+        # The one Objective-C file (CoucouTry): Swift cannot catch an exception AVAudioEngine raises.
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/App/Coucou-Bridging-Header.h
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         MACOSX_DEPLOYMENT_TARGET: "15.0"
         ENABLE_SANDBOX: NO
@@ -223,6 +225,8 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: fr.louisraille.Coucou
         PRODUCT_NAME: Coucou
         INFOPLIST_FILE: Resources/InfoAppStore.plist
+        # The one Objective-C file (CoucouTry): Swift cannot catch an exception AVAudioEngine raises.
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/App/Coucou-Bridging-Header.h
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         MACOSX_DEPLOYMENT_TARGET: "15.0"
         CODE_SIGN_STYLE: Automatic

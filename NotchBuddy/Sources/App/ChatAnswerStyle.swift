@@ -37,8 +37,10 @@ enum ChatTurnLayout {
     }
 
     /// Every segment lands in exactly one item (a text with nothing but whitespace makes none). A note never folds:
-    /// inside a run of work it is emitted right after the group.
-    static func items(segments: [ChatSegment], running: Bool) -> [Item] {
+    /// inside a run of work it is emitted right after the group. `media`: the answers of this agent may carry media
+    /// directives (`ChatMediaDirectives`): a text that is only directives, or only the start of one, makes no card
+    /// until something to draw is there.
+    static func items(segments: [ChatSegment], running: Bool, media: Bool = false) -> [Item] {
         var out: [Item] = []
         var run: [ChatSegment] = []
         var held: [ChatSegment] = []
@@ -58,7 +60,9 @@ enum ChatTurnLayout {
                     run.append(segment)
                 } else {
                     flush()
-                    if !t.allSatisfy(\.isWhitespace) { out.append(.card(id: segment.id, text: t, open: role == .open)) }
+                    if !t.allSatisfy(\.isWhitespace), !(media && isEmptyOfMedia(t, streaming: role == .open)) {
+                        out.append(.card(id: segment.id, text: t, open: role == .open))
+                    }
                 }
             case .note(let t):
                 if run.isEmpty { out.append(.note(id: segment.id, text: t)) } else { held.append(segment) }
@@ -73,6 +77,12 @@ enum ChatTurnLayout {
             out[index] = .group(group, mode: mode(of: group, live: running && index == lastGroup && !closedCardFollows))
         }
         return out
+    }
+
+    /// Nothing to draw once the directives are taken out: no text and no attachment.
+    private static func isEmptyOfMedia(_ text: String, streaming: Bool) -> Bool {
+        let found = ChatMediaDirectives.extractCached(text, streaming: streaming)
+        return found.attachments.isEmpty && found.text.allSatisfy(\.isWhitespace)
     }
 
     private static func mode(of group: WorkGroup, live: Bool) -> Mode {
@@ -120,9 +130,9 @@ enum ChatTurnLayout {
     /// something alive: a live box (it has a work group) or its own dots (`showsOwnDots`). Otherwise a second set of
     /// dots would sit under the first.
     /// `lastSegments`: the segments of the last message when it is the running agent message, else nil.
-    static func anchorReplacesDots(typing: Bool, streamingLast: Bool, lastSegments: [ChatSegment]?) -> Bool {
+    static func anchorReplacesDots(typing: Bool, streamingLast: Bool, lastSegments: [ChatSegment]?, media: Bool = false) -> Bool {
         guard typing, streamingLast, let segments = lastSegments, !segments.isEmpty else { return false }
-        return hasWork(segments) || showsOwnDots(items: items(segments: segments, running: true), running: true, typing: false)
+        return hasWork(segments) || showsOwnDots(items: items(segments: segments, running: true, media: media), running: true, typing: false)
     }
 
     /// A finished turn with a folded group, interim text in it and no answer: what the agent said must not be hidden.
@@ -270,6 +280,8 @@ enum CardItem: Equatable {
     case ask(String)
     case block(MDBlock, closed: Bool)
     case hairline
+    /// The row of an attachment (`ChatMediaDirectives`), at the place of the directive line.
+    case attachment(Int)
 }
 
 // MARK: - Rules
@@ -302,6 +314,7 @@ enum ChatAnswerRules {
             .map { $0.trimmingCharacters(in: edge) }
             .filter { !$0.isEmpty }
         guard lines.count >= 2, let first = lines.first,
+              !isTagLine(first),
               first.count <= leadMaxChars,
               first.contains(where: \.isLetter),
               let last = first.last, !".!?:;…,".contains(last),
@@ -314,6 +327,12 @@ enum ChatAnswerRules {
         if short && lines.count >= 3 { return (nil, lines) }
         if short && lines.count == 2 && !second.contains(where: \.isWhitespace) { return (nil, lines) }
         return (first, Array(lines.dropFirst()))
+    }
+
+    /// `[[word]]`: a directive of the agent platforms (an unknown one stays text, but never a title).
+    private static func isTagLine(_ line: String) -> Bool {
+        guard line.hasPrefix("[["), line.hasSuffix("]]"), line.count > 4 else { return false }
+        return line.dropFirst(2).dropLast(2).allSatisfy { $0.isLowercase || $0 == "_" || $0.isNumber }
     }
 
     /// A first line this long, followed by a lower case line, is the first half of a hard wrapped sentence.
@@ -373,7 +392,21 @@ enum ChatAnswerRules {
 
     /// The status strip of a section is not part of the item: it is computed by the view of the item (`statusStrip`),
     /// once, when the paragraph closes, and not again while a later block streams.
-    static func sections(blocks: [MDBlock], streaming: Bool, verdict: Bool) -> [CardItem] {
+    static func sections(blocks all: [MDBlock], streaming: Bool, verdict: Bool, attachments: Int = 0) -> [CardItem] {
+        // The slot lines of the attachments (`ChatMediaDirectives.slotLine`) are not blocks of text: they place a row.
+        // Every rule below reads the blocks without them (the first paragraph, the last one), and the row is emitted
+        // where its slot was. Only the slots of a parse that made `attachments` rows are read: a paragraph that merely looks
+        // like a slot (private use characters in some other chat) stays a paragraph.
+        var blocks: [MDBlock] = []
+        var slots: [[Int]] = [[]]
+        for block in all {
+            if case .paragraph(let text) = block, let id = ChatMediaDirectives.slotID(of: text), id < attachments {
+                slots[slots.count - 1].append(id)
+            } else {
+                blocks.append(block)
+                slots.append([])
+            }
+        }
         var items: [CardItem] = []
         var afterSection = false
         var sawHeading = false
@@ -390,6 +423,7 @@ enum ChatAnswerRules {
         }
 
         for (index, block) in blocks.enumerated() {
+            for id in slots[index] { add(.attachment(id)) }
             let closed = !streaming || index < blocks.count - 1
             switch block {
             case .paragraph(let text):
@@ -422,6 +456,7 @@ enum ChatAnswerRules {
                 add(.block(block, closed: closed))
             }
         }
+        for id in slots[blocks.count] { add(.attachment(id)) }
         // A text that ends with a rule has no divider to close the card on.
         if items.last == .hairline { items.removeLast() }
         return items

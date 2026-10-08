@@ -14,6 +14,7 @@ final class AppState: ObservableObject {
             if mode != .expanded { clearCmuxPrompt() }
             #endif
             clearHermesBadgeIfChatShown()
+            syncChatMediaVisibility()
         }
     }
     @Published var view: IslandView = .overview {
@@ -23,7 +24,27 @@ final class AppState: ObservableObject {
             if view == .prompt && !cmuxOpeningPrompt { clearCmuxPrompt() }
             #endif
             clearHermesBadgeIfChatShown()
+            syncChatMediaVisibility()
         }
+    }
+
+    /// The chat is on screen only while the island is open on the prompt view: a media row fetches by itself only then,
+    /// and a voice message that plays is paused (keeping its position) the moment the island folds or hides.
+    private func syncChatMediaVisibility() {
+        ChatMediaVisibility.shared.set(mode == .expanded && view == .prompt)
+    }
+
+    /// Another conversation came on screen (another agent, or the shared chat): a voice message of the one that left
+    /// pauses, keeping its position.
+    private func syncChatMediaConversation() {
+        ChatMediaStore.shared.conversationChanged(to: activeConversationID.mediaKey)
+    }
+
+    /// Where the answers of the chat on screen come from, for the media rows. Only a Hermes agent writes directives;
+    /// only a sign in agent can be asked for a file.
+    var chatMediaContext: ChatMediaContext {
+        guard chatProvider == .hermes, let agent = activeHermesAgent else { return ChatMediaContext() }
+        return ChatMediaContext(enabled: true, conversation: activeConversationID.mediaKey, agent: agent, agentName: agent.shownName)
     }
 
     // Tasks
@@ -124,6 +145,7 @@ final class AppState: ObservableObject {
         didSet {
             UserDefaults.standard.set(chatProvider.rawValue, forKey: "chatProvider")
             if chatProvider != .hermes { lastSharedProvider = chatProvider }
+            syncChatMediaConversation()
             // Switching only changes which conversation is shown: a Hermes agent never shares one with another
             // provider or agent, and nothing is cleared or cancelled by the switch.
             clearHermesBadgeIfChatShown()
@@ -217,6 +239,7 @@ final class AppState: ObservableObject {
         didSet {
             UserDefaults.standard.set(hermesChatAgent, forKey: "hermesChatAgent")
             clearHermesBadgeIfChatShown()
+            syncChatMediaConversation()
         }
     }
     /// The agent picked in the chat (by name), else the first configured one.
@@ -1401,6 +1424,11 @@ struct ChatMessage: Identifiable, Equatable {
 }
 
 /// The one sign in session store of the app, over the Keychain item "hermes-agent-sessions".
+extension ChatMediaStore {
+    /// The one store of the app: it asks the agents with the one set of sign in sessions.
+    static let shared = ChatMediaStore(sessions: .shared)
+}
+
 extension HermesSessions {
     static let shared = HermesSessions(storage: HermesSessionStorage(
         load: { KeychainStore.shared.get("hermes-agent-sessions") ?? "" },

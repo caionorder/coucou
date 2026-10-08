@@ -30,6 +30,8 @@ struct AgentTurnBlock: View, Equatable {
     /// Folded groups that start open (a snapshot or a preview); the user's clicks do the rest.
     @State private var expanded: Set<Int>
     @State private var touched: Bool
+    /// Where the answers of this chat come from: Hermes agents hand over files with directives that become rows.
+    @Environment(\.chatMedia) private var media
 
     init(speaker: ChatSpeaker, showsHeader: Bool, segments: [ChatSegment], typing: Bool = false, running: Bool = false,
          label: ChatTurnHeader.Label = .none, messageID: UUID? = nil, initiallyExpanded: Set<Int> = []) {
@@ -58,7 +60,7 @@ struct AgentTurnBlock: View, Equatable {
     }
 
     var body: some View {
-        let items = ChatTurnLayout.items(segments: segments, running: running)
+        let items = ChatTurnLayout.items(segments: segments, running: running, media: media.enabled)
         VStack(alignment: .leading, spacing: 9) {
             if showsHeader { header }
             ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
@@ -126,9 +128,13 @@ struct AgentTurnBlock: View, Equatable {
                     if open { ChatStepsList(rows: group.rows).equatable() }
                 }
             }
-        case .card(_, let text, let open):
+        case .card(let id, let text, let open):
             ChatMarkdownView(markdown: text, style: .card(verdict: hasWork(before: index, in: items)), streaming: open)
                 .equatable()
+                .transformEnvironment(\.chatMedia) {
+                    $0.scope = "\(messageID?.uuidString ?? "")-\(id)"
+                    $0.colorHex = speaker.colorHex
+                }
         case .note(_, let text):
             Text(verbatim: text)
                 .font(.system(size: 11))
@@ -397,6 +403,7 @@ struct ChatStepRow: View, Equatable {
 /// between two paragraphs. The three chat lists (shared chat, Hermes chat, cmux reply) draw their body with this.
 /// The scroll anchors stay as they were: `.id(message.id)` on each row and `"typing"` on the dots.
 struct ChatTurnList: View {
+    @Environment(\.chatMedia) private var media
     let messages: [ChatMessage]
     /// Who wrote an agent message; nil asks for the speaker who is about to answer (the typing dots).
     let speaker: (ChatMessage?) -> ChatSpeaker
@@ -420,7 +427,7 @@ struct ChatTurnList: View {
         // A turn that already has rows and still runs shows its own live box: the "typing" anchor stays below it as a
         // row with no height, so `scrollTo("typing")` keeps working and no second set of dots is drawn.
         let runningSegments = shown.last.flatMap { $0.id == lastID && $0.role == .assistant ? $0.segments : nil }
-        let rowsRun = ChatTurnLayout.anchorReplacesDots(typing: typing, streamingLast: streamingLast, lastSegments: runningSegments)
+        let rowsRun = ChatTurnLayout.anchorReplacesDots(typing: typing, streamingLast: streamingLast, lastSegments: runningSegments, media: media.enabled)
         // Spacing is padding on the rows (14 pt between turns), so a message with nothing to show can still carry
         // its scroll anchor as a zero height row without adding a gap.
         VStack(alignment: .leading, spacing: 0) {

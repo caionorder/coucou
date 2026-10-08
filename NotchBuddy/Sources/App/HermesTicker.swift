@@ -1,8 +1,8 @@
 import Foundation
 
 /// What the overview card of a Hermes pill shows while its agent works: the rows of the turn as ticker lines.
-/// Pure, display only: it reads the rows the chat already draws (tool name, its one line preview, sentences), nothing
-/// else, and nothing here is logged, stored or sent.
+/// Pure, display only: it reads the rows the chat already draws (tool name, its one line preview, sentences, the label of
+/// a file or a voice note), nothing else, and nothing here is logged, stored or sent.
 enum HermesTicker {
     /// Lines kept on the pill, above the 60 steps a turn keeps in the chat. Past the cap the count stays and the card
     /// still advances: it follows the last line (`Signature`).
@@ -19,8 +19,12 @@ enum HermesTicker {
                 out.append(step.label.isEmpty || step.label == step.tool ? step.tool : "\(step.tool) · \(step.label)")
             case .text(let text, let role):
                 guard role != .open else { continue }
-                let line = DiffEngine.toOneLine(text)
+                // The directives of a file or a voice note are not text: the sentence, then one label for the files
+                // (never a path).
+                let found = ChatMediaDirectives.extractCached(text, streaming: false)
+                let line = DiffEngine.toOneLine(found.text)
                 if !line.isEmpty { out.append(line) }
+                if let label = ChatMediaDirectives.tickerLabel(for: found.attachments) { out.append(label) }
             case .note, .hiddenSteps:
                 continue
             }

@@ -1326,6 +1326,7 @@ struct PromptView: View {
                                          streamingLast: state.chatProvider == .hermes
                                              ? state.hermesTurnRunning : ClaudeService.shared.sharedChatStreaming,
                                          typing: typingShown)
+                            .environment(\.chatMedia, state.chatMediaContext)
                             .padding(.vertical, 2)
                         }
                         .pinnedScrollTracking($pinned) {
