@@ -11,8 +11,10 @@ enum CmuxRouting {
     static let taskPrefix = "agent_cmux_"
     /// Pills (cmux workspaces) kept at once.
     static let maxTasks = 12
-    /// Agent surfaces (sessions) kept per pill.
-    static let maxSurfacesPerTask = 8
+    /// Agent surfaces (sessions) kept per pill. A workspace that fans out helpers reached 10 live sessions and the
+    /// ninth and tenth were dropped with all their events; 24 leaves room. The global bounds stay: `maxTasks` pills,
+    /// `CmuxCardQueue` (16 cards, 6 per pill) and `maxFileSessions` for the session file.
+    static let maxSurfacesPerTask = 24
     static let maxKeyLength = 36
     /// A registry entry (and its task) not seen for this long is dropped.
     static let staleAfter: TimeInterval = 30 * 60
@@ -903,6 +905,40 @@ extension CmuxRouting {
         return states.contains { $0.key != stoppingKey && busyStates.contains($0.value) }
     }
 
+    /// True for the Notification of Claude Code that says a session is idle and waits for the user (`idle_prompt`,
+    /// "Claude is waiting for your input"): cmux turns it into its own "Waiting" notification. `type` is the
+    /// payload's `notification_type` when there is one; without it the message decides. A permission request is
+    /// answered by its card, a message ending with `?` is a question: neither is this.
+    static func isWaitingNotification(type: String?, message: String) -> Bool {
+        if let type, !type.isEmpty { return type.lowercased() == "idle_prompt" }
+        let m = message.lowercased()
+        return m.contains("waiting for your input") || m.contains("waiting for your next prompt")
+    }
+
+    /// States of a session that failed (sticky until its next prompt): the finished badge is not for them.
+    static let failedStates: Set<String> = ["error", "ratelimit"]
+
+    /// Whether a waiting notification of a session gives its pill the badge of a finished turn. Only for a session
+    /// whose last Stop told nobody (`CmuxStopRecord`), while the pill is not the one on screen, carries no badge
+    /// already and holds no card, and the session is neither mid turn nor failed. A badge only: no sound, no view, so
+    /// never more than the finished turn itself.
+    static func waitingNeedsBadge(stopToldNobody: Bool, pillFocused: Bool, pillHasBadge: Bool, pillHoldsCard: Bool,
+                                  sessionState: String?) -> Bool {
+        guard stopToldNobody, !pillFocused, !pillHasBadge, !pillHoldsCard else { return false }
+        let state = sessionState ?? ""
+        return !busyStates.contains(state) && !failedStates.contains(state)
+    }
+
+    /// Where the Stop of a silent session (a helper finishing while a sibling works) shows itself: the finished badge
+    /// of its pill at once, no sound, no view, no card, no final line. Not for the focused pill, whose row the pill
+    /// grid does not draw (the badge would only appear once the focus moves away), nor over a card or an existing
+    /// badge. Never `.view`.
+    static func silentStopPlacement(pillFocused: Bool, cardOfPillOnScreen: Bool, pillHoldsCard: Bool,
+                                    pillHasBadge: Bool) -> AlertPlacement {
+        if pillFocused || pillHasBadge { return .none }
+        return alertPlacement(focused: false, cardOfPillOnScreen: cardOfPillOnScreen, pillHoldsCard: pillHoldsCard)
+    }
+
     /// Where a finished or error alert of a cmux session goes.
     enum AlertPlacement: Equatable {
         /// The island shows the finished / error view.
@@ -1248,7 +1284,7 @@ struct CmuxRegistry {
     /// (cmux restarted somewhere else without a termination notice), the new unit is accepted.
     /// `key` is the surface key; without it the entry is keyed by the task id (one surface per task). An
     /// existing entry keeps its pill (`taskId` only places a new one).
-    /// A pill never holds more than `maxSurfacesPerTask` surfaces: a ninth is not registered.
+    /// A pill never holds more than `maxSurfacesPerTask` surfaces: one more is not registered.
     @discardableResult
     mutating func note(taskId: String, key: String? = nil, surfaceId: String, workspaceId: String, socketPath: String,
                        capability: String, sessionId: String, now: TimeInterval,
@@ -1592,6 +1628,27 @@ struct CmuxCardQueue {
     func hasCards(for taskId: String) -> Bool { cards.contains { $0.taskId == taskId } }
 
     func hasCards(forSurface key: String) -> Bool { cards.contains { $0.surfaceKey == key } }
+}
+
+
+/// The cmux sessions whose last Stop told nobody (silent, or its alert had nowhere to go) and that have not been given
+/// the waiting badge since. A Stop that told someone, a new prompt, a StopFailure and a forgotten surface take the key
+/// out; a waiting badge takes it out too, so one idle period gives the badge once. A session never recorded (fresh,
+/// never stopped) is not a candidate. Bounded by what the registry can hold: a full record gives no badge rather than
+/// an extra one.
+struct CmuxStopRecord {
+    static let capacity = CmuxRouting.maxTasks * CmuxRouting.maxSurfacesPerTask
+    private var keys = Set<String>()
+
+    func toldNobody(_ key: String) -> Bool { keys.contains(key) }
+
+    mutating func stop(_ key: String, told: Bool) {
+        if told { keys.remove(key) } else if keys.contains(key) || keys.count < Self.capacity { keys.insert(key) }
+    }
+    mutating func prompt(_ key: String) { keys.remove(key) }
+    mutating func stopFailed(_ key: String) { keys.remove(key) }
+    mutating func gaveWaitingBadge(_ key: String) { keys.remove(key) }
+    mutating func forget(_ key: String) { keys.remove(key) }
 }
 
 #endif

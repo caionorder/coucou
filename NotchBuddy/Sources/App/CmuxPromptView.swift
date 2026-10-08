@@ -265,24 +265,49 @@ struct CmuxPromptView: View {
         }
     }
 
+    /// More chips than this scroll in a bounded area instead of pushing the transcript and the field away (a
+    /// workspace holds up to 24 sessions). Up to this many, the chips wrap exactly as before.
+    private static let chipsBeforeScroll = 8
+    /// Two rows of chips and half of the third (a chip is about 22 pt high, rows 6 pt apart): the cut row says the
+    /// list scrolls.
+    private static let chipsScrollHeight: CGFloat = 67
+
     /// One chip per agent session of the workspace, the main one first; the selected chip is the target.
     @ViewBuilder private func targetChips(for task: AgentTask) -> some View {
         let surfaces = HookServer.shared.cmuxSurfaces(for: task.id)
-        if surfaces.count > 1 {
-            let target = targetKey
-            ChipFlowLayout(spacing: 6) {
-                ForEach(surfaces, id: \.key) { s in
-                    Button {
-                        if s.key != target { chipClicked = true }
-                        HookServer.shared.setCmuxReplyChoice(s.key, for: task.id)
-                    } label: {
-                        chipLabel(s.label, selected: s.key == target)
-                    }
-                    .buttonStyle(.plain)
+        if surfaces.count > Self.chipsBeforeScroll {
+            // At most two rows, then the same wrapping chips scroll; the selected chip is kept in view.
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: false) {
+                    // Full width, leading: a scroll view centres content narrower than itself, and the chips must sit
+                    // on the same left edge as in the wrapping case.
+                    chipFlow(surfaces, task: task)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
+                .frame(maxHeight: Self.chipsScrollHeight)
+                .onAppear { if let t = targetKey { proxy.scrollTo(t) } }
+                .onChange(of: targetKey) { _, t in if let t { proxy.scrollTo(t) } }
             }
-            .padding(.horizontal, 10)
+        } else if surfaces.count > 1 {
+            chipFlow(surfaces, task: task)
         }
+    }
+
+    private func chipFlow(_ surfaces: [CmuxSurfaceInfo], task: AgentTask) -> some View {
+        let target = targetKey
+        return ChipFlowLayout(spacing: 6) {
+            ForEach(surfaces, id: \.key) { s in
+                Button {
+                    if s.key != target { chipClicked = true }
+                    HookServer.shared.setCmuxReplyChoice(s.key, for: task.id)
+                } label: {
+                    chipLabel(s.label, selected: s.key == target)
+                }
+                .buttonStyle(.plain)
+                .id(s.key)
+            }
+        }
+        .padding(.horizontal, 10)
     }
 
     // MARK: bodies

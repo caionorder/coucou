@@ -97,6 +97,9 @@ final class HookServer: @unchecked Sendable {
     private var cmuxEndedAt: [String: TimeInterval] = [:]
     /// The session whose Stop wrote the pill's final line, so ending another session leaves it alone.
     private var cmuxFinalLineKey: [String: String] = [:]
+    /// The sessions whose last Stop told nobody: the "waiting for input" Notification that follows gives their pill a
+    /// badge, once. Cleaned wherever a surface is forgotten; bounded by what the registry can hold.
+    private var cmuxStopRecord = CmuxStopRecord()
     #endif
 
     private init() {}
@@ -658,6 +661,9 @@ final class HookServer: @unchecked Sendable {
             if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKey) }
             if let idx = state.tasks.firstIndex(where: { $0.id == agentId }) { state.tasks[idx].finalLine = nil }
             setTaskState(agentId, .thinking, cmuxKey: cmuxKey)
+            #if !APPSTORE
+            if let key = cmuxKey { cmuxStopRecord.prompt(key) }
+            #endif
             if let prompt = payload["prompt"] as? String, !prompt.isEmpty {
                 appendStep(id: agentId, step: stepPrefix(forKey: cmuxKey) + String(prompt.prefix(60)))
                 #if !APPSTORE
@@ -708,15 +714,40 @@ final class HookServer: @unchecked Sendable {
         case "Notification":
             let message = payload["message"] as? String ?? ""
             let lower = message.lowercased()
+            // The kind and whether a badge was set go to the log, never the message.
+            var kind = "other"
+            var badgeSet = false
             if lower.contains("rate limit") || lower.contains("limite d") {
+                kind = "ratelimit"
                 setTaskState(agentId, .ratelimit, cmuxKey: cmuxKey)
                 SoundEngine.shared.play("rate")
             } else if message.hasSuffix("?") {
+                kind = "question"
                 setTaskState(agentId, .question, cmuxKey: cmuxKey)
                 appendStep(id: agentId, step: stepPrefix(forKey: cmuxKey) + message)
+            } else {
+                #if !APPSTORE
+                // A cmux session that waits for the user (cmux shows its own "Waiting" notification) and whose Stop
+                // told nobody: the badge of a finished turn, once, nothing louder.
+                if let key = cmuxKey,
+                   CmuxRouting.isWaitingNotification(type: payload["notification_type"] as? String, message: message) {
+                    kind = "waiting"
+                    if CmuxRouting.waitingNeedsBadge(
+                        stopToldNobody: cmuxStopRecord.toldNobody(key), pillFocused: focused,
+                        pillHasBadge: state.tasks.first { $0.id == agentId }?.pillBadge != nil,
+                        pillHoldsCard: cmuxTaskHoldsCard(agentId),
+                        sessionState: cmuxRegistry.surface(key: key)?.state) {
+                        setPillBadge(id: agentId, badge: .finished)
+                        cmuxStopRecord.gaveWaitingBadge(key)
+                        badgeSet = true
+                    }
+                }
+                #endif
             }
+            nbLog("Notification \(isExternalAgent ? agentId : projectName) kind=\(kind) badge=\(badgeSet)")
 
         case "Stop":
+            nbLog("Stop \(isExternalAgent ? agentId : projectName)")
             // A helper that stops while another session of the workspace is mid turn adds a step, nothing else:
             // no sound, no finished view, no badge. The main session is never silent, and a sibling stuck in an
             // old state (error, rate limit) silences nobody. Decided before the state is recorded.
@@ -762,17 +793,44 @@ final class HookServer: @unchecked Sendable {
             #else
             let answerInPlace = false
             #endif
+            #if !APPSTORE
+            var stopTold = false
+            #endif
             if silentStop {
-                // nothing to show
+                // No sound, no view, no final line. A helper of a busy workspace shows itself by the finished badge of
+                // its pill at once (what cmux shows), unless the pill is the focused one or a card holds it.
+                #if !APPSTORE
+                if CmuxRouting.silentStopPlacement(
+                    pillFocused: focused, cardOfPillOnScreen: cmuxCardOnScreen(forPill: agentId),
+                    pillHoldsCard: cmuxTaskHoldsCard(agentId),
+                    pillHasBadge: state.tasks.first { $0.id == agentId }?.pillBadge != nil) == .badge {
+                    setPillBadge(id: agentId, badge: .finished)
+                    stopTold = true
+                }
+                #endif
             } else if answerInPlace {
                 // nothing to switch
+                #if !APPSTORE
+                stopTold = true
+                #endif
             } else {
                 switch alertPlacement(pillId: agentId, cmuxKey: cmuxKey, focused: focused && !cardPromoted) {
-                case .view: expandIfNeeded(to: .finished)
-                case .badge: setPillBadge(id: agentId, badge: .finished)
+                case .view:
+                    expandIfNeeded(to: .finished)
+                    #if !APPSTORE
+                    stopTold = true
+                    #endif
+                case .badge:
+                    setPillBadge(id: agentId, badge: .finished)
+                    #if !APPSTORE
+                    stopTold = true
+                    #endif
                 case .none: break
                 }
             }
+            #if !APPSTORE
+            if let key = cmuxKey { cmuxStopRecord.stop(key, told: stopTold) }
+            #endif
             DispatchQueue.main.asyncAfter(deadline: .now() + 5.2) {
                 #if !APPSTORE
                 if let key = cmuxKey, CmuxRouting.isCmuxTaskId(agentId) {
@@ -789,6 +847,10 @@ final class HookServer: @unchecked Sendable {
             }
 
         case "StopFailure":
+            nbLog("StopFailure \(isExternalAgent ? agentId : projectName)")
+            #if !APPSTORE
+            if let key = cmuxKey { cmuxStopRecord.stopFailed(key) }
+            #endif
             RecapStore.shared.stop(sessionId: recapSessionId)
             setTaskState(agentId, .error, cmuxKey: cmuxKey)
             SoundEngine.shared.play("error")
@@ -825,6 +887,7 @@ final class HookServer: @unchecked Sendable {
                 let now = Date().timeIntervalSinceReferenceDate
                 cmuxEndedAt = cmuxEndedAt.filter { now - $0.value < CmuxRouting.endedGrace * 6 }
                 if cmuxEndedAt.count < 64 { cmuxEndedAt[key] = now }
+                cmuxStopRecord.forget(key)
                 forgetCmuxSurface(key, wasFocused: state.focusId == agentId)
                 requestCmuxDiscovery()
                 RecapStore.shared.sessionEnd(sessionId: recapSessionId)
@@ -1762,6 +1825,7 @@ final class HookServer: @unchecked Sendable {
         let state = AppState.shared
         for cardId in cmuxQueue.removeAll(surfaceKey: key) { dropCmuxHeld(cardId, leftOpen: false) }
         cmuxOpenDialogs[key] = nil
+        cmuxStopRecord.forget(key)
         state.cmuxTranscripts[key] = nil
         // Through the path that refreshes an open field; the draft typed before the session was resolved goes too.
         let closed = PromptSlot.Content.cmuxReply(taskId: taskId, surfaceKey: key)
@@ -1916,7 +1980,10 @@ final class HookServer: @unchecked Sendable {
         pruneStaleCmux()
         // Registry entries whose pill is gone (late event after SessionEnd) must not count toward the cap.
         let live = Set(state.tasks.map { $0.id })
-        for stale in cmuxRegistry.taskIds where !live.contains(stale) { cmuxRegistry.remove(taskId: stale) }
+        for stale in cmuxRegistry.taskIds where !live.contains(stale) {
+            for s in cmuxRegistry.surfaces(ofTask: stale) { cmuxStopRecord.forget(s.key) }
+            cmuxRegistry.remove(taskId: stale)
+        }
         let idle = CmuxRouting.evictableIdle(
             Set(state.tasks.filter { CmuxRouting.isCmuxTaskId($0.id) && $0.state == .idle }.map { $0.id }),
             openReplyTask: openCmuxReplyTask())

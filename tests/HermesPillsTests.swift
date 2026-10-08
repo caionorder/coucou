@@ -59,6 +59,12 @@ enum HermesPillsTests {
               HermesPills.reconcile(existingIds: ["integration_claude", "agent_cmux_1", "agent_codex"], agents: []).remove, [])
         check("no agents adds nothing", HermesPills.reconcile(existingIds: [], agents: []).add.count, 0)
 
+        print("progress sent to the iPhone")
+        let hp = HermesPills.publishedProgress(taskId: "agent_hermes_alfred", stepIndex: 6, stepCount: 7)
+        check("a Hermes pill sends no step numbers", [hp.stepIndex, hp.stepCount], [0, 0])
+        let cp = HermesPills.publishedProgress(taskId: "agent_cmux_w1", stepIndex: 6, stepCount: 7)
+        check("another pill keeps its numbers", [cp.stepIndex, cp.stepCount], [6, 7])
+
         print("subtitle")
         check("profile", HermesPills.subtitle(profile: "work", baseURL: "https://a.example.com"), "Hermes · work")
         check("default profile shows host", HermesPills.subtitle(profile: "default", baseURL: "https://a.example.com"), "Hermes · a.example.com")

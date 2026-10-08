@@ -185,13 +185,16 @@ struct SessionSnapshot: Equatable {
                 ? (question?.questions.map(\.question).joined(separator: "\n") ?? "")
                 : ""
             let payload = task.state == .question ? question.map(QuestionPayload.init(ask:)) : nil
+            // The rows of a Hermes turn are for the overview card of the notch only: they never leave the Mac.
+            let isHermes = HermesPills.isTaskId(task.id)
+            let progress = HermesPills.publishedProgress(taskId: task.id, stepIndex: task.stepIndex, stepCount: task.steps.count)
             result[task.id] = SessionSnapshot(
                 pillId: task.id,
                 name: PhoneText.english(task.name),
                 color: task.color,
                 state: task.state.rawValue,
-                stepIndex: task.stepIndex,
-                steps: task.steps.map(PhoneText.english),
+                stepIndex: progress.stepIndex,
+                steps: isHermes ? [] : task.steps.map(PhoneText.english),
                 cwd: task.sessionCwd ?? "",
                 finalLine: task.finalLine ?? "",
                 approvalTool: hasApproval ? (approval?.tool ?? "") : "",
