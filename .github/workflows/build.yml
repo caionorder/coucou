@@ -42,6 +42,9 @@ jobs:
       - name: Test chat parsing
         run: bash scripts/test-chat-parsing.sh
 
+      - name: Test chat answer style
+        run: bash scripts/test-chat-answer-style.sh
+
       - name: Test Hermes chat
         run: bash scripts/test-hermes-chat.sh
 

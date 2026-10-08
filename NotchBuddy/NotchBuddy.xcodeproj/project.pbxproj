@@ -145,6 +145,7 @@
 		8173F93555ED400954AA1CB3 /* AboutView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 097F57179CC066459E64303A /* AboutView.swift */; };
 		818E87607FD9F0CA5406BF35 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = B2AA83D80260660475FAB052 /* Localizable.xcstrings */; };
 		82E72E0AFCAB192D98AB2004 /* MochiActivityState.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE18399D1CD69468CCF57966 /* MochiActivityState.swift */; };
+		83BE3359D395EDBB8C8E9C8B /* ChatAnswerStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = F51854768E2E2616FD2ECE4B /* ChatAnswerStyle.swift */; };
 		845D762E9F4F0AD0D5FCEDF4 /* BotEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 66E6F5FC81429871B6F766A8 /* BotEngine.swift */; };
 		862CE6CB220D55E46F646DA9 /* GitHubPulse.swift in Sources */ = {isa = PBXBuildFile; fileRef = F8D3AD61802A32C4833F3EDA /* GitHubPulse.swift */; };
 		868E3EB4A275AA2394EA20BF /* CoucouWidgets.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 5C3E2269A202B640E7F3B5E0 /* CoucouWidgets.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
@@ -195,6 +196,7 @@
 		A8DE03387E75846A62B3A3D0 /* HermesSignInNet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 480F129573A8C1E0A43E0573 /* HermesSignInNet.swift */; };
 		A982ED4CF79164347630CCA2 /* ChatHeight.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA7253DA9DE7185F453F8448 /* ChatHeight.swift */; };
 		A9F602EC0D755DD774F99C9F /* HermesAnnounce.swift in Sources */ = {isa = PBXBuildFile; fileRef = 89F4DECD196F6A3277925E93 /* HermesAnnounce.swift */; };
+		AB842EA92A79F4C9F92770FC /* ChatAnswerStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = F51854768E2E2616FD2ECE4B /* ChatAnswerStyle.swift */; };
 		AD94156F1F9CFF62B35202FB /* ApprovalRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD426E81DF79CA79888059D9 /* ApprovalRelay.swift */; };
 		ADB4EF797FBD6CC90F8D25D3 /* MochiActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 323F242B14A61A7C071EC115 /* MochiActivityAttributes.swift */; };
 		ADBB9C15DDA4044625B325BE /* MochiOutfitDrawing.swift in Sources */ = {isa = PBXBuildFile; fileRef = E84E5D91129352E8A1D32AA4 /* MochiOutfitDrawing.swift */; };
@@ -465,6 +467,7 @@
 		F1BD8F3CAA60CF37640759E1 /* NotchBuddyApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotchBuddyApp.swift; sourceTree = "<group>"; };
 		F4263B550838CC5614569D13 /* ClaudePlanCardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClaudePlanCardView.swift; sourceTree = "<group>"; };
 		F4A13AEE6E06F46CEC9D908C /* UserIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UserIdentity.swift; sourceTree = "<group>"; };
+		F51854768E2E2616FD2ECE4B /* ChatAnswerStyle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatAnswerStyle.swift; sourceTree = "<group>"; };
 		F767D5651FFD45E956A57D4A /* CmuxRouting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CmuxRouting.swift; sourceTree = "<group>"; };
 		F86B99CF65C5E4BC887888C6 /* Haptics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Haptics.swift; sourceTree = "<group>"; };
 		F8D3AD61802A32C4833F3EDA /* GitHubPulse.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitHubPulse.swift; sourceTree = "<group>"; };
@@ -496,6 +499,7 @@
 				A29F4C0B02BE91654D02AA0C /* BotCanvasView.swift */,
 				3104222B3F17BA5E8DEA5277 /* CalcomPoller.swift */,
 				A038EA6D5F6318D76F322E0F /* CardInputLock.swift */,
+				F51854768E2E2616FD2ECE4B /* ChatAnswerStyle.swift */,
 				7B39D07E5491EDD97725495D /* ChatConversations.swift */,
 				D797CC384B5BC70D34F121BC /* ChatMarkdown.swift */,
 				BFE88A53AEAA637F866D479D /* ChatMarkdownView.swift */,
@@ -896,6 +900,7 @@
 				845D762E9F4F0AD0D5FCEDF4 /* BotEngine.swift in Sources */,
 				4F1E0B3C838DA3CD6F864BC0 /* CalcomPoller.swift in Sources */,
 				438C4BD2D0FFE15A9CE2A51C /* CardInputLock.swift in Sources */,
+				83BE3359D395EDBB8C8E9C8B /* ChatAnswerStyle.swift in Sources */,
 				45EB65019DC3ACD71B5483A6 /* ChatConversations.swift in Sources */,
 				7C58A651768B1A4823A6C3A8 /* ChatHeight.swift in Sources */,
 				8FC5907E9506DC79EB1DDC3C /* ChatMarkdown.swift in Sources */,
@@ -1074,6 +1079,7 @@
 				B314F09AD7924387D0E04B45 /* BotEngine.swift in Sources */,
 				1969590AFEE6CB21404346F1 /* CalcomPoller.swift in Sources */,
 				1737FCE04D9397DC468D2C2B /* CardInputLock.swift in Sources */,
+				AB842EA92A79F4C9F92770FC /* ChatAnswerStyle.swift in Sources */,
 				BE47D560EC0ABE02BAD686D4 /* ChatConversations.swift in Sources */,
 				BE130B62EC2007B675310794 /* ChatHeight.swift in Sources */,
 				B2D86BE268D6F4C86BD0C446 /* ChatMarkdown.swift in Sources */,
