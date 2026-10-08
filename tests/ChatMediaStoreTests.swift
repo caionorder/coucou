@@ -270,8 +270,10 @@ enum ChatMediaStoreTests {
         if let big = makePNG(width: 3000, height: 2000) {
             defer { try? fm.removeItem(at: big) }
             let decoded = ChatMediaStore.decode(big)
-            let longSide = decoded.map { max($0.thumbnail.representations.first?.pixelsWide ?? 0, $0.thumbnail.representations.first?.pixelsHigh ?? 0) } ?? 0
-            checkTrue("04 a thumbnail is decoded at twice the drawn size (600 px), not 1600", longSide == 600 && decoded?.pixels == CGSize(width: 3000, height: 2000))
+            // The image is made at half its pixels (2x), so its size gives the pixels without asking a representation,
+            // which a machine with no screen may not report.
+            let longSide = decoded.map { Int((max($0.thumbnail.size.width, $0.thumbnail.size.height) * 2).rounded()) } ?? 0
+            check("04 a thumbnail is decoded at twice the drawn size (600 px), not 1600", "\(longSide) \(decoded?.pixels ?? .zero)", "600 \(CGSize(width: 3000, height: 2000))")
         } else {
             checkTrue("04 could not make the test picture", false)
         }
