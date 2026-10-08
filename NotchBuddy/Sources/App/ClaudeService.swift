@@ -595,6 +595,7 @@ final class ClaudeService {
         conversations.mutateIfPresent(id) { $0.turns[turnId] = HermesTurn(task: nil, hasText: false) }
         refreshHermesTyping(state)
         state.setHermesPillBusy(agentName: agent.name, true)
+        let pillTurn = state.beginHermesPillTurn(agentName: agent.name)
         defer { state.setHermesPillBusy(agentName: agent.name, false) }
         let startedAt = Date()
         appendAppLog("nb.log", "hermes turn started signIn=\(signIn)")
@@ -615,6 +616,11 @@ final class ClaudeService {
             // text or the first row hides the typing dots.
             let onTurn: @MainActor (String?, [ChatSegment]?) -> Void = { visible, segments in
                 if visible?.isEmpty == false || segments?.isEmpty == false { firstText() }
+                // The overview card of this agent's pill follows the rows while the turn runs: a turn that already
+                // ended (cancelled, cleared) writes nothing there.
+                if let segments, self.conversations[id].turns[turnId] != nil {
+                    state.setHermesPillRows(agentName: agent.name, turn: pillTurn, segments: segments)
+                }
                 state.updateChat(id, createIfMissing: false) { h in
                     guard let idx = h.firstIndex(where: { $0.id == msgId }) else { return }
                     if let visible { h[idx].content = visible }
@@ -640,10 +646,13 @@ final class ClaudeService {
             let final = try await task.value
             conversations.mutateIfPresent(id) { $0.turns[turnId] = nil }
             guard isCurrent(id, generation: generation) else {
+                state.endHermesPillTurn(agentName: agent.name, turn: pillTurn, finished: false)
                 appendAppLog("nb.log", "hermes turn discarded (conversation cleared) after=\(Self.seconds(since: startedAt))s")
                 refreshHermesTyping(state)
                 return
             }
+            // The rows already end with the answer (the last publish sealed it): nothing is added from the returned text.
+            state.endHermesPillTurn(agentName: agent.name, turn: pillTurn, finished: true)
             conversations.mutateIfPresent(id) { $0.messages.append(["role": "assistant", "content": final]) }
             state.updateChat(id, createIfMissing: false) { h in
                 if let idx = h.firstIndex(where: { $0.id == msgId }) { h[idx].content = final }
@@ -658,10 +667,12 @@ final class ClaudeService {
             guard isCurrent(id, generation: generation) else {
                 // Cleared meanwhile: leave the new conversation alone, only stop the typing dots
                 // when no newer Hermes request is still waiting for its first text.
+                state.endHermesPillTurn(agentName: agent.name, turn: pillTurn, finished: false)
                 appendAppLog("nb.log", "hermes turn discarded (conversation cleared) after=\(Self.seconds(since: startedAt))s")
                 refreshHermesTyping(state)
                 return
             }
+            state.endHermesPillTurn(agentName: agent.name, turn: pillTurn, finished: false)
             // Remove this turn's own message: a sibling turn may have added its own after it.
             conversations.mutateIfPresent(id) { c in
                 if let own = c.messages.lastIndex(where: { ($0["role"] as? String) == "user" && ($0["content"] as? String) == userText }) {

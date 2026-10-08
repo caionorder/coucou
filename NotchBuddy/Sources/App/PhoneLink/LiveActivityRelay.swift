@@ -394,16 +394,18 @@ final class LiveActivityRelay {
         guard let lead = ranked.min(by: { $0.1 < $1.1 }) else { return nil }
         let (task, urgency) = lead
         let others = ranked.filter { $0.0.id != task.id && $0.1 <= 3 }.count
+        // Same as SessionPublisher: the rows of a Hermes pill never leave the Mac, nor do their numbers.
+        let progress = HermesPills.publishedProgress(taskId: task.id, stepIndex: task.stepIndex, stepCount: task.steps.count)
         return MochiActivityState(
             pillId: task.id,
             agent: PillCatalog.definition(for: task.id)?.name ?? "Agent",
             color: task.color,
             state: (urgency == 0 ? BotState.approval : task.state).rawValue,
             statusText: MochiActivityState.statusText(state: task.state, urgency: urgency,
-                                                      stepIndex: task.stepIndex, stepCount: task.steps.count),
+                                                      stepIndex: progress.stepIndex, stepCount: progress.stepCount),
             tone: MochiActivityState.tone(urgency: urgency),
-            stepIndex: max(0, task.stepIndex),
-            stepCount: task.steps.count,
+            stepIndex: max(0, progress.stepIndex),
+            stepCount: progress.stepCount,
             others: others,
             approval: approval?.pillId == task.id ? approval.map(ApprovalRelay.fingerprint) : nil)
     }

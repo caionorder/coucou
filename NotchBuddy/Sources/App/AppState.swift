@@ -165,6 +165,7 @@ final class AppState: ObservableObject {
         chatHistories.remove(id)
         ClaudeService.shared.clearConversation(id)
         // Cancelled turns end by themselves and release their own count in `hermesTurnsRunning`.
+        if let name = id.hermesAgent { clearHermesPillCard(agentName: name) }
         if let name = id.hermesAgent, let pill = HermesPills.taskIds(for: hermesAgents.map { $0.name })[name],
            let i = tasks.firstIndex(where: { $0.id == pill }) { tasks[i].pillBadge = nil }
     }
@@ -176,6 +177,7 @@ final class AppState: ObservableObject {
     private func discardHermesConversations(of names: [String]) {
         for name in names {
             chatHistories.remove(.hermes(name))
+            hermesCards[name]?.discard()
             ClaudeService.shared.dropConversation(.hermes(name))
             promptDrafts.clear(.hermesChat(agent: name))
         }
@@ -1045,6 +1047,51 @@ final class AppState: ObservableObject {
               let i = tasks.firstIndex(where: { $0.id == id }) else { return }
         let target: BotState = count > 0 ? .thinking : .idle
         if tasks[i].state != target { tasks[i].state = target }
+    }
+
+    /// The overview card of each Hermes agent across its turns (see `HermesCard`): display only, never persisted.
+    private var hermesCards: [String: HermesCard] = [:]
+
+    /// A turn of this agent starts: the card starts from scratch. The returned number goes with every later call of the turn.
+    func beginHermesPillTurn(agentName: String) -> Int {
+        var card = hermesCards[agentName] ?? HermesCard()
+        let turn = card.start()
+        hermesCards[agentName] = card
+        showHermesCard(agentName)
+        return turn
+    }
+
+    /// The rows of a running turn reach the card of that agent's pill, as ticker lines. Only what the chat already
+    /// shows; the pill of another agent is never touched, and only the newest running turn writes.
+    func setHermesPillRows(agentName: String, turn: Int, segments: [ChatSegment]) {
+        guard hermesCards[agentName] != nil else { return }
+        hermesCards[agentName]?.rows(turn, HermesTicker.lines(from: segments))
+        showHermesCard(agentName)
+    }
+
+    /// A turn of this agent ends. After a success the rows stay (the last one is the answer); a failed or cancelled
+    /// turn, or one whose conversation was cleared, leaves no row.
+    func endHermesPillTurn(agentName: String, turn: Int, finished: Bool) {
+        guard hermesCards[agentName] != nil else { return }
+        hermesCards[agentName]?.end(turn, finished: finished)
+        showHermesCard(agentName)
+    }
+
+    /// The conversation of this agent was cleared: the card empties now, running turns write nothing more.
+    func clearHermesPillCard(agentName: String) {
+        guard hermesCards[agentName] != nil else { return }
+        hermesCards[agentName]?.clear()
+        showHermesCard(agentName)
+    }
+
+    private func showHermesCard(_ agentName: String) {
+        guard let card = hermesCards[agentName],
+              let id = HermesPills.taskIds(for: hermesAgents.map { $0.name })[agentName],
+              let i = tasks.firstIndex(where: { $0.id == id }) else { return }
+        // The index goes with the lines, also for a pill that was created with the default 0 and no row.
+        let index = HermesTicker.stepIndex(forCount: card.lines.count)
+        if tasks[i].steps != card.lines { tasks[i].steps = card.lines }
+        if tasks[i].stepIndex != index { tasks[i].stepIndex = index }
     }
 
     /// Task id of the pill of the active Hermes agent, when the Hermes chat is the selected one.

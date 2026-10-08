@@ -40,6 +40,12 @@ enum HermesPills {
         return id.hasPrefix(taskPrefix) && id.count > taskPrefix.count
     }
 
+    /// The step numbers a pill sends to the iPhone (session list, Live Activity). The rows of a Hermes pill are for the
+    /// overview card of the notch only, so their count and index never leave the Mac.
+    static func publishedProgress(taskId: String, stepIndex: Int, stepCount: Int) -> (stepIndex: Int, stepCount: Int) {
+        isTaskId(taskId) ? (0, 0) : (stepIndex, stepCount)
+    }
+
     /// Lowercase a-z, 0-9 and dash only, capped. A name with none of them (e.g. only symbols) gets
     /// `x` plus a hash of the name, so every name has a usable key.
     static func sanitize(_ name: String) -> String {

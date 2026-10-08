@@ -1382,9 +1382,15 @@ enum CmuxRoutingTests {
         rm.remove(taskId: "P")
         check("remove(taskId:) removes every surface of the pill", rm.surfaces.isEmpty && rm.surface(for: "P") == nil && rm.mainKeys.isEmpty)
         var cap = CmuxRegistry()
-        for i in 0..<10 { cap.note(taskId: "P", key: "k\(i)", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", capability: "", sessionId: "", now: Double(i)) }
-        check("a pill holds at most 8 surfaces", cap.surfaces(ofTask: "P").count == CmuxRouting.maxSurfacesPerTask && CmuxRouting.maxSurfacesPerTask == 8)
-        check("a ninth discovered surface is refused", cap.noteDiscovered(taskId: "P", key: "kx", surfaceId: "S", workspaceId: "W", socketPath: "", sessionId: "", title: nil, index: nil, startedAt: nil, now: 1) == false)
+        for i in 0..<26 { cap.note(taskId: "P", key: "k\(i)", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", capability: "", sessionId: "", now: Double(i)) }
+        check("a pill holds at most 24 surfaces", cap.surfaces(ofTask: "P").count == CmuxRouting.maxSurfacesPerTask && CmuxRouting.maxSurfacesPerTask == 24)
+        check("a 25th discovered surface is refused", cap.noteDiscovered(taskId: "P", key: "kx", surfaceId: "S", workspaceId: "W", socketPath: "", sessionId: "", title: nil, index: nil, startedAt: nil, now: 1) == false)
+        check("10 live sessions of one workspace are all registered (the 9th and 10th used to be dropped)", {
+            var ten = CmuxRegistry()
+            for i in 0..<10 { ten.note(taskId: "P", key: "k\(i)", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", capability: "", sessionId: "", now: Double(i)) }
+            return ten.surfaces(ofTask: "P").count == 10 && ten.surface(key: "k9") != nil
+        }())
+        check("a 26th noted session is refused and the first 24 stay", cap.surface(key: "k25") == nil && cap.surface(key: "k23") != nil)
         var ev2 = CmuxRegistry()
         for p in 1...13 { for s in 0..<2 { ev2.note(taskId: "p\(p)", key: "p\(p)s\(s)", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", capability: "", sessionId: "", now: Double(p)) } }
         check("eviction counts pills, not surfaces", ev2.evictionCandidates(idle: ev2.taskIds, keep: "p13") == ["p1"])
@@ -1479,7 +1485,7 @@ enum CmuxRoutingTests {
         check("the tree moves the entry to its workspace's pill", ph.pillId(forKey: "k") == "agent_cmux_W2" && ph.taskIds == ["agent_cmux_W2"])
         check("the old pill has no main surface left, the new one has it", ph.surface(for: "agent_cmux_W1") == nil && ph.surface(for: "agent_cmux_W2")?.key == "k")
         var fullPill = CmuxRegistry()
-        for i in 0..<8 { fullPill.note(taskId: "T", key: "f\(i)", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", capability: "t", sessionId: "", now: 1) }
+        for i in 0..<CmuxRouting.maxSurfacesPerTask { fullPill.note(taskId: "T", key: "f\(i)", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", capability: "t", sessionId: "", now: 1) }
         fullPill.note(taskId: "U", key: "m", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", capability: "t", sessionId: "", now: 1)
         check("a move into a full pill is refused", fullPill.noteDiscovered(taskId: "T", key: "m", surfaceId: "S", workspaceId: "W", socketPath: "/x.sock", sessionId: "", title: nil, index: 0, startedAt: nil, now: 2) == false
               && fullPill.pillId(forKey: "m") == "U")
@@ -1574,6 +1580,66 @@ enum CmuxRoutingTests {
         check("not focused: the badge, unless the pill holds a queued card (its approval badge stays)",
               CmuxRouting.alertPlacement(focused: false, cardOfPillOnScreen: false, pillHoldsCard: false) == .badge
               && CmuxRouting.alertPlacement(focused: false, cardOfPillOnScreen: false, pillHoldsCard: true) == .none)
+
+        print("waiting notification")
+        check("idle_prompt is a waiting notification, whatever the message",
+              CmuxRouting.isWaitingNotification(type: "idle_prompt", message: "") && CmuxRouting.isWaitingNotification(type: "IDLE_PROMPT", message: "x"))
+        check("another typed notification is not (permission prompt, elicitation, auth)",
+              !CmuxRouting.isWaitingNotification(type: "permission_prompt", message: "Claude is waiting for your input")
+              && !CmuxRouting.isWaitingNotification(type: "elicitation_dialog", message: "")
+              && !CmuxRouting.isWaitingNotification(type: "auth_success", message: ""))
+        check("untyped: the waiting messages count, a permission message or a question does not",
+              CmuxRouting.isWaitingNotification(type: nil, message: "Claude is waiting for your input")
+              && CmuxRouting.isWaitingNotification(type: "", message: "Waiting for your next prompt")
+              && !CmuxRouting.isWaitingNotification(type: nil, message: "Claude needs your permission to use Bash")
+              && !CmuxRouting.isWaitingNotification(type: nil, message: "Which file?")
+              && !CmuxRouting.isWaitingNotification(type: nil, message: ""))
+        func badge(_ nobody: Bool = true, focused: Bool = false, hasBadge: Bool = false, card: Bool = false, state: String? = "idle") -> Bool {
+            CmuxRouting.waitingNeedsBadge(stopToldNobody: nobody, pillFocused: focused, pillHasBadge: hasBadge, pillHoldsCard: card, sessionState: state)
+        }
+        check("a Stop that told nobody, pill not on screen, session idle: the badge", badge() && badge(state: "finished") && badge(state: nil))
+        check("the Stop told the user (not recorded): no second badge", !badge(false))
+        check("the pill is the focused one, already badged or holding a card: nothing", !badge(focused: true) && !badge(hasBadge: true) && !badge(card: true))
+        check("a session mid turn gets no badge", !badge(state: "working") && !badge(state: "thinking") && !badge(state: "searching"))
+        check("a failed session (error, rate limit) never gets the finished badge", !badge(state: "error") && !badge(state: "ratelimit"))
+
+        print("stop told nobody record")
+        var rec = CmuxStopRecord()
+        check("a session never recorded is not a candidate (fresh session, session that never stopped)", !rec.toldNobody("a"))
+        rec.stop("a", told: false)
+        check("a Stop that told nobody is recorded", rec.toldNobody("a"))
+        rec.stop("a", told: true)
+        check("a Stop that told someone takes it out", !rec.toldNobody("a"))
+        rec.stop("a", told: false)
+        rec.prompt("a")
+        check("the next prompt of the session takes it out", !rec.toldNobody("a"))
+        rec.stop("a", told: false)
+        rec.gaveWaitingBadge("a")
+        check("a waiting badge is given once per idle period (a second notification finds nothing)", !rec.toldNobody("a"))
+        rec.stop("a", told: false)
+        rec.stopFailed("a")
+        check("a StopFailure takes it out: a failed session gets no finished badge", !rec.toldNobody("a"))
+        rec.stop("a", told: false)
+        rec.forget("a")
+        check("a forgotten surface leaves the record", !rec.toldNobody("a"))
+        var fullRec = CmuxStopRecord()
+        for i in 0..<CmuxStopRecord.capacity { fullRec.stop("k\(i)", told: false) }
+        fullRec.stop("extra", told: false)
+        check("a full record refuses a new key (no badge instead of an extra one)", !fullRec.toldNobody("extra") && fullRec.toldNobody("k0"))
+        fullRec.forget("k0")
+        fullRec.stop("extra", told: false)
+        check("a freed place takes the key", fullRec.toldNobody("extra"))
+        check("the record is sized for every session the registry can hold", CmuxStopRecord.capacity >= CmuxRouting.maxTasks * CmuxRouting.maxSurfacesPerTask)
+
+        print("silent stop badge")
+        func silent(focused: Bool = false, screen: Bool = false, holds: Bool = false, hasBadge: Bool = false) -> CmuxRouting.AlertPlacement {
+            CmuxRouting.silentStopPlacement(pillFocused: focused, cardOfPillOnScreen: screen, pillHoldsCard: holds, pillHasBadge: hasBadge)
+        }
+        check("a helper that stops while a sibling works gives the finished badge of its pill at once", silent() == .badge)
+        check("the focused pill shows no badge (its row is not drawn in the pill grid): nothing", silent(focused: true) == .none)
+        check("a card of the pill on screen or held keeps the screen and the approval badge", silent(screen: true) == .none && silent(holds: true) == .none)
+        check("a pill that already has a badge keeps it", silent(hasBadge: true) == .none)
+        check("a silent stop never takes the view", silent() != .view && silent(focused: true) != .view)
 
         // ── Aegis F4: a heard session does not outlive its process ──
         print("time rule")
