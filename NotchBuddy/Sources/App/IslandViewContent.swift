@@ -98,7 +98,7 @@ struct OverviewView: View {
                                     .truncationMode(.tail)
                                 }
                                 Spacer(minLength: 2)
-                                if agent.steps.count > 1 {
+                                if agent.steps.count > 1, !HermesPills.isTaskId(agent.id) {
                                     Text("\(min(agent.stepIndex + 1, agent.steps.count))/\(agent.steps.count)")
                                         .font(.system(size: 11))
                                         .foregroundColor(Color(hex: "#6B7079"))
@@ -3705,6 +3705,7 @@ struct TickerView: View {
 
     @State private var displayIndex: Int = -1
     @State private var isTransitioning = false
+    @State private var hermesSettle = 0   // Hermes pills: counts the ends of a transition
 
     private let completedScale: CGFloat = 11.5 / 13   // 0.885 — matches completed font size
 
@@ -3757,6 +3758,7 @@ struct TickerView: View {
             }
         }
         .onChange(of: task?.steps.count) { _, _ in
+            guard !isHermesCard else { return }   // a Hermes pill is followed by the signature below
             guard let task, !task.steps.isEmpty, !isTransitioning else { return }
             let newIdx = task.stepIndex
             if displayIndex < 0 {
@@ -3767,6 +3769,37 @@ struct TickerView: View {
             }
             guard newIdx != displayIndex else { return }
             tickerAnimate(to: newIdx)
+        }
+        // Hermes pills only (nil for every other pill, so this never fires for them): the card follows the count and
+        // the last line, and asks again when a transition ends (`hermesSettle`).
+        .onChange(of: hermesSignature) { _, _ in hermesSync() }
+        .onChange(of: hermesSettle) { _, _ in hermesSync() }
+    }
+
+    private var isHermesCard: Bool { HermesPills.isTaskId(task?.id) }
+
+    private var hermesSignature: HermesTicker.Signature? {
+        guard isHermesCard, let task else { return nil }
+        return HermesTicker.Signature(count: task.steps.count, last: task.steps.last)
+    }
+
+    /// What the card of a Hermes pill shows for its list now: the placeholder when empty, the new row otherwise.
+    private func hermesSync() {
+        guard isHermesCard, let task else { return }
+        switch HermesTicker.tickerPlan(count: task.steps.count, shownIndex: displayIndex, shownLast: rowB,
+                                       last: task.steps.last, transitioning: isTransitioning) {
+        case .nothing:
+            return
+        case .placeholder:
+            displayIndex = -1
+            rowA = "…"
+            rowB = "…"
+        case .show(let idx):
+            displayIndex = idx
+            rowA = idx > 0 ? steps[max(0, idx - 1)] : "…"
+            rowB = steps[min(idx, steps.count - 1)]
+        case .animate(let idx):
+            tickerAnimate(to: idx)
         }
     }
 
@@ -3805,6 +3838,7 @@ struct TickerView: View {
             self.rowCOffset      = 44
             self.rowCOpacity     = 0
             self.isTransitioning = false
+            if self.isHermesCard { self.hermesSettle += 1 }
         }
     }
 }
