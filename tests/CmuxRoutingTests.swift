@@ -594,6 +594,30 @@ enum CmuxRoutingTests {
         check("UUID under a result wrapper",
               CmuxRouting.workspaceId(forRef: "workspace:10", inListJSON: "{\"result\":\(listJSON)}") == wsUUID)
 
+        // Shapes of workspace.list in cmux 0.64.25 (made up ids and titles): `--id-format uuids` drops `ref`,
+        // `both` and the default keep the UUID id and add the ref.
+        let itemA = "\"id\":\"11111111-1111-4111-8111-111111111111\",\"index\":0,\"title\":\"one\",\"current_directory\":\"/x\""
+        let itemB = "\"id\":\"\(wsUUID)\",\"index\":1,\"title\":\"two\",\"current_directory\":\"/y\""
+        let uuidsShape = "{\"window_id\":\"22222222-2222-4222-8222-222222222222\",\"workspaces\":[{\(itemA)},{\(itemB)}]}"
+        let bothShape = "{\"window_id\":\"22222222-2222-4222-8222-222222222222\",\"window_ref\":\"window:1\",\"workspaces\":[{\(itemA),\"ref\":\"workspace:9\"},{\(itemB),\"ref\":\"workspace:10\"}]}"
+        check("UUID: the uuids shape has no ref, nothing else may match (index, title, folder)",
+              CmuxRouting.workspaceId(forRef: "workspace:10", inListJSON: uuidsShape) == nil
+              && CmuxRouting.workspaceId(forRef: "workspace:1", inListJSON: uuidsShape) == nil)
+        check("UUID: the both shape and the default shape resolve by ref",
+              CmuxRouting.workspaceId(forRef: "workspace:10", inListJSON: bothShape) == wsUUID
+              && CmuxRouting.workspaceId(forRef: "workspace:9", inListJSON: bothShape) == "11111111-1111-4111-8111-111111111111")
+        check("workspace.list lookup: asks for ids and refs first, then the default form once, nothing else",
+              CmuxRouting.workspaceListIdFormats == ["both", nil]
+              && CmuxRouting.workspaceListArguments(idFormat: "both") == ["--id-format", "both", "rpc", "workspace.list", "{}"]
+              && CmuxRouting.workspaceListArguments(idFormat: nil) == ["rpc", "workspace.list", "{}"])
+        let token = CmuxPendingLaunch(workspaceId: "", socketPath: "/s.sock", cwd: "/x", prompt: "p", createdAt: 0)
+        check("unresolved launch: a token launch without workspace id is reported, a resolved one and a password one are not",
+              token.cannotBeMatched
+              && !CmuxPendingLaunch(workspaceId: wsUUID, socketPath: "/s.sock", cwd: "/x", prompt: "p", createdAt: 0).cannotBeMatched
+              && !CmuxPendingLaunch(workspaceId: "", socketPath: "", cwd: "/x", prompt: "p", createdAt: 0).cannotBeMatched
+              && !token.matches(workspaceId: wsUUID, socketPath: "/s.sock", isNewTask: true, now: 1)
+              && !token.matchesFolder(cwd: "/x", isNewTask: true, now: 1))
+
         print("sendCredential (its own token only, never the password)")
         var sc = CmuxRegistry()
         sc.note(taskId: "a", surfaceId: "sa", workspaceId: "w", socketPath: "/s.sock", capability: "TA", sessionId: "", now: 10)
