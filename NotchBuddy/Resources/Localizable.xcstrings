@@ -285,6 +285,58 @@
         }
       }
     },
+    "%lld steps" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "variations" : {
+            "plural" : {
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld step"
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld steps"
+                }
+              }
+            }
+          }
+        },
+        "pt-BR" : {
+          "variations" : {
+            "plural" : {
+              "one" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld passo"
+                }
+              },
+              "other" : {
+                "stringUnit" : {
+                  "state" : "translated",
+                  "value" : "%lld passos"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "%lld+ steps" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld+ passos"
+          }
+        }
+      }
+    },
     "%lld/4 slots used" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -428,6 +480,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "IA para o chat"
+          }
+        }
+      }
+    },
+    "answered" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "respondeu"
           }
         }
       }
@@ -4812,6 +4875,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "在分享图片中隐藏项目名称"
+          }
+        }
+      }
+    },
+    "Hide steps" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ocultar passos"
           }
         }
       }
@@ -10093,6 +10167,17 @@
         }
       }
     },
+    "Show steps" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mostrar passos"
+          }
+        }
+      }
+    },
     "Shows your Claude plan usage (5-hour and weekly limits) in the notch header. Coucou adds a status line relay to ~/.claude/settings.json. If you already have a status line, it keeps working as before. Pro and Max plans only." : {
       "extractionState" : "manual",
       "localizations" : {
@@ -10417,6 +10502,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "启动"
+          }
+        }
+      }
+    },
+    "step %lld" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "passo %lld"
           }
         }
       }
@@ -11915,6 +12011,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Workflows"
+          }
+        }
+      }
+    },
+    "working…" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "trabalhando…"
           }
         }
       }
