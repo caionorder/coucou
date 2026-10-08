@@ -29,6 +29,62 @@ enum ChatMarkdown {
     static let maxLanguageChars = 40
     static let maxIndentLevel = 6
 
+    // MARK: Bidirectional controls
+
+    private static func isBidiControl(_ u: Unicode.Scalar) -> Bool {
+        (u.value >= 0x202A && u.value <= 0x202E) || (u.value >= 0x2066 && u.value <= 0x2069)
+    }
+
+    /// Drops the embedding, override and isolate characters (U+202A to U+202E, U+2066 to U+2069): in a command they
+    /// make what is shown differ from what is pasted. For display and for the Copy button only: never apply it to
+    /// the stored text or to what is sent back to an agent.
+    static func withoutBidiControls(_ s: String) -> String {
+        guard s.unicodeScalars.contains(where: isBidiControl) else { return s }
+        var out = String.UnicodeScalarView()
+        out.append(contentsOf: s.unicodeScalars.filter { !isBidiControl($0) })
+        return String(out)
+    }
+
+    /// The same, only inside inline code spans (a run of backticks and the next run of the same length). Text outside
+    /// a span, and a span that never closes, are left as they are.
+    static func withoutBidiControlsInCodeSpans(_ s: String) -> String {
+        guard s.unicodeScalars.contains(where: isBidiControl) else { return s }
+        let chars = Array(s)
+        var out = ""
+        var unclosable = Set<Int>()      // opener lengths known to have no closer: a later opener cannot find one either
+        var i = 0
+        while i < chars.count {
+            guard chars[i] == "`" else { out.append(chars[i]); i += 1; continue }
+            // A backtick after an odd run of backslashes is escaped: it is text, not the start of a span.
+            var slashes = 0
+            while slashes < i, chars[i - 1 - slashes] == "\\" { slashes += 1 }
+            if slashes % 2 == 1 { out.append("`"); i += 1; continue }
+            var n = 0
+            while i + n < chars.count, chars[i + n] == "`" { n += 1 }
+            var close: Int?
+            if !unclosable.contains(n) {
+                var j = i + n
+                while j < chars.count {
+                    if chars[j] == "`" {
+                        var m = 0
+                        while j + m < chars.count, chars[j + m] == "`" { m += 1 }
+                        if m == n { close = j; break }
+                        j += m
+                    } else { j += 1 }
+                }
+                if close == nil { unclosable.insert(n) }
+            }
+            out += String(repeating: "`", count: n)
+            if let close {
+                out += withoutBidiControls(String(chars[(i + n)..<close])) + String(repeating: "`", count: n)
+                i = close + n
+            } else {
+                i += n
+            }
+        }
+        return out
+    }
+
     /// `streaming: true` is for a text that is still arriving: it holds back a half written fence marker, shows a
     /// table from its header line on, and closes an open `**`, `` ` `` or `~~` of the last line. A finished text is
     /// parsed with `false` and shown as written.
@@ -54,7 +110,8 @@ enum ChatMarkdown {
                     code.append(removeIndent(lines[i], upTo: fence.indent))
                     i += 1
                 }
-                blocks.append(.codeBlock(lang: fence.lang, code: code.joined(separator: "\n")))
+                // Display and Copy only: the blocks are made from the text each time, the text itself is not touched.
+                blocks.append(.codeBlock(lang: withoutBidiControls(fence.lang), code: withoutBidiControls(code.joined(separator: "\n"))))
                 i += 1
                 continue
             }

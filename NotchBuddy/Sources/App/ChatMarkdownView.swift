@@ -141,7 +141,9 @@ struct ChatMarkdownView: View, Equatable {
         var options = AttributedString.MarkdownParsingOptions(
             interpretedSyntax: .inlineOnlyPreservingWhitespace)
         options.failurePolicy = .returnPartiallyParsedIfPossible
-        var attributed = (try? AttributedString(markdown: text, options: options)) ?? AttributedString(text)
+        // Override and isolate characters inside inline code are dropped for display (code blocks are cleaned by the parser).
+        let shownText = ChatMarkdown.withoutBidiControlsInCodeSpans(text)
+        var attributed = (try? AttributedString(markdown: shownText, options: options)) ?? AttributedString(shownText)
         let strong = bold ?? boldColor
         for run in Array(attributed.runs) {
             if let intent = run.inlinePresentationIntent {

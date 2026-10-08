@@ -163,7 +163,7 @@ struct ChatTurnList: View {
     let streamingLast: Bool
     let typing: Bool
 
-    private func visible(_ m: ChatMessage) -> Bool { !m.content.isEmpty || !m.segments.isEmpty }
+    private func visible(_ m: ChatMessage) -> Bool { m.isShown }
 
     var body: some View {
         let shown = messages.filter(visible)

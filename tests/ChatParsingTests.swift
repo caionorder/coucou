@@ -472,6 +472,37 @@ enum ChatParsingTests {
         check("34c a closed link is unchanged", ChatMarkdown.closeOpenInline("[a](https://x.y)"), "[a](https://x.y)")
         check("34d an opener with nothing after it is dropped", ChatMarkdown.closeOpenInline("a **"), "a ")
         check("34e a ** inside an open code span does not count", ChatMarkdown.closeOpenInline("a `x ** y"), "a `x ** y`")
+        bidiControls()
+    }
+
+    // MARK: - Bidirectional controls in code (display and Copy only)
+
+    private static func bidiControls() {
+        print("ChatMarkdown: override and isolate characters in code")
+        let dirty = "ls\u{202A}\u{202B}\u{202C}\u{202D}\u{202E}\u{2066}\u{2067}\u{2068}\u{2069} -la"
+        check("40 every override, embedding and isolate character is dropped", ChatMarkdown.withoutBidiControls(dirty), "ls -la")
+        check("40b text with none is returned as it is", ChatMarkdown.withoutBidiControls("echo \"héllo\" 😀 \u{200F}x"), "echo \"héllo\" 😀 \u{200F}x")
+        let blocks = ChatMarkdown.parse("```py\u{202E}thon\nrm\u{202E} -rf x\u{2066}\n```")
+        if case .codeBlock(let lang, let code)? = blocks.first {
+            check("41 a code block shown and copied without them: the code", code, "rm -rf x")
+            check("41 ... and the info string", lang, "python")
+        } else { print("  ✗ 41 no code block"); failures += 1 }
+        check("42 inline code span: dropped inside, kept outside",
+              ChatMarkdown.withoutBidiControlsInCodeSpans("run `ls\u{202E}x` now\u{202E}"), "run `lsx` now\u{202E}")
+        check("42b a double backtick span", ChatMarkdown.withoutBidiControlsInCodeSpans("a ``x`\u{2067}y`` b"), "a ``x`y`` b")
+        check("42c an unclosed span is not a span", ChatMarkdown.withoutBidiControlsInCodeSpans("a `b\u{202E}"), "a `b\u{202E}")
+        check("42d two spans", ChatMarkdown.withoutBidiControlsInCodeSpans("`a\u{202E}` and `b\u{2069}`"), "`a` and `b`")
+        check("42e a text with none is returned as it is", ChatMarkdown.withoutBidiControlsInCodeSpans("plain `code`"), "plain `code`")
+        check("42f an escaped backtick opens no span: the real span after it is cleaned",
+              ChatMarkdown.withoutBidiControlsInCodeSpans("\\` then `ls\u{202E}x`"), "\\` then `lsx`")
+        check("42g two backslashes escape themselves: the backtick opens a span",
+              ChatMarkdown.withoutBidiControlsInCodeSpans("\\\\`a\u{202E}b`"), "\\\\`ab`")
+        check("42h three backslashes: the backtick is escaped again, the span after it is cleaned",
+              ChatMarkdown.withoutBidiControlsInCodeSpans("\\\\\\` `c\u{202E}d`"), "\\\\\\` `cd`")
+        let hostile = String(repeating: "`", count: 30_000) + "\u{202E}" + String(repeating: "`a", count: 30_000)
+        let t0 = Date()
+        _ = ChatMarkdown.withoutBidiControlsInCodeSpans(hostile)
+        checkTrue("42f many unclosed backticks stay linear (\(Int(Date().timeIntervalSince(t0) * 1000)) ms)", Date().timeIntervalSince(t0) < 2)
     }
 
     // MARK: - Finish

@@ -22,6 +22,16 @@ enum SafeWebURLTests {
         precondition(safeWebURL("https:example.com") == nil)
         precondition(safeWebURL("//example.com") == nil)
 
-        print("Safe web links: 15 cases passed")
+        // Rejected: a user or a password in front of the host (the link reads as one site and goes to another)
+        precondition(safeWebURL("https://apple.com@evil.example/login") == nil)
+        precondition(safeWebURL("https://apple.com%2Flogin@evil.example/") == nil)
+        precondition(safeWebURL("https://user:secret@example.com") == nil)
+        precondition(safeWebURL("http://:pw@example.com") == nil)
+        precondition(safeWebURL("https://@example.com") == nil)
+        // Still accepted: an @ after the host is part of the path or the query
+        precondition(safeWebURL("https://example.com/@user") != nil)
+        precondition(safeWebURL("https://example.com/a?mail=a@b.c") != nil)
+
+        print("Safe web links: 22 cases passed")
     }
 }

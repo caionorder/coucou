@@ -17,6 +17,21 @@ Routes (prefix is "", "/p/default" or "/p/mark"):
         "longline"       -> one 5000 byte line without a newline
         "bigtext"        -> content frames totalling 3000 characters
         "slow"           -> some content, then keepalive lines for ~8 s
+        "steps"          -> text, a tool (running then completed, real hermes.tool.progress shape), text
+        "steps2"         -> text, two tools, text, one more tool, the answer
+        "steps_off"      -> the same text as "steps" with no named frame at all
+        "approval"       -> text, a named approval.request frame (its command is a marker that must never be read)
+        "long_label"     -> a tool whose label is 5000 characters
+        "status"         -> a named hermes.status frame between two texts
+        "cut_in_tool"    -> text, a tool that starts and never finishes, then the connection closes
+        "think_split"    -> a <think> block that opens before a tool and closes after it, then a second tool and the answer
+        "reuse_id"       -> one toolCallId used by two calls in a row, each with its own text before it
+        "burst"          -> a hundred tool running / completed pairs in one write, then the answer
+        "seq3"           -> three tools in sequence with a pause (0.5 s) before each completion: the next tool starts right after
+                            the previous one ends, as the server does in a round
+        "text_tool"      -> a sentence and the start of a tool in ONE write, a pause, then the completion and the answer
+        "think_open"     -> a <think> that never closes, across two tools, then the answer
+        "think_literal"  -> an answer that names the tag in inline code
         "bigmodels"      -> (GET /big/v1/models) a 100 KB body
 Test control (shared by both endpoints):
   POST /_test/reset                    counters and failures back to zero
@@ -29,6 +44,7 @@ Test control (shared by both endpoints):
         chat_stall: hold the response headers of the next chat_stall_count chat requests for that long
         chat_status: answer every chat request with this status
   GET  /_test/state                    {"models_hits": n, "chat_hits": n}
+  GET  /_test/last_body                the raw JSON body of the last chat request (as the client sent it)
 Wrong/missing key -> 401 gateway_auth_failed. Unknown profile -> 404.
 Response header X-Test-Model echoes the request "model"; X-Test-System is "1" if a system
 message was sent (the client must not send one).
@@ -49,6 +65,14 @@ MODEL_IDS = {"": "hermes-agent", "default": "hermes-agent", "mark": "mark"}
 CONTENT = ["Hello ", "from ", "mark."]
 EXPECTED_RESPONSE = "Hello from mark."
 
+# The text of the "steps" scenarios: what the agent says before a tool, and the answer after it. In the real
+# stream the text after a tool round starts with one blank line (agent/stream_delivery.py "_stream_needs_break").
+STEPS_FIRST = "Let me check the page."
+STEPS_ANSWER = "The page is limited."
+STEPS_TEXT = STEPS_FIRST + "\n\n" + STEPS_ANSWER
+REASONING_MARKER = "REASONING_MARKER_77"
+APPROVAL_MARKER = "rm -rf APPROVAL_COMMAND_MARKER_88"
+
 
 def envelope(message, etype, code):
     return json.dumps({"error": {"message": message, "type": etype, "code": code}}).encode()
@@ -57,6 +81,7 @@ def envelope(message, etype, code):
 LOCK = threading.Lock()
 CONFIG = {}
 COUNTS = {}
+LAST = {"body": b""}
 
 
 def reset():
@@ -66,6 +91,7 @@ def reset():
                        "models_stall": 0, "models_stall_count": 0})
         COUNTS.clear()
         COUNTS.update({"models_hits": 0, "chat_hits": 0})
+        LAST["body"] = b""
 
 
 reset()
@@ -113,6 +139,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/_test/state":
             with LOCK:
                 return self.send_json(200, json.dumps(COUNTS).encode())
+        if path == "/_test/last_body":
+            with LOCK:
+                return self.send_json(200, LAST["body"] or b"{}")
         if path == "/dashboard/v1/models":
             body = b"<html><body>Login</body></html>"
             self.send_response(200)
@@ -166,6 +195,9 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             req = {}
         profile, tail = self.route()
+        if tail == "/v1/chat/completions":
+            with LOCK:
+                LAST["body"] = raw
         if profile == "__unknown__":
             return self.send_json(404, envelope("no such profile", "not_found", "profile_not_found"))
         if tail != "/v1/chat/completions":
@@ -228,12 +260,116 @@ class Handler(BaseHTTPRequestHandler):
             self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
             self.connection.close()
 
+        def tool_running(call_id, tool, label, emoji="🔧"):
+            # The real shape: hermes/gateway/platforms/api_server_openai_routes.py, tool_progress "running".
+            return ("event: hermes.tool.progress\ndata: " + json.dumps(
+                {"tool": tool, "emoji": emoji, "label": label, "toolCallId": call_id, "status": "running"}) + "\n\n")
+
+        def tool_completed(call_id, tool):
+            return ("event: hermes.tool.progress\ndata: " + json.dumps(
+                {"tool": tool, "toolCallId": call_id, "status": "completed"}) + "\n\n")
+
+        own_stream = ("steps", "steps2", "steps_off", "approval", "long_label", "status", "cut_in_tool", "think_split", "reuse_id", "burst",
+                      "seq3", "text_tool", "think_open", "think_literal")
         try:
             emit(chunk({"role": "assistant"}))
             emit(": keepalive\n\n")
-            emit("event: hermes.tool.progress\ndata: " + json.dumps({"tool": "terminal", "status": "running"}) + "\n\n")
-            emit(chunk({"reasoning_content": "thinking about it"}))
-            if last_user == "fail":
+            if last_user not in own_stream:
+                emit(tool_running("call_1", "terminal", "curl -s localhost", "💻"))
+                emit(chunk({"reasoning_content": "thinking about it"}))
+            if last_user == "steps" or last_user == "steps_off":
+                emit(chunk({"reasoning_content": REASONING_MARKER}))
+                emit(chunk({"content": STEPS_FIRST}))
+                if last_user == "steps":
+                    emit(tool_running("call_1", "terminal", "curl -s graph.facebook.com/v19.0/me", "💻"))
+                    emit(tool_completed("call_1", "terminal"))
+                emit(chunk({"content": "\n\n" + STEPS_ANSWER}))
+                emit(chunk({}, "stop", usage={"total_tokens": 3}))
+            elif last_user == "steps2":
+                emit(chunk({"content": "Let me check the page."}))
+                emit(tool_running("call_1", "terminal", "curl -s graph.facebook.com/v19.0/me", "💻"))
+                emit(tool_completed("call_1", "terminal"))
+                emit(chunk({"content": "\n\nThe restriction has an unlock date. Checking the queue."}))
+                emit(tool_running("call_2", "mongo_query", "automations-flow, last 48h", "🗄️"))
+                emit(tool_completed("call_2", "mongo_query"))
+                emit(chunk({"content": "\n\n**Yes.** The page is *limited* now."}))
+                emit(chunk({}, "stop", usage={"total_tokens": 3}))
+            elif last_user == "approval":
+                emit(chunk({"content": "I need to run a command."}))
+                emit("event: approval.request\ndata: " + json.dumps(
+                    {"event": "approval.request", "run_id": "chatcmpl-1", "command": APPROVAL_MARKER, "description": "danger",
+                     "session_id": "s1", "timestamp": 1.0, "choices": ["once", "deny"]}) + "\n\n")
+                emit(chunk({"content": "\n\nWaiting."}))
+                emit(chunk({}, "stop"))
+            elif last_user == "long_label":
+                emit(chunk({"content": "Working."}))
+                emit(tool_running("call_1", "terminal", "L" * 5000))
+                emit(tool_completed("call_1", "terminal"))
+                emit(chunk({"content": "\n\nDone."}))
+                emit(chunk({}, "stop"))
+            elif last_user == "status":
+                emit(chunk({"content": "Before."}))
+                emit("event: hermes.status\ndata: " + json.dumps({"kind": "wait", "text": "STATUS_MARKER_99 waiting"}) + "\n\n")
+                emit(chunk({"content": " After."}))
+                emit(chunk({}, "stop"))
+            elif last_user == "cut_in_tool":
+                emit(chunk({"content": "Starting."}))
+                emit(tool_running("call_1", "terminal", "sleep 100"))
+                return
+            elif last_user == "think_split":
+                emit(chunk({"content": "Hello. <think>plan part one"}))
+                emit(tool_running("call_1", "terminal", "ls", "💻"))
+                emit(tool_completed("call_1", "terminal"))
+                emit(chunk({"content": "\n\nplan part two</think>Mid text."}))
+                emit(tool_running("call_2", "terminal", "ls", "💻"))
+                emit(tool_completed("call_2", "terminal"))
+                emit(chunk({"content": "\n\nAnswer."}))
+                emit(chunk({}, "stop"))
+            elif last_user == "reuse_id":
+                emit(chunk({"content": "First."}))
+                emit(tool_running("same", "terminal", "ls", "💻"))
+                emit(tool_completed("same", "terminal"))
+                emit(chunk({"content": "\n\nAgain."}))
+                emit(tool_running("same", "terminal", "ls", "💻"))
+                emit(tool_completed("same", "terminal"))
+                emit(chunk({"content": "\n\nAnswer."}))
+                emit(chunk({}, "stop"))
+            elif last_user == "burst":
+                # One write: the client reads the hundred pairs inside a single refresh window.
+                emit("".join(tool_running("b%d" % i, "terminal", "step %d" % i) + tool_completed("b%d" % i, "terminal") for i in range(100)))
+                emit(chunk({"content": "Burst done."}))
+                emit(chunk({}, "stop"))
+            elif last_user == "seq3":
+                emit(chunk({"content": "Look."}))
+                emit(tool_running("s1", "terminal", "one", "💻"))
+                emit(tool_completed("s1", "terminal"))
+                emit(tool_running("s2", "terminal", "two", "💻"))
+                time.sleep(0.5)
+                emit(tool_completed("s2", "terminal"))
+                emit(tool_running("s3", "terminal", "three", "💻"))
+                time.sleep(0.5)
+                emit(tool_completed("s3", "terminal"))
+                emit(chunk({"content": "\n\nAnswer."}))
+                emit(chunk({}, "stop"))
+            elif last_user == "text_tool":
+                emit(chunk({"content": "Sentence."}) + tool_running("w1", "terminal", "work", "💻"))
+                time.sleep(0.6)
+                emit(tool_completed("w1", "terminal"))
+                emit(chunk({"content": "\n\nAnswer."}))
+                emit(chunk({}, "stop"))
+            elif last_user == "think_open":
+                emit(chunk({"content": "Hi. <think>plan"}))
+                emit(tool_running("o1", "terminal", "ls", "💻"))
+                emit(tool_completed("o1", "terminal"))
+                emit(chunk({"content": "\n\nMore."}))
+                emit(tool_running("o2", "terminal", "ls", "💻"))
+                emit(tool_completed("o2", "terminal"))
+                emit(chunk({"content": "\n\nAnswer."}))
+                emit(chunk({}, "stop"))
+            elif last_user == "think_literal":
+                emit(chunk({"content": "Use the `<think>` tag for reasoning. Then answer."}))
+                emit(chunk({}, "stop"))
+            elif last_user == "fail":
                 emit(chunk({}, "error", error={"message": "boom"}))
             elif last_user == "content_error":
                 emit(chunk({"content": "Partial "}))
@@ -262,6 +398,7 @@ class Handler(BaseHTTPRequestHandler):
                     emit(": keepalive\n\n")
                     time.sleep(0.05)
             else:
+                emit(tool_completed("call_1", "terminal"))
                 for piece in CONTENT:
                     emit(chunk({"content": piece}))
                 emit(chunk({}, "stop", usage={"total_tokens": 3}))

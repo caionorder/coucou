@@ -583,16 +583,7 @@ final class ClaudeService {
         let id = ConversationID.hermes(agent.name)
         let generation = ensureConversation(id)
         // No system message: Hermes layers it over the agent's own prompt.
-        var msgs: [[String: Any]] = []
-        for m in conversations[id].messages {
-            var simplified = m
-            if let content = m["content"] as? [[String: Any]],
-               let textBlock = content.first(where: { ($0["type"] as? String) == "text" }),
-               let text = textBlock["text"] as? String {
-                simplified["content"] = text
-            }
-            msgs.append(simplified)
-        }
+        var msgs = HermesChat.requestMessages(from: conversations[id].messages)
         let userText = openAIUserText(query: query, context: context, inlineFiles: true, firstTurn: conversations[id].messages.isEmpty)
         msgs.append(["role": "user", "content": userText])
         conversations.mutateIfPresent(id) { $0.messages.append(["role": "user", "content": userText]) }
@@ -611,15 +602,23 @@ final class ClaudeService {
         let encodedBody = signIn ? Data() : ((try? JSONSerialization.data(withJSONObject: body)) ?? Data())
         let storedSession = conversations[id].serverSession
         let task = Task { [state, msgId] () async throws -> String in
-            let onToken: @MainActor (String) -> Void = { visible in
-                if !visible.isEmpty, self.conversations[id].turns[turnId]?.hasText == false {
+            let firstText: @MainActor () -> Void = {
+                if self.conversations[id].turns[turnId]?.hasText == false {
                     // hide typing dots once no turn waits for text
                     self.conversations.mutateIfPresent(id) { $0.turns[turnId]?.hasText = true }
                     appendAppLog("nb.log", "hermes turn first text after=\(Self.seconds(since: startedAt))s")
                     self.refreshHermesTyping(state)
                 }
+            }
+            // One write per tick: the text and the rows of the turn arrive together. Display only; written by message id
+            // under the same rule as the text (a cleared or removed conversation is never brought back), and the first
+            // text or the first row hides the typing dots.
+            let onTurn: @MainActor (String?, [ChatSegment]?) -> Void = { visible, segments in
+                if visible?.isEmpty == false || segments?.isEmpty == false { firstText() }
                 state.updateChat(id, createIfMissing: false) { h in
-                    if let idx = h.firstIndex(where: { $0.id == msgId }) { h[idx].content = visible }
+                    guard let idx = h.firstIndex(where: { $0.id == msgId }) else { return }
+                    if let visible { h[idx].content = visible }
+                    if let segments { h[idx].segments = segments }
                 }
             }
             if signIn {
@@ -631,9 +630,10 @@ final class ClaudeService {
                             self.conversations.mutateIfPresent(id) { $0.serverSession = sessionId.isEmpty ? nil : sessionId }
                         }
                     },
-                    onToken: onToken)
+                    onToken: { onTurn($0, nil) }, onSegments: { onTurn(nil, $0) }, onTurn: onTurn)
             }
-            return try await HermesChat.streamChat(agent: agent, key: key, encodedBody: encodedBody, onToken: onToken)
+            return try await HermesChat.streamChat(agent: agent, key: key, encodedBody: encodedBody,
+                                                   onToken: { onTurn($0, nil) }, onSegments: { onTurn(nil, $0) }, onTurn: onTurn)
         }
         conversations.mutateIfPresent(id) { $0.turns[turnId]?.task = task }
         do {

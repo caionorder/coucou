@@ -1330,13 +1330,13 @@ struct PromptView: View {
                         }
                         .pinnedScrollTracking($pinned) {
                             if typingShown { proxy.scrollTo("typing", anchor: .bottom) }
-                            else if let last = state.chatHistory.last(where: { !$0.content.isEmpty }) {
+                            else if let last = state.chatHistory.last(where: { $0.isShown }) {
                                 proxy.scrollTo(last.id, anchor: .bottom)
                             }
                         }
                         .onChange(of: state.chatHistory) { _, _ in
                             guard pinned else { return }
-                            if let last = state.chatHistory.last(where: { !$0.content.isEmpty }) {
+                            if let last = state.chatHistory.last(where: { $0.isShown }) {
                                 proxy.scrollTo(last.id, anchor: .bottom)
                             }
                         }
@@ -1344,7 +1344,7 @@ struct PromptView: View {
                             guard pinned else { return }
                             if shown {
                                 withAnimation { proxy.scrollTo("typing", anchor: .bottom) }
-                            } else if let last = state.chatHistory.last(where: { !$0.content.isEmpty }) {
+                            } else if let last = state.chatHistory.last(where: { $0.isShown }) {
                                 withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                             }
                         }

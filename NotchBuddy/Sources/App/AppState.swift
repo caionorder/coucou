@@ -1341,6 +1341,9 @@ struct ChatMessage: Identifiable, Equatable {
     var segments: [ChatSegment] = []
     /// A sentence the app wrote (an error kept in the chat), never a text that is still arriving.
     var isNotice = false
+    /// Something to draw: text, or the rows of an agent turn that has written no text yet. The chat list and the
+    /// scroll targets of the chat share this one rule.
+    var isShown: Bool { ChatVisibility.isShown(content: content, segments: segments) }
 }
 
 /// The one sign in session store of the app, over the Keychain item "hermes-agent-sessions".

@@ -8,6 +8,7 @@ trap 'rm -rf "$TEST_DIR"; [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
 
 PORT_FILE="$TEST_DIR/port.txt"
 SOURCES=(
+    NotchBuddy/Sources/App/ChatTurn.swift
     NotchBuddy/Sources/App/HermesChat.swift
     NotchBuddy/Sources/App/HermesSignIn.swift
     NotchBuddy/Sources/App/HermesSignInNet.swift
