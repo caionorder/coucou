@@ -492,6 +492,8 @@ enum HermesChat {
     static let interruptedNote = String(localized: "(The answer was interrupted.)")
     static let tooLongNote = String(localized: "(The answer was cut: it went over the size limit.)")
     static let tooSlowNote = String(localized: "(The answer was cut: it took longer than 15 minutes.)")
+    /// Shared with the sign in transport (`HermesSignIn.approvalNote`): the one sentence for an approval nobody answered.
+    static let approvalNote = String(localized: "(The agent needed an approval that Coucou cannot give yet. Approve it in the Hermes app.)")
 
     private static func session() -> URLSession { URLSession(configuration: .ephemeral) }
 
@@ -540,6 +542,135 @@ enum HermesChat {
         return (choice["finish_reason"] as? String) == "stop"
     }
 
+    // MARK: Steps (named frames)
+
+    /// Pairs an `event:` line with the `data:` line that follows it. A blank line ends the frame.
+    struct SSEFrames {
+        private var event: String?
+        /// The frame a line completes: the event name (nil for a plain data frame) and the JSON text.
+        mutating func feed(_ line: String) -> (event: String?, data: String)? {
+            if line.isEmpty { event = nil; return nil }
+            if line.hasPrefix(":") { return nil }
+            if line.hasPrefix("event:") {
+                let name = line.dropFirst(6).trimmingCharacters(in: .whitespaces)
+                event = name.isEmpty ? nil : String(name.prefix(64))
+                return nil
+            }
+            if line.hasPrefix("data: ") {
+                let name = event
+                event = nil
+                return (name, String(line.dropFirst(6)))
+            }
+            return nil
+        }
+    }
+
+    /// What a `hermes.tool.progress` frame says. Only these four fields are read: `emoji` and anything else are not.
+    struct ToolProgress: Equatable {
+        var id: String
+        var tool: String
+        var label: String
+        var running: Bool
+    }
+
+    static func parseToolProgress(_ data: String) -> ToolProgress? {
+        guard let d = data.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+              let tool = json["tool"] as? String, !ChatTurnBuilder.cleanTool(tool).isEmpty,
+              let id = json["toolCallId"] as? String, !id.isEmpty,
+              let status = json["status"] as? String else { return nil }
+        switch status {
+        case "running": return ToolProgress(id: id, tool: tool, label: (json["label"] as? String) ?? "", running: true)
+        case "completed": return ToolProgress(id: id, tool: tool, label: "", running: false)
+        default: return nil
+        }
+    }
+
+    /// The messages of a Hermes API key request: the stored history, with a message made of blocks reduced to its
+    /// text. Roles and text only: rows, steps, notes and previews live in `ChatMessage.segments` and never get here.
+    static func requestMessages(from stored: [[String: Any]]) -> [[String: Any]] {
+        var msgs: [[String: Any]] = []
+        for m in stored {
+            var simplified = m
+            if let content = m["content"] as? [[String: Any]],
+               let textBlock = content.first(where: { ($0["type"] as? String) == "text" }),
+               let text = textBlock["text"] as? String {
+                simplified["content"] = text
+            }
+            msgs.append(simplified)
+        }
+        return msgs
+    }
+
+    /// The rows of a turn for the chat: the same think-block filtering as the text, and no row left empty by it.
+    /// A block that opens in one row and closes in a later one (a tool in between) is hidden in both: the state
+    /// "inside a block" is carried from row to row, as the text is filtered whole. Reasoning never reaches a row.
+    static func displaySegments(_ segments: [ChatSegment]) -> [ChatSegment] {
+        var inside = false
+        return segments.compactMap { seg in
+            guard case .text(let t, let role) = seg.kind else { return seg }
+            let visible = visibleText(t, inside: &inside)
+            return visible.isEmpty ? nil : ChatSegment(id: seg.id, kind: .text(visible, role: role))
+        }
+    }
+
+    /// The rows at the end of the turn: filtered with the rule of the string the turn returns (closed blocks only,
+    /// across rows), so the screen and the stored text agree. A `<think>` that never closes, or one an answer merely
+    /// names in inline code, hides nothing: the text holds it too. While the turn runs `displaySegments` may hide it.
+    static func finalDisplaySegments(_ segments: [ChatSegment]) -> [ChatSegment] {
+        let sep = "\n\n"
+        var joined = ""
+        var spans: [Int: (start: Int, end: Int)] = [:]      // row index -> UTF-16 range in `joined`
+        for (i, seg) in segments.enumerated() {
+            guard case .text(let t, _) = seg.kind else { continue }
+            if !joined.isEmpty { joined += sep }
+            let start = joined.utf16.count
+            joined += t
+            spans[i] = (start, joined.utf16.count)
+        }
+        let ns = joined as NSString
+        var blocks: [NSRange] = []
+        if joined.contains("<think>"), let regex = try? NSRegularExpression(pattern: "<think>[\\s\\S]*?</think>") {
+            blocks = regex.matches(in: joined, range: NSRange(location: 0, length: ns.length)).map(\.range)
+        }
+        var out: [ChatSegment] = []
+        for (i, seg) in segments.enumerated() {
+            guard case .text(_, let role) = seg.kind, let span = spans[i] else { out.append(seg); continue }
+            var visible = ""
+            var pos = span.start
+            for b in blocks {
+                let lo = max(b.location, span.start), hi = min(b.location + b.length, span.end)
+                guard lo < hi else { continue }
+                if lo > pos { visible += ns.substring(with: NSRange(location: pos, length: lo - pos)) }
+                pos = max(pos, hi)
+            }
+            if pos < span.end { visible += ns.substring(with: NSRange(location: pos, length: span.end - pos)) }
+            visible = visible.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !visible.isEmpty { out.append(ChatSegment(id: seg.id, kind: .text(visible, role: role))) }
+        }
+        return out
+    }
+
+    /// `LocalChat.progressiveFilter` for one row, starting inside a block or not, and telling whether it ends inside one.
+    private static func visibleText(_ t: String, inside: inout Bool) -> String {
+        if !inside, !t.contains("<think>") { return t.trimmingCharacters(in: .whitespacesAndNewlines) }
+        var out = ""
+        var rest = Substring(t)
+        while !rest.isEmpty {
+            if inside {
+                guard let close = rest.range(of: "</think>") else { break }
+                rest = rest[close.upperBound...]
+                inside = false
+            } else {
+                guard let open = rest.range(of: "<think>") else { out += rest; break }
+                out += rest[..<open.lowerBound]
+                rest = rest[open.upperBound...]
+                inside = true
+            }
+        }
+        return out.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     /// Text and end-of-stream state gathered from the SSE lines.
     private struct StreamState {
         var text = ""
@@ -547,12 +678,36 @@ enum HermesChat {
         var failure: String?
         var complete = false
         var overLimit = false
+        var frames = SSEFrames()
+        /// Steps, notes and roles: display only. Nothing here reaches `text`, the returned string or a request.
+        var turn = ChatTurnBuilder()
 
-        /// Returns true when the line added text.
-        mutating func ingest(_ line: String, maxChars: Int) -> Bool {
+        /// What a line changed: the text grew, a step or a note changed.
+        struct Change { var text = false; var steps = false }
+
+        mutating func ingest(_ line: String, maxChars: Int) -> Change {
+            var change = Change()
+            if let frame = frames.feed(line), let name = frame.event {
+                switch name {
+                case "hermes.tool.progress":
+                    if let p = HermesChat.parseToolProgress(frame.data) {
+                        turn.apply(p.running ? .toolStarted(id: p.id, tool: p.tool, label: p.label)
+                                             : .toolFinished(id: p.id, detail: nil))
+                        change.steps = true
+                    }
+                case "approval.request":
+                    // The payload (the command) is not read: only the fact that one was asked.
+                    if !turn.segments.contains(where: { $0.kind == .note(HermesChat.approvalNote) }) {
+                        turn.apply(.note(HermesChat.approvalNote))
+                        change.steps = true
+                    }
+                default: break   // hermes.status and any other name
+                }
+            }
             if let f = HermesChat.parseStreamFailure(line) { failure = f }
             if HermesChat.isStreamComplete(line) { complete = true }
-            guard let delta = LocalChat.parseSSEDelta(line) else { return false }
+            guard let delta = LocalChat.parseSSEDelta(line) else { return change }
+            let room = maxChars - chars
             text += delta
             chars += delta.count
             if chars > maxChars {
@@ -560,7 +715,9 @@ enum HermesChat {
                 chars = maxChars
                 overLimit = true
             }
-            return true
+            turn.apply(.text(delta.count > room ? String(delta.prefix(max(room, 0))) : delta))
+            change.text = true
+            return change
         }
     }
 
@@ -569,7 +726,9 @@ enum HermesChat {
         key: String,
         encodedBody: Data,
         limits: Limits = .standard,
-        onToken: @MainActor @escaping (String) -> Void
+        onToken: @MainActor @escaping (String) -> Void,
+        onSegments: @MainActor @escaping ([ChatSegment]) -> Void = { _ in },
+        onTurn: (@MainActor (String?, [ChatSegment]?) -> Void)? = nil
     ) async throws -> String {
         guard let url = chatURL(for: agent) else { throw HermesChatError.invalidURL }
         var req = URLRequest(url: url, timeoutInterval: 300)
@@ -606,15 +765,31 @@ enum HermesChat {
         var lineTooLong = false
         var tooSlow = false
         var broken = false
-        var lastUpdate = Date.distantPast
+        var lastTextUpdate = Date.distantPast
         let minInterval: TimeInterval = 1.0 / 15.0
+        var stepBudget = StepPublishBudget()
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(limits.duration))
 
-        func emit(_ visibleSource: String) async {
-            let visible = LocalChat.progressiveFilter(visibleSource)
-            await MainActor.run { onToken(visible) }
+        /// One main actor hop and one write per tick: the text and the rows go out together (`onTurn`), or through the
+        /// two callbacks when the caller only has those.
+        func publish(content: String?, rows: [ChatSegment]?) async {
+            await MainActor.run {
+                if let onTurn { onTurn(content, rows) }
+                else {
+                    if let content { onToken(content) }
+                    if let rows { onSegments(rows) }
+                }
+            }
         }
+
+        /// The turn is over, whatever the way out: no step stays running, and the notes the text gets are rows too.
+        /// The last text (when the way out sends one) goes out in the same write as the last rows.
+        func settle(ok: Bool, notes: [String], content: String? = nil) async {
+            state.turn.apply(.ended(ok: ok, notes: notes))
+            await publish(content: content, rows: finalDisplaySegments(state.turn.segments))
+        }
+        var rowsPending = false
 
         do {
             // Lines are split here, not by `bytes.lines`, so a line can be capped.
@@ -628,11 +803,20 @@ enum HermesChat {
                 if line.last == 0x0D { line.removeLast() }
                 let text = String(decoding: line, as: UTF8.self)
                 line.removeAll(keepingCapacity: true)
-                if state.ingest(text, maxChars: limits.textChars) {
+                let change = state.ingest(text, maxChars: limits.textChars)
+                // The text keeps its gate (15 a second). A step or a note change is published at once while the budget
+                // lasts (15 in any second, no timer: a round of a few tools always fits); when the budget is spent it
+                // waits, and goes out with the next line of any kind (a keepalive too) or with the end of the turn.
+                if change.steps { rowsPending = true }
+                if change.text || rowsPending {
                     let now = Date()
-                    if now.timeIntervalSince(lastUpdate) >= minInterval {
-                        lastUpdate = now
-                        await emit(state.text)
+                    if change.text, now.timeIntervalSince(lastTextUpdate) >= minInterval {
+                        lastTextUpdate = now
+                        rowsPending = false
+                        await publish(content: LocalChat.progressiveFilter(state.text), rows: displaySegments(state.turn.segments))
+                    } else if rowsPending, stepBudget.take(at: now) {
+                        rowsPending = false
+                        await publish(content: nil, rows: displaySegments(state.turn.segments))
                     }
                 }
                 if state.overLimit { break }
@@ -641,21 +825,26 @@ enum HermesChat {
                 _ = state.ingest(String(decoding: line, as: UTF8.self), maxChars: limits.textChars)
             }
         } catch {
-            if Task.isCancelled { throw CancellationError() }
+            if Task.isCancelled { await settle(ok: false, notes: []); throw CancellationError() }
             broken = true
         }
-        if Task.isCancelled { throw CancellationError() }
-        if broken && state.text.isEmpty { throw HermesChatError.unreachable(host) }
-        await emit(state.text)
+        if Task.isCancelled { await settle(ok: false, notes: []); throw CancellationError() }
+        if broken && state.text.isEmpty { await settle(ok: false, notes: []); throw HermesChatError.unreachable(host) }
+        let lastVisible = LocalChat.progressiveFilter(state.text)
 
         let text = LocalChat.filterThinkingBlocks(state.text).trimmingCharacters(in: .whitespacesAndNewlines)
         let capNote: String? = tooSlow ? tooSlowNote : (lineTooLong || state.overLimit) ? tooLongNote : nil
         if text.isEmpty {
+            await settle(ok: false, notes: [], content: lastVisible)
             throw HermesChatError.agentFailed(state.failure ?? capNote ?? String(localized: "The agent returned no text."))
         }
         // Some text arrived: keep it, and say so when the stream did not end normally.
-        if let capNote { return text + "\n\n" + capNote }
-        if broken || state.failure != nil || !state.complete { return text + "\n\n" + interruptedNote }
+        if let capNote { await settle(ok: false, notes: [capNote], content: lastVisible); return text + "\n\n" + capNote }
+        if broken || state.failure != nil || !state.complete {
+            await settle(ok: false, notes: [interruptedNote], content: lastVisible)
+            return text + "\n\n" + interruptedNote
+        }
+        await settle(ok: true, notes: [], content: lastVisible)
         return text
     }
 }

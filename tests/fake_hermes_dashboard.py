@@ -39,7 +39,9 @@ CONFIG
 
 WebSocket prompt scenarios (the prompt text picks one): hello, error, error-partial, bare-error, close,
 approval, withdrawn, busy, queued, queued-early, queued-noterm, queued-start-first, binary, binary-flood, steered, redirected, early-terminal, early-error, submit-slow,
-silence, flood, flood-big, slow, big, echo-history, ping-wait, foreign, close-empty.
+silence, flood, flood-big, slow, big, echo-history, ping-wait, foreign, close-empty, and the ones that show tool steps
+(the events have the shapes of the real gateway, tui_gateway/contracts/events.py):
+steps, steps2, steps-noturn, interim-only, interim-final, steps-cut, steps-error, interim-prefix, reuse-id, think-split, burst, seq3, text-tool, think-open, think-literal.
 
   queued        the submit answers "queued"; the earlier turn ends (interrupted), then the queued turn runs and answers
   queued-early  the earlier turn's terminal event arrives BEFORE the "queued" answer, then the queued turn runs
@@ -54,8 +56,31 @@ silence, flood, flood-big, slow, big, echo-history, ping-wait, foreign, close-em
   submit-slow   prompt.submit answers after 1 s
   silence       no frame at all for 22.5 s, then the answer
   flood, flood-big   an answer start, then many small / a few large unknown events
+  steps         message.start, a delta, message.interim (already_streamed), tool.start (args hold a marker), tool.complete
+                (summary, result holds a second marker), a delta, message.complete with the final text only
+  steps2        the same with two tools and a second interim text (the end to end example)
+  steps-noturn  tool events for a session id that is not ours, and one while no turn is open
+  interim-only  message.interim with already_streamed false and no delta before it, then the answer
+  interim-final message.interim (not streamed), then message.complete with the same text and response_previewed
+  steps-cut     text, tool.start, then the socket closes (the step must end stopped)
+  steps-error   text, tool.start, then message.complete with status error (the step must end stopped)
+  interim-prefix  a delta that is the start of a sentence, then message.interim with the whole sentence and already_streamed
+                false (the server sends false exactly when the deltas were cut), a tool, the answer
+  reuse-id      one tool_id used by two calls in a row, each with its own text before it (the server forgets an id when
+                its tool completes)
+  think-split   a <think> block that opens before a tool and closes after it, in the deltas
+  burst         a hundred tool.start / tool.complete pairs with no pause, then the answer
 
 """
+
+# Markers that must never appear in what the client keeps: the arguments and the result of a tool, and reasoning.
+ARGS_MARKER = "ARGS_MARKER_41"
+RESULT_MARKER = "RESULT_MARKER_52"
+REASONING_MARKER = "REASONING_MARKER_63"
+LABELS_MARKER = "LABELS_MARKER_74"
+STATUS_MARKER = "STATUS_MARKER_85"
+COMPLETE_REASONING_MARKER = "COMPLETE_REASONING_MARKER_96"
+APPROVAL_COMMAND_MARKER = "APPROVAL_COMMAND_MARKER_88"
 
 import base64
 import hashlib
@@ -225,14 +250,16 @@ def scenario(conn, runtime, text, stored):
             return
         if text == "approval":
             conn.send_json({"jsonrpc": "2.0", "id": "srq-" + secrets.token_hex(6), "method": "approval",
-                            "params": {"session_id": sid, "request_id": "r1", "command": "rm -rf /tmp/x",
+                            "params": {"session_id": sid, "request_id": "r1", "command": "rm -rf /tmp/x " + APPROVAL_COMMAND_MARKER,
                                        "description": "test", "choices": ["once", "session", "always", "deny"]}})
             time.sleep(0.3)
             conn.event("message.delta", sid, {"text": "continued after the approval."})
             conn.event("message.complete", sid, {"text": "continued after the approval.", "status": "complete"})
             return
         if text == "withdrawn":
-            conn.event("tool.complete", sid, {"name": "terminal", "preview": "approval was withdrawn before the user answered"})
+            # The real tool.complete carries tool_id, name, args and the full result: the withdrawn text is in the result.
+            conn.event("tool.complete", sid, {"tool_id": "w1", "name": "terminal", "args": {"command": "ls"},
+                                              "result": "approval was withdrawn before the user answered"})
             conn.event("message.complete", sid, {"text": "I could not run that.", "status": "complete"})
             return
         if text == "slow":
@@ -322,11 +349,157 @@ def scenario(conn, runtime, text, stored):
             conn.event("message.delta", sid, {"text": answer})
             conn.event("message.complete", sid, {"text": answer, "status": "complete"})
             return
+        if text in ("steps", "steps2"):
+            conn.event("message.start", sid)
+            conn.event("message.delta", sid, {"text": "Let me check the page.", "rendered": "x"})
+            # The real server announces the call while the model writes it, before the interim text is closed.
+            conn.event("tool.generating", sid, {"name": "terminal"})
+            conn.event("message.interim", sid, {"text": "Let me check the page.", "already_streamed": True})
+            conn.event("tool.start", sid, {"tool_id": "t1", "name": "terminal", "context": "curl -s graph.facebook.com/v19.0/me",
+                                           "args": {"command": ARGS_MARKER}, "args_text": ARGS_MARKER, "labels": [LABELS_MARKER]})
+            conn.event("reasoning.delta", sid, {"text": REASONING_MARKER})
+            conn.event("status.update", sid, {"kind": "info", "text": STATUS_MARKER})
+            conn.event("tool.complete", sid, {"tool_id": "t1", "name": "terminal", "args": {"command": ARGS_MARKER},
+                                              "duration_s": 1.2, "result": RESULT_MARKER, "summary": "200 OK in 1.2s",
+                                              "result_text": RESULT_MARKER, "inline_diff": RESULT_MARKER,
+                                              "todos": [{"id": "1", "content": RESULT_MARKER}]})
+            final = "The page is limited."
+            if text == "steps2":
+                # The text that follows a tool round starts with a blank line (agent/stream_delivery.py).
+                conn.event("message.delta", sid, {"text": "\n\nThe restriction has an unlock date."})
+                conn.event("tool.generating", sid, {"name": "mongo_query"})
+                conn.event("message.interim", sid, {"text": "The restriction has an unlock date.", "already_streamed": True})
+                conn.event("tool.start", sid, {"tool_id": "t2", "name": "mongo_query", "context": "automations-flow, last 48h"})
+                conn.event("tool.complete", sid, {"tool_id": "t2", "name": "mongo_query", "args": {}, "result": RESULT_MARKER})
+                final = "**Yes.** The page is *limited* now."
+            conn.event("message.delta", sid, {"text": "\n\n" + final})
+            conn.event("message.complete", sid, {"text": final, "status": "complete", "usage": {"input": 1, "output": 3},
+                                                 "reasoning": COMPLETE_REASONING_MARKER})
+            return
+        if text == "interim-prefix":
+            conn.event("message.start", sid)
+            conn.event("message.delta", sid, {"text": "Let me che"})
+            conn.event("tool.generating", sid, {"name": "terminal"})
+            conn.event("message.interim", sid, {"text": "Let me check the page.", "already_streamed": False})
+            conn.event("tool.start", sid, {"tool_id": "p1", "name": "terminal", "context": "ls"})
+            conn.event("tool.complete", sid, {"tool_id": "p1", "name": "terminal", "result": "x", "summary": "ok"})
+            conn.event("message.delta", sid, {"text": "\n\nDone."})
+            conn.event("message.complete", sid, {"text": "Done.", "status": "complete"})
+            return
+        if text == "reuse-id":
+            conn.event("message.start", sid)
+            conn.event("message.delta", sid, {"text": "First."})
+            conn.event("message.interim", sid, {"text": "First.", "already_streamed": True})
+            conn.event("tool.start", sid, {"tool_id": "same", "name": "terminal", "context": "ls"})
+            conn.event("tool.complete", sid, {"tool_id": "same", "name": "terminal", "result": "x", "summary": "one"})
+            conn.event("message.delta", sid, {"text": "\n\nAgain."})
+            conn.event("message.interim", sid, {"text": "Again.", "already_streamed": True})
+            conn.event("tool.start", sid, {"tool_id": "same", "name": "terminal", "context": "ls"})
+            conn.event("tool.complete", sid, {"tool_id": "same", "name": "terminal", "result": "x", "summary": "two"})
+            conn.event("message.delta", sid, {"text": "\n\nAnswer."})
+            conn.event("message.complete", sid, {"text": "Answer.", "status": "complete"})
+            return
+        if text == "think-split":
+            conn.event("message.start", sid)
+            conn.event("message.delta", sid, {"text": "Hello. <think>plan part one"})
+            conn.event("tool.start", sid, {"tool_id": "k1", "name": "terminal", "context": "ls"})
+            conn.event("tool.complete", sid, {"tool_id": "k1", "name": "terminal", "result": "x", "summary": "ok"})
+            conn.event("message.delta", sid, {"text": "\n\nplan part two</think>Mid text."})
+            conn.event("tool.start", sid, {"tool_id": "k2", "name": "terminal", "context": "ls"})
+            conn.event("tool.complete", sid, {"tool_id": "k2", "name": "terminal", "result": "x", "summary": "ok"})
+            conn.event("message.delta", sid, {"text": "\n\nAnswer."})
+            conn.event("message.complete", sid, {"text": "Answer.", "status": "complete"})
+            return
+        if text == "burst":
+            conn.event("message.start", sid)
+            for i in range(100):
+                conn.event("tool.start", sid, {"tool_id": "b%d" % i, "name": "terminal", "context": "step %d" % i})
+                conn.event("tool.complete", sid, {"tool_id": "b%d" % i, "name": "terminal", "result": "x", "summary": "ok"})
+            conn.event("message.delta", sid, {"text": "Burst done."})
+            conn.event("message.complete", sid, {"text": "Burst done.", "status": "complete"})
+            return
+        if text == "seq3":
+            # Three tools in a round, a pause before each completion: the next tool starts right after the previous ends.
+            conn.event("message.start", sid)
+            conn.event("message.delta", sid, {"text": "Look."})
+            conn.event("message.interim", sid, {"text": "Look.", "already_streamed": True})
+            conn.event("tool.start", sid, {"tool_id": "s1", "name": "terminal", "context": "one"})
+            conn.event("tool.complete", sid, {"tool_id": "s1", "name": "terminal", "result": "x", "summary": "ok"})
+            conn.event("tool.start", sid, {"tool_id": "s2", "name": "terminal", "context": "two"})
+            time.sleep(0.5)
+            conn.event("tool.complete", sid, {"tool_id": "s2", "name": "terminal", "result": "x", "summary": "ok"})
+            conn.event("tool.start", sid, {"tool_id": "s3", "name": "terminal", "context": "three"})
+            time.sleep(0.5)
+            conn.event("tool.complete", sid, {"tool_id": "s3", "name": "terminal", "result": "x", "summary": "ok"})
+            conn.event("message.delta", sid, {"text": "\n\nAnswer."})
+            conn.event("message.complete", sid, {"text": "Answer.", "status": "complete"})
+            return
+        if text == "text-tool":
+            # A sentence and the start of the next tool back to back, then a pause before the completion.
+            conn.event("message.start", sid)
+            conn.event("message.delta", sid, {"text": "Sentence."})
+            conn.event("tool.start", sid, {"tool_id": "w1", "name": "terminal", "context": "work"})
+            time.sleep(0.6)
+            conn.event("tool.complete", sid, {"tool_id": "w1", "name": "terminal", "result": "x", "summary": "ok"})
+            conn.event("message.delta", sid, {"text": "\n\nAnswer."})
+            conn.event("message.complete", sid, {"text": "Answer.", "status": "complete"})
+            return
+        if text == "think-open":
+            conn.event("message.start", sid)
+            conn.event("message.delta", sid, {"text": "Hi. <think>plan"})
+            conn.event("tool.start", sid, {"tool_id": "o1", "name": "terminal", "context": "ls"})
+            conn.event("tool.complete", sid, {"tool_id": "o1", "name": "terminal", "result": "x", "summary": "ok"})
+            conn.event("message.delta", sid, {"text": "\n\nMore."})
+            conn.event("tool.start", sid, {"tool_id": "o2", "name": "terminal", "context": "ls"})
+            conn.event("tool.complete", sid, {"tool_id": "o2", "name": "terminal", "result": "x", "summary": "ok"})
+            conn.event("message.delta", sid, {"text": "\n\nAnswer."})
+            conn.event("message.complete", sid, {"text": "Answer.", "status": "complete"})
+            return
+        if text == "think-literal":
+            conn.event("message.start", sid)
+            conn.event("message.delta", sid, {"text": "Use the `<think>` tag for reasoning. Then answer."})
+            conn.event("message.complete", sid, {"text": "Use the `<think>` tag for reasoning. Then answer.", "status": "complete"})
+            return
+        if text == "steps-noturn":
+            conn.event("tool.start", "someone-else", {"tool_id": "x1", "name": "foreign_tool", "context": "FOREIGN"})
+            conn.event("message.start", sid)
+            conn.event("tool.start", "someone-else", {"tool_id": "x2", "name": "foreign_tool", "context": "FOREIGN"})
+            conn.event("message.delta", sid, {"text": "Own answer."})
+            conn.event("message.complete", sid, {"text": "Own answer.", "status": "complete"})
+            return
+        if text == "interim-only":
+            conn.event("message.start", sid)
+            conn.event("message.interim", sid, {"text": "I will look at it.", "already_streamed": False})
+            conn.event("message.complete", sid, {"text": "Done looking.", "status": "complete"})
+            return
+        if text == "interim-final":
+            conn.event("message.start", sid)
+            conn.event("message.interim", sid, {"text": "Final words.", "already_streamed": False})
+            conn.event("message.complete", sid, {"text": "Final words.", "status": "complete", "response_previewed": True})
+            return
+        if text == "steps-cut":
+            conn.event("message.start", sid)
+            conn.event("message.delta", sid, {"text": "Starting."})
+            conn.event("tool.start", sid, {"tool_id": "c1", "name": "terminal", "context": "sleep 100"})
+            time.sleep(0.15)
+            conn.send_frame(0x8, struct.pack(">H", 1011))
+            try:
+                conn.h.connection.shutdown(2)
+            except OSError:
+                pass
+            return
+        if text == "steps-error":
+            conn.event("message.start", sid)
+            conn.event("message.delta", sid, {"text": "Starting."})
+            conn.event("tool.start", sid, {"tool_id": "e1", "name": "terminal", "context": "make"})
+            conn.event("message.complete", sid, {"text": "", "status": "error", "error": "tool crashed"})
+            return
         # hello (default)
         conn.event("message.start", sid)
         for part in ("Hello ", "from ", "Steve."):
             conn.event("message.delta", sid, {"text": part, "rendered": part})
             time.sleep(0.03)
+        # Not a real event of this gateway: noise that must be ignored.
         conn.event("tool.progress", sid, {"name": "unknown event kinds must be ignored"})
         conn.event("message.complete", sid, {"text": "Hello from Steve.", "status": "complete",
                                              "usage": {"input": 1, "output": 3}})

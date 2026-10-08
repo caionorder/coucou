@@ -164,8 +164,10 @@ final class IslandWindowController: NSWindowController {
         // (nonactivatingPanel never auto-becomes key, but TextField needs it)
         viewSubscription = state.$view
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] newView in
+            .sink { [weak self] _ in
                 guard let self else { return }
+                // The value is delivered one hop late: judge the view as it is now, not as it was when it changed.
+                let newView = self.state.view
                 if newView == .prompt, !self.state.hermesAnnounceBlocksKey {
                     self.islandPanel.makeKey()
                 }
@@ -287,10 +289,25 @@ final class IslandWindowController: NSWindowController {
         if state.panelHeight != height { state.panelHeight = height }
     }
 
+    /// Opens the prompt slot with no target (hot key, attach window): it shows what belongs to the focused pill.
+    /// `carriesContext`: a window was attached, so a chat opens (never a cmux reply, which takes no context).
+    func openPromptSlot(makeKey: Bool = true, carriesContext: Bool = false) {
+        if makeKey { islandPanel.makeKey() }
+        #if !APPSTORE
+        if case .cmuxReply(let taskId, _) = state.promptContentOnOpen(carriesContext: carriesContext) {
+            openCmuxPrompt(.reply(taskId: taskId))
+            return
+        }
+        #else
+        _ = state.promptContentOnOpen(carriesContext: carriesContext)
+        #endif
+        expand(to: .prompt)
+    }
+
     #if !APPSTORE
     /// Opens the reply / new chat prompt of cmux in the `.prompt` slot.
     func openCmuxPrompt(_ mode: CmuxPromptMode) {
-        state.cmuxNotice = nil
+        state.applyNoticeRuleForOpening(mode)
         islandPanel.makeKey()
         // AppState clears the cmux prompt on every other entry to the prompt view; this one keeps it.
         state.cmuxOpeningPrompt = true
@@ -551,8 +568,7 @@ final class IslandWindowController: NSWindowController {
             }
 
         case .openChat:
-            islandPanel.makeKey()
-            expand(to: .prompt)
+            openPromptSlot()
 
         case .goToAlert:
             if state.pendingApproval != nil {
@@ -730,8 +746,7 @@ final class IslandWindowController: NSWindowController {
         state.promptContext = ctx
         SoundEngine.shared.play("approve")
         NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
-        islandPanel.makeKey()
-        expand(to: .prompt)
+        openPromptSlot(carriesContext: true)
     }
     #endif
 
@@ -865,7 +880,7 @@ final class IslandWindowController: NSWindowController {
                     self.state.promptContext = ctx
                     SoundEngine.shared.play("approve")
                     NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
-                    self.expand(to: .prompt)
+                    self.openPromptSlot(makeKey: false, carriesContext: true)
                 } else if !inNotchZone {
                     // Drop outside notch zone → install Mochi on the desktop.
                     // Prevent hideDragGhost from closing the ghost panel so we can promote it.

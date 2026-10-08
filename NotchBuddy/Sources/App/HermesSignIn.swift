@@ -283,8 +283,13 @@ enum HermesSignIn {
         case result(id: Int, [String: String])
         case failure(id: Int, code: Int, message: String)
         case delta(session: String, text: String)
-        case complete(session: String, text: String, status: String, error: String?)
+        /// `delivered`: the server says this text already went out in the turn (`response_previewed` / `response_reused`).
+        case complete(session: String, text: String, status: String, error: String?, delivered: Bool = false)
         case error(session: String, message: String)
+        /// Rows of the turn. Only the words a row shows are read; arguments, results and reasoning never leave `decode`.
+        case interim(session: String, text: String, alreadyStreamed: Bool)
+        case toolStart(session: String, id: String, name: String, context: String)
+        case toolComplete(session: String, id: String, summary: String?, approvalHint: Bool)
         case serverRequest(id: String, method: String)
         case requestCancelled(method: String)
         case approvalHint
@@ -322,13 +327,26 @@ enum HermesSignIn {
                 if let e = payload["error"] as? String, !e.isEmpty { err = String(e.prefix(200)) }
                 else if let e = payload["error"] as? [String: Any], let m = e["message"] as? String, !m.isEmpty { err = String(m.prefix(200)) }
                 let status = (payload["status"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "complete"
-                return .complete(session: session, text: (payload["text"] as? String) ?? "", status: status, error: err)
+                let delivered = (payload["response_previewed"] as? Bool) == true || (payload["response_reused"] as? Bool) == true
+                return .complete(session: session, text: (payload["text"] as? String) ?? "", status: status, error: err, delivered: delivered)
+            case "message.interim":
+                guard let t = payload["text"] as? String else { return .ignored }
+                return .interim(session: session, text: t, alreadyStreamed: (payload["already_streamed"] as? Bool) == true)
+            case "tool.start":
+                guard let id = payload["tool_id"] as? String, !id.isEmpty, let name = payload["name"] as? String,
+                      !ChatTurnBuilder.cleanTool(name).isEmpty else { return .ignored }
+                return .toolStart(session: session, id: id, name: name, context: (payload["context"] as? String) ?? "")
             case "error":
                 let m = (payload["message"] as? String) ?? ""
                 return .error(session: session, message: String(m.prefix(200)))
             case "request.cancel":
                 return .requestCancelled(method: (payload["method"] as? String) ?? "")
-            case "tool.complete", "status.update":
+            case "tool.complete":
+                let hint = mentionsWithdrawnApproval(payload)
+                guard let id = payload["tool_id"] as? String, !id.isEmpty else { return hint ? .approvalHint : .ignored }
+                let summary = (payload["summary"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                return .toolComplete(session: session, id: id, summary: summary, approvalHint: hint)
+            case "status.update":
                 return mentionsWithdrawnApproval(payload) ? .approvalHint : .ignored
             default: return .ignored
             }
@@ -360,7 +378,7 @@ enum HermesSignIn {
 
     // MARK: Turn reducer (no I/O)
 
-    static let approvalNote = String(localized: "(The agent needed an approval that Coucou cannot give yet. Approve it in the Hermes app.)")
+    static let approvalNote = HermesChat.approvalNote
     static let newSessionNote = String(localized: "(The previous session was no longer available, so a new one was started.)")
 
     struct Turn {
@@ -379,6 +397,11 @@ enum HermesSignIn {
         var awaitingStart = false
         /// A `message.start` was seen on this socket (the server sends one at the start of every turn).
         var startSeen = false
+        /// The rows of the turn (steps, interim text, notes): display only. Never read by `finalText`, so the
+        /// string the turn returns does not depend on them.
+        var rows = ChatTurnBuilder()
+        /// Set when a frame changed a row other than text; the stream loop sends rows at once and clears it.
+        var stepsTouched = false
 
         private func other(_ s: String) -> Bool { !session.isEmpty && !s.isEmpty && s != session }
 
@@ -390,6 +413,8 @@ enum HermesSignIn {
             switch f {
             case .delta(let s, let t):
                 guard !other(s), !done, !awaitingStart else { return false }
+                let room = maxChars - chars
+                rows.apply(.text(t.count > room ? String(t.prefix(max(room, 0))) : t))
                 text += t
                 chars += t.count
                 if chars > maxChars {
@@ -398,7 +423,7 @@ enum HermesSignIn {
                     overLimit = true
                 }
                 return true
-            case .complete(let s, let t, let status, let err):
+            case .complete(let s, let t, let status, let err, let delivered):
                 guard !other(s), !done, !awaitingStart else { return false }
                 done = true
                 self.status = status
@@ -406,8 +431,28 @@ enum HermesSignIn {
                 if !t.isEmpty {
                     completeText = t.count > maxChars ? String(t.prefix(maxChars)) : t
                     if t.count > maxChars { overLimit = true }
+                    // The server's version of the final answer wins over the deltas, as it does for the text.
+                    rows.apply(.finalText(completeText, alreadyDelivered: delivered))
                     return true
                 }
+                return false
+            case .interim(let s, let t, let alreadyStreamed):
+                guard !other(s), !done, !awaitingStart else { return false }
+                rows.apply(.interim(t, alreadyStreamed: alreadyStreamed))
+                stepsTouched = true
+                return false
+            case .toolStart(let s, let id, let name, let context):
+                guard !other(s), !done, !awaitingStart else { return false }
+                rows.apply(.toolStarted(id: id, tool: name, label: context))
+                stepsTouched = true
+                return false
+            case .toolComplete(let s, let id, let summary, let hint):
+                // The hint is applied before the session guard, as it always was: a subagent runs under another session
+                // id, and a missed approval notice is worse than a spurious one (the notice is informational only).
+                if hint { noteApproval() }
+                guard !other(s), !done, !awaitingStart else { return false }
+                rows.apply(.toolFinished(id: id, detail: summary))
+                stepsTouched = true
                 return false
             case .error(let s, let m):
                 guard !other(s), !done, !awaitingStart else { return false }
@@ -423,13 +468,13 @@ enum HermesSignIn {
                 resetContent()
                 return false
             case .serverRequest(_, let method):
-                if method == "approval" { approval = true }
+                if method == "approval" { noteApproval() }
                 return false
             case .requestCancelled(let method):
-                if method == "approval" { approval = true }
+                if method == "approval" { noteApproval() }
                 return false
             case .approvalHint:
-                approval = true
+                noteApproval()
                 return false
             case .ready, .result, .failure, .ignored:
                 return false
@@ -439,6 +484,38 @@ enum HermesSignIn {
         private mutating func resetContent() {
             text = ""; completeText = ""; chars = 0
             done = false; failure = nil; status = ""; overLimit = false
+            rows.reset()
+        }
+
+        /// An approval was asked: the flag as before, and the one sentence as a row. The request itself is not read.
+        private mutating func noteApproval() {
+            approval = true
+            if !rows.segments.contains(where: { $0.kind == .note(HermesSignIn.approvalNote) }) {
+                rows.apply(.note(HermesSignIn.approvalNote))
+                stepsTouched = true
+            }
+        }
+
+        private func capNoteFor(tooSlow: Bool) -> String? { tooSlow ? HermesChat.tooSlowNote : overLimit ? HermesChat.tooLongNote : nil }
+
+        /// How the turn ended: whether it ended well, and the sentences appended to the text, in their fixed order.
+        /// The one place that decides them: `finalText` appends exactly these, and the rows show exactly these.
+        func outcome(tooSlow: Bool, closedEarly: Bool, resumedFresh: Bool) -> (ok: Bool, notes: [String]) {
+            let capNote = capNoteFor(tooSlow: tooSlow)
+            var notes: [String] = []
+            var ok = true
+            if let capNote { notes.append(capNote); ok = false }
+            else if status == "interrupted" || status == "error" || failure != nil || (closedEarly && !done) {
+                notes.append(HermesChat.interruptedNote); ok = false
+            }
+            if approval { notes.append(HermesSignIn.approvalNote) }
+            if resumedFresh { notes.append(HermesSignIn.newSessionNote) }
+            return (ok, notes)
+        }
+
+        /// The end of the turn, whatever the way out: no step stays running, and the notes are rows too.
+        mutating func settleRows(ok: Bool, notes: [String]) {
+            rows.apply(.ended(ok: ok, notes: notes))
         }
 
         /// The server accepted the message but queued it behind a running turn (`prompt.submit` answered `queued`).
@@ -454,17 +531,10 @@ enum HermesSignIn {
         func finalText(tooSlow: Bool, closedEarly: Bool, resumedFresh: Bool) throws -> String {
             let source = completeText.isEmpty ? text : completeText
             let visible = LocalChat.filterThinkingBlocks(source).trimmingCharacters(in: .whitespacesAndNewlines)
-            let capNote: String? = tooSlow ? HermesChat.tooSlowNote : overLimit ? HermesChat.tooLongNote : nil
             if visible.isEmpty {
-                throw HermesChatError.agentFailed(failure ?? capNote ?? String(localized: "The agent returned no text."))
+                throw HermesChatError.agentFailed(failure ?? capNoteFor(tooSlow: tooSlow) ?? String(localized: "The agent returned no text."))
             }
-            var notes: [String] = []
-            if let capNote { notes.append(capNote) }
-            else if status == "interrupted" || status == "error" || failure != nil || (closedEarly && !done) {
-                notes.append(HermesChat.interruptedNote)
-            }
-            if approval { notes.append(approvalNote) }
-            if resumedFresh { notes.append(newSessionNote) }
+            let notes = outcome(tooSlow: tooSlow, closedEarly: closedEarly, resumedFresh: resumedFresh).notes
             return notes.isEmpty ? visible : visible + "\n\n" + notes.joined(separator: "\n")
         }
     }

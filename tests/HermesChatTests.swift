@@ -263,6 +263,262 @@ enum HermesChatTests {
         rr = await run("content_reset")
         check("content then reset: text kept + note", rr.0 ?? "", "Partial answer.\n\n" + HermesChat.interruptedNote)
 
+        print("steps: SSEFrames (pure)")
+        var fr = HermesChat.SSEFrames()
+        check("a data line alone is a plain frame", fr.feed("data: {}")?.data ?? "-", "{}")
+        check("... with no event name", fr.feed("data: {}")?.event ?? "none", "none")
+        check("event then data is a named frame", fr.feed("event: hermes.tool.progress") == nil, true)
+        let named = fr.feed("data: {\"a\":1}")
+        check("... the name", named?.event ?? "none", "hermes.tool.progress")
+        check("... the data", named?.data ?? "-", "{\"a\":1}")
+        check("the name is used once: the next data line is plain", fr.feed("data: {\"b\":2}")?.event ?? "none", "none")
+        _ = fr.feed("event: approval.request")
+        check("a blank line clears the pending name", fr.feed("") == nil, true)
+        check("... so the next data line is plain", fr.feed("data: {}")?.event ?? "none", "none")
+        check("a keepalive comment gives nothing", fr.feed(": keepalive") == nil, true)
+        _ = fr.feed("event: hermes.status")
+        check("a keepalive between event and data keeps the name", fr.feed(": keepalive") == nil && fr.feed("data: {}")?.event == "hermes.status", true)
+        _ = fr.feed("event: lonely")
+        check("event with no data gives nothing", fr.feed("") == nil, true)
+        check("a line that is neither gives nothing", fr.feed("id: 4") == nil, true)
+
+        print("steps: parseToolProgress (pure)")
+        let tp = HermesChat.parseToolProgress(#"{"tool":"terminal","emoji":"x","label":"ls -la","toolCallId":"c1","status":"running"}"#)
+        check("running is read", tp, HermesChat.ToolProgress(id: "c1", tool: "terminal", label: "ls -la", running: true))
+        check("completed is read", HermesChat.parseToolProgress(#"{"tool":"terminal","toolCallId":"c1","status":"completed"}"#),
+              HermesChat.ToolProgress(id: "c1", tool: "terminal", label: "", running: false))
+        checkTrue("a missing toolCallId gives nil", HermesChat.parseToolProgress(#"{"tool":"t","status":"running"}"#) == nil)
+        checkTrue("a missing tool gives nil", HermesChat.parseToolProgress(#"{"toolCallId":"c","status":"running"}"#) == nil)
+        checkTrue("an unknown status gives nil", HermesChat.parseToolProgress(#"{"tool":"t","toolCallId":"c","status":"failed"}"#) == nil)
+        checkTrue("a non JSON payload gives nil", HermesChat.parseToolProgress("not json") == nil)
+        check("a running frame without label has an empty label", HermesChat.parseToolProgress(#"{"tool":"t","toolCallId":"c","status":"running"}"#)?.label ?? "-", "")
+
+        print("steps over the fake")
+        final class SegLog: @unchecked Sendable {
+            var calls = 0
+            var last: [ChatSegment] = []
+            var everRunningAfterLast = false
+            var all: [[ChatSegment]] = []      // every call, not only the last
+            var tokens: [String] = []          // every onToken value
+        }
+        func desc(_ segs: [ChatSegment]) -> [String] {
+            segs.map { seg in
+                switch seg.kind {
+                case .text(let t, let role): return "\(role):\(t)"
+                case .step(let st): return "step:\(st.tool)|\(st.label)|\(st.status)"
+                case .note(let n): return "note:\(n)"
+                case .hiddenSteps: return "hidden"
+                }
+            }
+        }
+        func runSegs(_ prompt: String, limits: HermesChat.Limits = .standard) async -> (text: String?, error: HermesChatError?, log: SegLog) {
+            let log = SegLog()
+            do {
+                let t = try await HermesChat.streamChat(agent: markAgent, key: "test-key-mark", encodedBody: body(prompt), limits: limits,
+                                                        onToken: { log.tokens.append($0) },
+                                                        onSegments: { segs in log.calls += 1; log.last = segs; log.all.append(segs) })
+                return (t, nil, log)
+            } catch { return (nil, error as? HermesChatError, log) }
+        }
+        func noRunning(_ segs: [ChatSegment]) -> Bool {
+            !segs.contains { if case .step(let s) = $0.kind { return s.status == .running }; return false }
+        }
+        let stepsRun = await runSegs("steps")
+        let offRun = await runSegs("steps_off")
+        check("3 steps: interim, done step, answer", desc(stepsRun.log.last),
+              ["interim:Let me check the page.", "step:terminal|curl -s graph.facebook.com/v19.0/me|done", "answer:The page is limited."])
+        check("3 steps: the returned string equals the string of steps_off (the text path did not move)",
+              stepsRun.text ?? "-", offRun.text ?? "+")
+        check("3 steps: ... and is the text with the blank line, as today", stepsRun.text ?? "-", "Let me check the page.\n\nThe page is limited.")
+        check("4 steps_off: one answer segment", desc(offRun.log.last), ["answer:Let me check the page.\n\nThe page is limited."])
+        let apprRun = await runSegs("approval")
+        check("5 approval: the existing sentence is the only trace",
+              desc(apprRun.log.last), ["interim:I need to run a command.", "note:" + HermesChat.approvalNote, "answer:Waiting."])
+        check("5 approval: the returned string is unchanged by the approval frame", apprRun.text ?? "-", "I need to run a command.\n\nWaiting.")
+        checkTrue("5 approval: the command of the request is nowhere",
+                  !desc(apprRun.log.last).joined().contains("APPROVAL_COMMAND_MARKER_88") && !(apprRun.text ?? "").contains("APPROVAL_COMMAND_MARKER_88"))
+        let longRun = await runSegs("long_label")
+        if case .step(let st)? = longRun.log.last.compactMap({ seg -> ChatSegment.Kind? in if case .step = seg.kind { return seg.kind }; return nil }).first {
+            check("6 long_label: the label is 120 characters", st.label.count, 120)
+        } else { print("  ✗ 6 long_label: no step"); failures += 1 }
+        let statusRun = await runSegs("status")
+        check("7 status: no row for it, and the text is untouched", desc(statusRun.log.last), ["answer:Before. After."])
+        check("7 status: the returned string", statusRun.text ?? "-", "Before. After.")
+        checkTrue("7 status: its text is nowhere", !desc(statusRun.log.last).joined().contains("STATUS_MARKER_99"))
+        let cutRun = await runSegs("cut_in_tool")
+        check("8 a turn cut in the middle of a tool: the step is stopped, the interrupted note is a row",
+              desc(cutRun.log.last), ["interim:Starting.", "step:terminal|sleep 100|stopped", "note:" + HermesChat.interruptedNote])
+        check("8 ... the string keeps its note as today", cutRun.text ?? "-", "Starting.\n\n" + HermesChat.interruptedNote)
+        let failRun = await runSegs("fail")
+        check("8b a failed turn throws", failRun.error, .agentFailed("boom"))
+        checkTrue("8b ... and the rows it left have no running step", noRunning(failRun.log.last) && failRun.log.calls >= 1)
+        let defRun = await runSegs("hi")
+        check("default turn: a done step then the answer", desc(defRun.log.last), ["step:terminal|curl -s localhost|done", "answer:Hello from mark."])
+        check("... reasoning is not read", desc(defRun.log.last).joined().contains("thinking about it"), false)
+        checkTrue("every normal end leaves no running step", [stepsRun, offRun, apprRun, longRun, statusRun, cutRun, defRun].allSatisfy { noRunning($0.log.last) })
+        let reasoningRun = desc(stepsRun.log.last).joined() + (stepsRun.text ?? "")
+        checkTrue("the reasoning text is nowhere", !reasoningRun.contains("REASONING_MARKER_77"))
+        let two = await runSegs("steps2")
+        check("end to end, two tools",
+              desc(two.log.last),
+              ["interim:Let me check the page.", "step:terminal|curl -s graph.facebook.com/v19.0/me|done",
+               "interim:The restriction has an unlock date. Checking the queue.", "step:mongo_query|automations-flow, last 48h|done",
+               "answer:**Yes.** The page is *limited* now."])
+        print("  e2e API key segments: " + desc(two.log.last).joined(separator: " ⏎ "))
+        print("  e2e API key returned: " + (two.text ?? "-").replacingOccurrences(of: "\n", with: "\\n"))
+
+        print("steps: review fixes")
+        func seg(_ id: Int, _ t: String, _ r: ChatSegment.TextRole) -> ChatSegment { ChatSegment(id: id, kind: .text(t, role: r)) }
+        func stepRow(_ id: Int) -> ChatSegment {
+            ChatSegment(id: id, kind: .step(ChatStep(callId: "c\(id)", tool: "t", label: "l", detail: nil, status: .done)))
+        }
+        check("10 a think block that opens before a tool and closes after it is hidden in both halves",
+              desc(HermesChat.displaySegments([seg(0, "<think>secret plan A", .interim), stepRow(1),
+                                               seg(2, "secret plan B</think>Visible answer.", .answer)])),
+              ["step:t|l|done", "answer:Visible answer."])
+        check("10b text before the open block stays, text after the closing tag shows",
+              desc(HermesChat.displaySegments([seg(0, "Hello. <think>plan part one", .interim), stepRow(1),
+                                               seg(2, "plan part two</think>Answer.", .answer)])),
+              ["interim:Hello.", "step:t|l|done", "answer:Answer."])
+        check("10c two blocks across three rows",
+              desc(HermesChat.displaySegments([seg(0, "A<think>x", .interim), stepRow(1), seg(2, "y</think>B<think>z", .interim),
+                                               stepRow(3), seg(4, "w</think>C", .answer)])),
+              ["interim:A", "step:t|l|done", "interim:B", "step:t|l|done", "answer:C"])
+        check("10d a block that never closes hides every later text row, not the steps",
+              desc(HermesChat.displaySegments([seg(0, "<think>never", .interim), stepRow(1), seg(2, "later", .open)])),
+              ["step:t|l|done"])
+        for sample in ["a<think>b</think>c", "<think>x", "plain", "</think>x", "a <think>b</think> c <think>d", "  spaced  ", "<think>a</think>"] {
+            let want = LocalChat.progressiveFilter(sample)
+            check("10e one row is filtered as the text is: \(sample.debugDescription)",
+                  desc(HermesChat.displaySegments([seg(0, sample, .answer)])), want.isEmpty ? [] : ["answer:" + want])
+        }
+        let thinkRun = await runSegs("think_split")
+        check("10f over the fake, a think block split by a tool: the rows",
+              desc(thinkRun.log.last),
+              ["interim:Hello.", "step:terminal|ls|done", "interim:Mid text.", "step:terminal|ls|done", "answer:Answer."])
+        check("10f ... the returned string is as before", thinkRun.text ?? "-", "Hello. Mid text.\n\nAnswer.")
+        checkTrue("10f ... no row of any call, no token, shows the reasoning",
+                  !(thinkRun.log.all.flatMap(desc) + thinkRun.log.tokens).joined().contains("plan part"))
+        let reuseRun = await runSegs("reuse_id")
+        check("11 a call id used again after its completion is a second step",
+              desc(reuseRun.log.last),
+              ["interim:First.", "step:terminal|ls|done", "interim:Again.", "step:terminal|ls|done", "answer:Answer."])
+        check("11 ... the returned string is as before", reuseRun.text ?? "-", "First.\n\nAgain.\n\nAnswer.")
+        let burstRun = await runSegs("burst")
+        checkTrue("12 a burst of a hundred tools makes few row updates (\(burstRun.log.calls))", burstRun.log.calls >= 1 && burstRun.log.calls <= 2 * StepPublishBudget.perSecond + 2)
+        checkTrue("12 ... few token updates (\(burstRun.log.tokens.count))", burstRun.log.tokens.count <= 4)
+        check("12 ... and the last rows hold sixty steps, one hidden row, the answer",
+              [desc(burstRun.log.last).filter { $0.hasPrefix("step:") }.count, desc(burstRun.log.last).filter { $0 == "hidden" }.count,
+               desc(burstRun.log.last).last == "answer:Burst done." ? 1 : 0], [60, 1, 1])
+        check("12 ... the string", burstRun.text ?? "-", "Burst done.")
+        print("steps: round 3 (budget, end of turn think filter)")
+        final class Timed: @unchecked Sendable { var t0 = Date(); var rows: [(at: Double, rows: [ChatSegment])] = [] }
+        func runTimed(_ prompt: String) async -> (text: String?, log: Timed) {
+            let log = Timed()
+            log.t0 = Date()
+            let t = try? await HermesChat.streamChat(agent: markAgent, key: "test-key-mark", encodedBody: body(prompt), onToken: { _ in },
+                                                     onSegments: { log.rows.append((Date().timeIntervalSince(log.t0), $0)) })
+            return (t, log)
+        }
+        let seq3 = await runTimed("seq3")
+        print("  timing proof, API key, seq3 (the fake pauses 0.5 s before each completion):")
+        for r in seq3.log.rows { print(String(format: "    +%.2fs  ", r.at) + desc(r.rows).map { $0.replacingOccurrences(of: "step:terminal|", with: "") }.joined(separator: " | ")) }
+        let seqStates = seq3.log.rows.map { desc($0.rows) }
+        checkTrue("50 the second tool of a round is published as running before its completion frame",
+                  seq3.log.rows.contains { r in let d = desc(r.rows); return d.contains("step:terminal|two|running") && d.contains("step:terminal|one|done") && !d.contains("step:terminal|three|running") && r.at < 0.45 })
+        checkTrue("50b ... and so is the third, with the second done, before the third completes",
+                  seqStates.contains { $0.contains("step:terminal|three|running") && $0.contains("step:terminal|two|done") })
+        check("50c ... the rows at the end", desc(seq3.log.rows.last?.rows ?? []),
+              ["interim:Look.", "step:terminal|one|done", "step:terminal|two|done", "step:terminal|three|done", "answer:Answer."])
+        check("50d ... the returned string is as before", seq3.text ?? "-", "Look.\n\nAnswer.")
+        let tt = await runTimed("text_tool")
+        print("  timing proof, API key, text_tool (a sentence and a tool start in one write, 0.6 s before the completion):")
+        for r in tt.log.rows { print(String(format: "    +%.2fs  ", r.at) + desc(r.rows).map { $0.replacingOccurrences(of: "step:terminal|", with: "") }.joined(separator: " | ")) }
+        checkTrue("51 a tool start in the same write as the sentence before it is published at once",
+                  tt.log.rows.contains { desc($0.rows).contains("step:terminal|work|running") && $0.at < 0.5 })
+        func final(_ prompt: String) async -> (text: String?, log: SegLog) { let r = await runSegs(prompt); return (r.text, r.log) }
+        let thinkOpen = await final("think_open")
+        check("52 a think tag with no closing tag: the rows show the whole turn, as the stored text holds it",
+              desc(thinkOpen.log.last),
+              ["interim:Hi. <think>plan", "step:terminal|ls|done", "interim:More.", "step:terminal|ls|done", "answer:Answer."])
+        check("52 ... the returned string is as before", thinkOpen.text ?? "-", "Hi. <think>plan\n\nMore.\n\nAnswer.")
+        let literal = await final("think_literal")
+        check("52b an answer that names the tag in inline code is shown whole", desc(literal.log.last),
+              ["answer:Use the `<think>` tag for reasoning. Then answer."])
+        func seg2(_ id: Int, _ t: String, _ r: ChatSegment.TextRole) -> ChatSegment { ChatSegment(id: id, kind: .text(t, role: r)) }
+        func step2(_ id: Int) -> ChatSegment {
+            ChatSegment(id: id, kind: .step(ChatStep(callId: "c\(id)", tool: "t", label: "l", detail: nil, status: .done)))
+        }
+        check("53 at the end, a block closed across a tool is hidden in both rows",
+              desc(HermesChat.finalDisplaySegments([seg2(0, "<think>secret plan A", .interim), step2(1), seg2(2, "secret plan B</think>Visible.", .answer)])),
+              ["step:t|l|done", "answer:Visible."])
+        check("53b ... text around the block stays",
+              desc(HermesChat.finalDisplaySegments([seg2(0, "Hello. <think>plan one", .interim), step2(1), seg2(2, "plan two</think>Answer.", .answer)])),
+              ["interim:Hello.", "step:t|l|done", "answer:Answer."])
+        check("53c ... an open block after a closed one stays whole, as the stored text",
+              desc(HermesChat.finalDisplaySegments([seg2(0, "A<think>x</think>B<think>never", .interim), step2(1), seg2(2, "later", .answer)])),
+              ["interim:AB<think>never", "step:t|l|done", "answer:later"])
+        for sample in ["a<think>b</think>c", "<think>x", "plain", "</think>x", "a <think>b</think> c <think>d", "  spaced  ", "<think>a</think>", "`<think>` tag"] {
+            let want = LocalChat.filterThinkingBlocks(sample)
+            check("53d one row at the end is filtered as the returned string is: \(sample.debugDescription)",
+                  desc(HermesChat.finalDisplaySegments([seg2(0, sample, .answer)])), want.isEmpty ? [] : ["answer:" + want])
+        }
+
+        // One published write per tick: with onTurn the two callbacks are not used.
+        final class TurnLog: @unchecked Sendable { var calls = 0; var both = 0; var content: String?; var rows: [ChatSegment] = []; var separate = 0 }
+        let tlog = TurnLog()
+        let turnText = try? await HermesChat.streamChat(agent: markAgent, key: "test-key-mark", encodedBody: body("steps2"),
+                                                        onToken: { _ in tlog.separate += 1 }, onSegments: { _ in tlog.separate += 1 },
+                                                        onTurn: { c, r in
+                                                            tlog.calls += 1
+                                                            if c != nil && r != nil { tlog.both += 1 }
+                                                            if let c { tlog.content = c }
+                                                            if let r { tlog.rows = r }
+                                                        })
+        check("13 with onTurn, the two separate callbacks are never called", tlog.separate, 0)
+        checkTrue("13 ... the rows and the text arrive through it", tlog.calls >= 1 && tlog.content != nil && desc(tlog.rows) == desc(two.log.last))
+        check("13 ... and the returned string is the same", turnText ?? "-", two.text ?? "+")
+        // Privacy: every call, every token, the returned string.
+        let markers = ["REASONING_MARKER_77", "APPROVAL_COMMAND_MARKER_88", "STATUS_MARKER_99", "💻", "🗄️", "🔧"]
+        for (name, run) in [("steps", stepsRun), ("steps_off", offRun), ("approval", apprRun), ("status", statusRun), ("steps2", two),
+                            ("default", defRun), ("think_split", thinkRun), ("reuse_id", reuseRun), ("burst", burstRun)] {
+            let seen = (run.log.all.flatMap(desc) + run.log.tokens + [run.text ?? ""]).joined(separator: "\n")
+            checkTrue("15 \(name): no marker and no emoji in any row, any token or the returned string", !markers.contains { seen.contains($0) })
+        }
+
+        print("steps: the request body and the history")
+        // What the app does after a turn with steps: the assistant entry is the returned string, nothing else.
+        let history: [String: Any] = ["model": "mark", "stream": true, "messages": [
+            ["role": "user", "content": "steps"],
+            ["role": "assistant", "content": stepsRun.text ?? ""],
+            ["role": "user", "content": "next"]]]
+        let historyBody = (try? JSONSerialization.data(withJSONObject: history)) ?? Data()
+        _ = try? await HermesChat.streamChat(agent: markAgent, key: "test-key-mark", encodedBody: historyBody) { _ in }
+        let seen = (try? await URLSession.shared.data(from: URL(string: base + "/_test/last_body")!))?.0 ?? Data()
+        check("9 streamChat sends the body it is given untouched (byte for byte)", seen, historyBody)
+        let seenJSON = (try? JSONSerialization.jsonObject(with: seen)) as? [String: Any]
+        let seenMsgs = (seenJSON?["messages"] as? [[String: Any]]) ?? []
+        check("9 ... the assistant message in it is the string the test put there", seenMsgs.count > 1 ? (seenMsgs[1]["content"] as? String ?? "-") : "-", stepsRun.text ?? "+")
+        let seenText = String(decoding: seen, as: UTF8.self)
+        checkTrue("9 ... and a body the test built holds no label, no tool name, no note (the transport adds none)",
+                  !seenText.contains("graph.facebook.com") && !seenText.contains("terminal") && !seenText.contains(HermesChat.approvalNote)
+                    && !seenText.contains(HermesChat.interruptedNote))
+
+        // The history the app sends is built by one pure function (ClaudeService calls it): rows never enter it.
+        let storedMessages: [[String: Any]] = [
+            ["role": "user", "content": [["type": "text", "text": "steps"], ["type": "image_url", "image_url": "x"]]],
+            ["role": "assistant", "content": stepsRun.text ?? ""],
+            ["role": "user", "content": "next"]]
+        let built = HermesChat.requestMessages(from: storedMessages)
+        check("14 the history keeps the roles and the text of each message", built.map { ($0["role"] as? String ?? "-") + ":" + ($0["content"] as? String ?? "-") },
+              ["user:steps", "assistant:" + (stepsRun.text ?? ""), "user:next"])
+        let builtJSON = String(decoding: (try? JSONSerialization.data(withJSONObject: built, options: [.sortedKeys])) ?? Data(), as: UTF8.self)
+        let rowWords = desc(stepsRun.log.last).filter { !$0.hasPrefix("answer:") && !$0.hasPrefix("interim:") }
+        checkTrue("14 ... and holds no step, label, tool name or note of the rows",
+                  !builtJSON.contains("graph.facebook.com") && !builtJSON.contains("terminal") && !builtJSON.contains(HermesChat.approvalNote)
+                    && !builtJSON.contains(HermesChat.interruptedNote) && !builtJSON.contains("running") && !rowWords.isEmpty)
+        check("14 ... the same dictionaries are used for a message that is already text", built.count, 3)
+
         print("limits")
         var small = HermesChat.Limits()
         small.lineBytes = 2048

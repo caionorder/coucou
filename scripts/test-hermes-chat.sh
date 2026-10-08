@@ -16,6 +16,7 @@ SERVER_PID=$!
 # Compilation typically takes a few seconds, which gives the server plenty of
 # time to bind and write its port — avoiding a busy-wait on fast machines.
 swiftc \
+    NotchBuddy/Sources/App/ChatTurn.swift \
     NotchBuddy/Sources/App/HermesChat.swift \
     NotchBuddy/Sources/App/LocalChat.swift \
     NotchBuddy/Sources/App/SafeWebURL.swift \

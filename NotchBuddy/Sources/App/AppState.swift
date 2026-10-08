@@ -28,7 +28,15 @@ final class AppState: ObservableObject {
 
     // Tasks
     @Published var tasks: [AgentTask] = []
-    @Published var focusId: String? = nil
+    @Published var focusId: String? = nil {
+        didSet {
+            // The prompt slot must show what belongs to the focused pill: any writer that moves the focus
+            // (new session, approval card, Hermes announce...) closes a slot that no longer belongs to it.
+            guard oldValue != focusId, !applyingFocusEffect, let content = promptContent,
+                  !PromptSlot.belongs(content, to: focusPill) else { return }
+            closePromptSlot()
+        }
+    }
 
     // Bot state override
     @Published var stateOverride: BotState? = nil
@@ -115,10 +123,19 @@ final class AppState: ObservableObject {
     @Published var chatProvider: ChatProvider = .anthropic {
         didSet {
             UserDefaults.standard.set(chatProvider.rawValue, forKey: "chatProvider")
+            if chatProvider != .hermes { lastSharedProvider = chatProvider }
             // Switching only changes which conversation is shown: a Hermes agent never shares one with another
             // provider or agent, and nothing is cleared or cancelled by the switch.
             clearHermesBadgeIfChatShown()
         }
+    }
+
+    /// The last provider of the shared chat (any provider but Hermes). The shared chat is shown with it when the
+    /// provider is Hermes and the slot opens for a pill that is not a Hermes agent.
+    /// Nil when it is not known (Hermes was already selected before this was tracked): nothing switches to a
+    /// cloud provider by itself then.
+    private(set) var lastSharedProvider: ChatProvider? = nil {
+        didSet { if let p = lastSharedProvider { UserDefaults.standard.set(p.rawValue, forKey: "chatSharedProvider") } }
     }
 
     /// Every chat conversation, in memory for the app session only (never written to disk): one for the non Hermes
@@ -160,6 +177,7 @@ final class AppState: ObservableObject {
         for name in names {
             chatHistories.remove(.hermes(name))
             ClaudeService.shared.dropConversation(.hermes(name))
+            promptDrafts.clear(.hermesChat(agent: name))
         }
     }
     @Published var googleChatModel: String = ChatProvider.google.defaultModel {
@@ -421,8 +439,11 @@ final class AppState: ObservableObject {
     }
 
     /// The model currently active for chat (provider-aware).
-    var activeChatModel: String {
-        switch chatProvider {
+    var activeChatModel: String { chatModel(for: chatProvider) }
+
+    /// The model of one provider (a turn keeps the provider it started with).
+    func chatModel(for provider: ChatProvider) -> String {
+        switch provider {
         case .anthropic: return claudeModel
         case .google:    return googleChatModel
         case .openai:    return openAIChatModel
@@ -559,9 +580,7 @@ final class AppState: ObservableObject {
 
     #if !APPSTORE
     // cmux as the main workspace: the reply / new chat prompt, per session transcripts, settings.
-    @Published var cmuxPrompt: CmuxPromptMode? = nil {
-        didSet { if cmuxPrompt == nil { cmuxDraft = nil } }
-    }
+    @Published var cmuxPrompt: CmuxPromptMode? = nil
     /// True only while `IslandWindowController.openCmuxPrompt` switches to the prompt view.
     var cmuxOpeningPrompt = false
     /// Transcripts of the cmux sessions, keyed by surface key (a pill is a workspace with one or more).
@@ -571,8 +590,14 @@ final class AppState: ObservableObject {
     /// Bumped when the sessions of a workspace change, so the reply header and cards redraw.
     @Published var cmuxRevision = 0
     @Published var cmuxNotice: String? = nil {
-        didSet { if !settingCmuxFailure { cmuxNoticeFailure = nil; cmuxNoticeOffersCmux = false } }
+        didSet { if !settingCmuxFailure { cmuxNoticeFailure = nil; cmuxNoticeOffersCmux = false; cmuxNoticeOwner = nil } }
     }
+    /// The reply the notice is about (a failed send). The reply view shows a notice with an owner only when it
+    /// renders that very reply; a notice with no owner belongs to the prompt in general.
+    @Published private(set) var cmuxNoticeOwner: PromptSlot.Content? = nil
+    /// What `CmuxPromptView` renders now. Set and cleared by that view; a send that ends after the view is gone
+    /// uses it to tell whether its reply is still on screen.
+    var cmuxRenderedContent: PromptSlot.Content? = nil
     /// The notice is the "started in cmux" one of a command line launcher: it offers the Open cmux action.
     @Published private(set) var cmuxNoticeOffersCmux = false
     func showCmuxStarted(_ text: String) {
@@ -583,15 +608,15 @@ final class AppState: ObservableObject {
     /// never by comparing the translated text.
     @Published private(set) var cmuxNoticeFailure: CmuxControl.Failure? = nil
     private var settingCmuxFailure = false
-    func showCmuxFailure(_ failure: CmuxControl.Failure) {
+    func showCmuxFailure(_ failure: CmuxControl.Failure, owner: PromptSlot.Content? = nil) {
         settingCmuxFailure = true
         cmuxNotice = failure.message
         cmuxNoticeFailure = failure
         cmuxNoticeOffersCmux = false
+        cmuxNoticeOwner = owner
         settingCmuxFailure = false
     }
     @Published var cmuxBusy = false
-    @Published var cmuxDraft: CmuxDraft? = nil
     @Published var cmuxRecentFolders: [String] = UserDefaults.standard.stringArray(forKey: "cmuxRecentFolders") ?? [] {
         didSet { UserDefaults.standard.set(cmuxRecentFolders, forKey: "cmuxRecentFolders") }
     }
@@ -623,7 +648,7 @@ final class AppState: ObservableObject {
         cmuxLaunchCommands[launcher.id.rawValue] ?? launcher.defaultCommand
     }
 
-    /// Closes the cmux prompt (reply / new chat) and its notice and draft.
+    /// Closes the cmux prompt (reply / new chat) and its notice. Drafts stay in `promptDrafts`.
     func clearCmuxPrompt() {
         if cmuxPrompt != nil { cmuxPrompt = nil }
         if cmuxNotice != nil { cmuxNotice = nil }
@@ -787,7 +812,10 @@ final class AppState: ObservableObject {
         mochiOutfitSelection = Outfit.stored
         if let v = ud.string(forKey: "claudeModel"),
            !v.trimmingCharacters(in: .whitespaces).isEmpty { claudeModel = v }
+        if let v = ud.string(forKey: "chatSharedProvider"), let p = ChatProvider(rawValue: v), p != .hermes { lastSharedProvider = p }
         if let v = ud.string(forKey: "chatProvider"), let p = ChatProvider(rawValue: v) { chatProvider = p }
+        // didSet does not run in init: seed the shared provider from the one loaded when it was never stored.
+        if lastSharedProvider == nil, chatProvider != .hermes { lastSharedProvider = chatProvider }
         if let v = ud.string(forKey: "googleChatModel"), !v.isEmpty { googleChatModel = v }
         if let v = ud.string(forKey: "openAIChatModel"), !v.isEmpty { openAIChatModel = v }
         if let v = ud.string(forKey: "ollamaChatModel"), !v.isEmpty { ollamaChatModel = v }
@@ -879,11 +907,16 @@ final class AppState: ObservableObject {
         tasks[idx].state = state
     }
 
-    func setFocus(_ id: String) {
-        guard let idx = tasks.firstIndex(where: { $0.id == id }) else { return }
-        focusId = id
-        tasks[idx].pillBadge = nil  // clear badge when user brings task to focus
-    }
+    // Prompt slot state (the logic is in PromptSlotState.swift): stored properties cannot live in an extension.
+    /// Set while `setFocus` moves the focus itself and applies the slot rule right after.
+    var applyingFocusEffect = false
+    /// Drafts of the prompt slot by content. Memory only, capped. Not published: the views write it on every
+    /// keystroke; a writer outside the views uses `writeDraft` so the open view picks the text up.
+    var promptDrafts = PromptDrafts()
+    /// Bumped by `writeDraft` only, never by the typing of the user: an open view that sees it reloads its draft.
+    @Published var draftRevision = 0
+    /// Bumped by the writers that end a launch (timeout, folder match, failed first prompt): only these lower `launching`.
+    @Published var launchEndedRevision = 0
 
     func setPillBadge(_ badge: PillBadge, for id: String) {
         guard let idx = tasks.firstIndex(where: { $0.id == id }) else { return }
@@ -1001,7 +1034,8 @@ final class AppState: ObservableObject {
     }
 
     /// Running chat turns per agent name. The pill stays thinking until the last of them ends.
-    private(set) var hermesTurnsRunning: [String: Int] = [:]
+    /// Published: the last message of a chat is drawn as finished when the count drops, with or without a pill row.
+    @Published private(set) var hermesTurnsRunning: [String: Int] = [:]
 
     /// A turn starts (`true`) or ends (`false`) for an agent: the pill is thinking while any turn runs.
     func setHermesPillBusy(agentName: String, _ busy: Bool) {
@@ -1042,12 +1076,13 @@ final class AppState: ObservableObject {
 
     /// The island should open on the Hermes chat rather than the overview.
     var opensOnHermesChat: Bool {
-        HermesAnnounce.opensOnChat(hermesChatActive: activeHermesPillId != nil, unseenAnswer: hermesHasUnseenAnswer,
-                                   turnRunning: hermesTurnRunning, alertPending: alertCardPending)
+        PromptSlot.reopensOnHermesChat(focus: focusPill, activeAgent: chatProvider == .hermes ? activeHermesAgent?.name : nil,
+                                       unseenAnswer: hermesHasUnseenAnswer, turnRunning: hermesTurnRunning,
+                                       alertPending: alertCardPending)
     }
 
     /// The cmux prompt occupies the prompt slot, or is being opened (the view changes before `cmuxPrompt` is set).
-    private var cmuxPromptIsOpenOrOpening: Bool {
+    var cmuxPromptIsOpenOrOpening: Bool {
         #if !APPSTORE
         return cmuxPrompt != nil || cmuxOpeningPrompt
         #else
@@ -1299,6 +1334,16 @@ struct ChatMessage: Identifiable, Equatable {
     let id = UUID()
     let role: ChatRole
     var content: String   // var for streaming updates
+    /// Display only, never encoded, persisted, logged or sent: the shared chat provider that wrote an answer
+    /// (nil for the user, for Hermes and for messages made before this field), and the rows of an agent turn
+    /// (empty: the message is drawn as one answer made from `content`).
+    var provider: ChatProvider? = nil
+    var segments: [ChatSegment] = []
+    /// A sentence the app wrote (an error kept in the chat), never a text that is still arriving.
+    var isNotice = false
+    /// Something to draw: text, or the rows of an agent turn that has written no text yet. The chat list and the
+    /// scroll targets of the chat share this one rule.
+    var isShown: Bool { ChatVisibility.isShown(content: content, segments: segments) }
 }
 
 /// The one sign in session store of the app, over the Keychain item "hermes-agent-sessions".

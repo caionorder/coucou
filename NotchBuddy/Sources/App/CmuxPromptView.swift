@@ -13,6 +13,8 @@ final class CmuxPromptModeBox {
 /// clicks Send or presses Return (plus the single deferred first prompt of a new chat).
 struct CmuxPromptView: View {
     @ObservedObject var state: AppState
+    /// The mode this view is created for: the very value used for `.id(mode)`, so no state read decides what Send does.
+    let bornMode: CmuxPromptMode
     @State private var text = ""
     @State private var folder = ""
     /// Claude every time the view opens: the last choice is not remembered.
@@ -23,8 +25,25 @@ struct CmuxPromptView: View {
     @FocusState private var focused: Bool
     /// Follow the newest text unless the user scrolled up.
     @State private var pinned = true
+    /// The session the header, the chips, the transcript and Send show. It follows the registry on the next
+    /// render; Send compares it with the registry at the press and refuses when they differ.
+    @State private var renderedKey: String?
+    /// The content the text in the field was loaded for. Set only where a draft is loaded; every edit is filed
+    /// under it (at the moment of the edit, not in a callback) and a send needs it to equal what is rendered.
+    @State private var textOwner: PromptSlot.Content?
+    /// A chip click is in flight: the retarget it causes is the user's own, so it needs no notice.
+    @State private var chipClicked = false
 
     private var mode: CmuxPromptMode { state.cmuxPrompt ?? .newChat }
+
+    /// The field. An edit is stored under the owner of the text right when it happens, so no order of callbacks
+    /// can file it under another content.
+    private var fieldText: Binding<String> {
+        Binding(get: { text }, set: { new in
+            text = new
+            if let owner = textOwner { state.promptDrafts.set(new, for: owner) }
+        })
+    }
 
     private var replyTask: AgentTask? {
         if case .reply(let id) = mode { return state.tasks.first { $0.id == id } }
@@ -45,10 +64,19 @@ struct CmuxPromptView: View {
         if !out.contains(folder) { folder = out.first ?? "" }
     }
 
-    /// The session a reply goes to: the one picked with the chips, else the main agent of the workspace.
-    private var targetKey: String? {
+    /// The session the registry says a reply goes to now: the one picked with the chips, else the main agent.
+    private var resolvedKey: String? {
         guard let t = replyTask else { return nil }
         return HookServer.shared.cmuxReplyTarget(for: t.id)
+    }
+
+    /// The session on screen. Only the very first frame, before `onAppear`, reads the registry.
+    private var targetKey: String? { renderedKey ?? resolvedKey }
+
+    /// What this view shows, for the drafts, the notice owner and the delivery check.
+    private var renderedContent: PromptSlot.Content {
+        if case .reply(let id) = mode { return .cmuxReply(taskId: id, surfaceKey: targetKey) }
+        return .cmuxNewChat
     }
 
     /// Proof that the session runs an agent (it reported in with a token: a session Coucou only discovered has
@@ -64,14 +92,19 @@ struct CmuxPromptView: View {
         return !launching && folders.contains(folder)
     }
 
+    /// A notice about a send belongs to the reply it was sent from: another reply does not show it.
+    private var storedNoticeIsMine: Bool {
+        state.cmuxNotice != nil && (state.cmuxNoticeOwner == nil || state.cmuxNoticeOwner == renderedContent)
+    }
+
     private var notice: String? {
-        if let n = state.cmuxNotice { return n }
+        if storedNoticeIsMine, let n = state.cmuxNotice { return n }
         return impliedFailure?.message
     }
 
     /// The failure the notice stands for: the one stored with it, or the one the session state implies.
     private var noticeFailure: CmuxControl.Failure? {
-        state.cmuxNotice != nil ? state.cmuxNoticeFailure : impliedFailure
+        storedNoticeIsMine ? state.cmuxNoticeFailure : impliedFailure
     }
 
     private var impliedFailure: CmuxControl.Failure? {
@@ -87,6 +120,12 @@ struct CmuxPromptView: View {
     private var transcript: [ChatMessage] {
         if isReply, let key = targetKey { return state.cmuxTranscripts[key] ?? [] }
         return []
+    }
+
+    /// The session that answers: its label (the string the header and chips show) in the colour of its pill.
+    private var replySpeaker: ChatSpeaker {
+        let label = replyTask.flatMap { t in HookServer.shared.cmuxSurfaces(for: t.id).first { $0.key == targetKey }?.label }
+        return ChatSpeaker(name: label ?? replyTask?.name ?? "cmux", colorHex: replyTask?.color ?? "#8E939C")
     }
 
     private var typing: Bool {
@@ -152,7 +191,7 @@ struct CmuxPromptView: View {
                 }
 
                 HStack(spacing: 8) {
-                    TextField(isReply ? String(localized: "Reply…") : String(localized: "First prompt…"), text: $text)
+                    TextField(isReply ? String(localized: "Reply…") : String(localized: "First prompt…"), text: fieldText)
                         .textFieldStyle(.plain)
                         .font(.system(size: 13))
                         .focused($focused)
@@ -183,12 +222,28 @@ struct CmuxPromptView: View {
             launcherId = .claude
             launching = HookServer.shared.cmuxPendingLaunch != nil
             loadFolders()
-            takeDraft()
+            renderedKey = resolvedKey
+            state.cmuxRenderedContent = renderedContent
+            loadDraft()
+        }
+        .onDisappear {
+            if state.cmuxRenderedContent == renderedContent { state.cmuxRenderedContent = nil }
         }
         .onChange(of: state.cmuxPrompt) { _, _ in launcherId = .claude }
         .onChange(of: state.cmuxDefaultFolder) { _, _ in loadFolders() }
         .onChange(of: state.cmuxRecentFolders) { _, _ in loadFolders() }
-        .onChange(of: state.cmuxDraft) { _, _ in takeDraft() }
+        // The registry moved the session of this pill (discovery, a closed session, a chip): show the new one.
+        .onChange(of: resolvedKey) { _, new in renderedKey = new }
+        // The field shows the draft of what is rendered; what is typed is kept for it.
+        .onChange(of: renderedContent) { _, new in
+            state.cmuxRenderedContent = new
+            loadDraft()
+        }
+        // A draft written from outside (a launch that timed out, a prompt that could not be typed, a send that ended).
+        // Keyed on the write counter, not on the text: the typing of the user also stores its draft.
+        .onChange(of: state.draftRevision) { _, _ in loadDraft() }
+        // Only a launch outcome (timeout, folder match, failed first prompt) lets Send work again while a launch waits.
+        .onChange(of: state.launchEndedRevision) { _, _ in launching = false }
         .onReceive(NotificationCenter.default.publisher(for: .islandSendMessage)) { _ in
             guard state.view == .prompt, state.cmuxPrompt != nil else { return }
             send()
@@ -217,7 +272,10 @@ struct CmuxPromptView: View {
             let target = targetKey
             ChipFlowLayout(spacing: 6) {
                 ForEach(surfaces, id: \.key) { s in
-                    Button { HookServer.shared.setCmuxReplyChoice(s.key, for: task.id) } label: {
+                    Button {
+                        if s.key != target { chipClicked = true }
+                        HookServer.shared.setCmuxReplyChoice(s.key, for: task.id)
+                    } label: {
                         chipLabel(s.label, selected: s.key == target)
                     }
                     .buttonStyle(.plain)
@@ -231,17 +289,11 @@ struct CmuxPromptView: View {
 
     @ViewBuilder private var replyBody: some View {
         if !transcript.isEmpty || typing {
+            let who = replySpeaker
             ScrollViewReader { proxy in
                 ScrollView(.vertical, showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(transcript) { msg in
-                            ChatBubble(message: msg).id(msg.id)
-                        }
-                        if typing {
-                            HStack { TypingDotsView(); Spacer(minLength: 32) }.id("typing")
-                        }
-                    }
-                    .padding(.vertical, 2)
+                    ChatTurnList(messages: transcript, speaker: { _ in who }, streamingLast: false, typing: typing)
+                        .padding(.vertical, 2)
                 }
                 .pinnedScrollTracking($pinned) { scrollToEnd(proxy) }
                 .onChange(of: transcript) { _, _ in if pinned { scrollToEnd(proxy) } }
@@ -312,28 +364,66 @@ struct CmuxPromptView: View {
 
     // MARK: actions
 
-    /// A draft goes back into the field only in the mode it was stored for.
-    private func takeDraft() {
-        guard let draft = state.cmuxDraft, draft.mode == mode, !draft.text.isEmpty else { return }
-        text = draft.text
-        state.cmuxDraft = nil
-        launching = false
+    /// The field takes the draft stored for what is rendered (empty when that content has none: the text typed
+    /// belongs to the other content, where it stays as a draft). The owner of the text is set here, and only here.
+    private func loadDraft() {
+        let content = renderedContent
+        // The session moved under typed text without the user doing it: say so. The text stays the draft of the
+        // session it was typed for (every edit was filed under its owner); the field takes the new one.
+        if PromptSlot.retargetNeedsNotice(owner: textOwner, rendered: content, textIsEmpty: text.isEmpty, byUser: chipClicked) {
+            state.showCmuxFailure(.sessionClosed, owner: content)
+        }
+        if textOwner != content { chipClicked = false }
+        textOwner = content
+        let draft = state.promptDrafts.text(for: content)
+        if draft != text { text = draft }
+    }
+
+    /// A send ended: the text goes (sent, or typed in cmux) or comes back (failed), in the draft of the content it
+    /// was sent from. The open view follows its draft; a view that is gone leaves the draft for when it returns.
+    private func settleDraft(_ content: PromptSlot.Content, sent prompt: String, keep: Bool) {
+        if keep {
+            state.restoreDraft(prompt, for: content)
+        } else {
+            // The sent text goes; text appended after the press stays, any other edit empties the field.
+            let draft = state.promptDrafts.text(for: content)
+            let remaining = PromptSlot.draftAfterSend(draft: draft, sent: prompt)
+            if remaining != draft { state.writeDraft(remaining, for: content) }
+        }
     }
 
     /// Explicit user action only: Send click, Return, or the island send shortcut.
     private func send() {
         guard canSubmit else { return }
+        // Only the mode this view was created for, and only while the prompt is still open: a prompt that was just
+        // closed (a card arriving, a focus change) must not turn a Return into a new chat.
+        guard state.view == .prompt, let current = state.cmuxPrompt, current == bornMode else { return }
+        // The text must have been loaded for what is rendered; otherwise it belongs to another session or chat.
+        guard PromptSlot.textMayDeliver(owner: textOwner, rendered: renderedContent) else {
+            if isReply { renderedKey = resolvedKey }
+            state.showCmuxFailure(.sessionClosed, owner: renderedContent)
+            return
+        }
         let prompt = text
         pinned = true
         state.cmuxNotice = nil
-        switch mode {
+        switch current {
         case .reply(let id):
-            CmuxControl.send(text: prompt, to: id, surfaceKey: targetKey) { failure in
+            // Only to the session that is on screen. If the registry moved on since the last render, nothing is
+            // typed: the view shows the new session and says so; the text stays with the session it was typed for.
+            let rendered = PromptSlot.Content.cmuxReply(taskId: id, surfaceKey: renderedKey)
+            let resolved = PromptSlot.Content.cmuxReply(taskId: id, surfaceKey: resolvedKey)
+            guard PromptSlot.mayDeliver(rendered: rendered, resolved: resolved), let key = renderedKey else {
+                renderedKey = resolvedKey
+                state.showCmuxFailure(.sessionClosed, owner: .cmuxReply(taskId: id, surfaceKey: resolvedKey))
+                return
+            }
+            CmuxControl.send(text: prompt, to: id, surfaceKey: key) { failure in
                 if let failure {
-                    state.showCmuxFailure(failure)
-                    if failure != .enterNotSent { text = prompt } else { text = "" }
+                    state.showCmuxFailure(failure, owner: rendered)
+                    settleDraft(rendered, sent: prompt, keep: failure != .enterNotSent)
                 } else {
-                    text = ""
+                    settleDraft(rendered, sent: prompt, keep: false)
                 }
             }
         case .newChat:
@@ -341,12 +431,12 @@ struct CmuxPromptView: View {
             let chosenLauncher = launcher
             CmuxControl.newChat(folder: chosen, prompt: prompt, launcher: chosenLauncher) { failure in
                 if let failure {
-                    state.showCmuxFailure(failure)
-                    text = prompt
+                    state.showCmuxFailure(failure, owner: .cmuxNewChat)
+                    settleDraft(.cmuxNewChat, sent: prompt, keep: true)
                 } else {
-                    text = ""
+                    settleDraft(.cmuxNewChat, sent: prompt, keep: false)
                     // Only Claude reports its start; the others have no pending launch to wait for.
-                    launching = chosenLauncher.reportsSessionStart
+                    if state.cmuxRenderedContent == .cmuxNewChat { launching = chosenLauncher.reportsSessionStart }
                 }
             }
         }
@@ -384,6 +474,22 @@ enum CmuxHub {
 
     static func open(_ mode: CmuxPromptMode) {
         NotificationCenter.default.post(name: .openCmuxPrompt, object: CmuxPromptModeBox(mode))
+    }
+
+    /// Reply from a card or the overview: the session whose answer is on the card comes first, else the chip the
+    /// user picked, else the main one. Only a live session is chosen; nothing is typed.
+    static func openReply(taskId: String) {
+        let server = HookServer.shared
+        let state = AppState.shared
+        let live = Set(server.cmuxSurfaces(for: taskId).map { $0.key })
+        let surface = PromptSlot.replySurface(cardSurface: server.cmuxFinalSurface(for: taskId),
+                                              choice: state.cmuxReplyChoice[taskId],
+                                              main: server.cmuxMainSurface(for: taskId), live: live)
+        // The main session needs no pin: it is what the reply resolves to by itself (and follows its changes).
+        if let surface, surface != server.cmuxReplyTarget(for: taskId) {
+            server.setCmuxReplyChoice(surface, for: taskId)
+        }
+        open(.reply(taskId: taskId))
     }
 }
 

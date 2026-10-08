@@ -165,6 +165,48 @@ enum HermesSignInTests {
         }
     }
 
+    final class RowLog: @unchecked Sendable { var calls = 0; var last: [ChatSegment] = []; var all: [[ChatSegment]] = [] }
+
+    /// A turn that also keeps the rows it was given (the last call is what the chat ends with).
+    static func turnRows(_ a: HermesAgent, _ sessions: HermesSessions, _ text: String, stored: String? = nil,
+                         limits: HermesChat.Limits = .standard) async -> (result: TurnResult, rows: RowLog) {
+        let box = Box()
+        let log = RowLog()
+        do {
+            let t = try await HermesSignInNet.streamTurn(agent: a, sessions: sessions, storedSession: stored, text: text,
+                                                         limits: limits,
+                                                         onSession: { box.sessionIDs.append($0) },
+                                                         onToken: { box.tokens.append($0) },
+                                                         onSegments: { log.calls += 1; log.last = $0; log.all.append($0) })
+            return (TurnResult(text: t, error: nil, stored: box.sessionIDs.last, tokens: box.tokens), log)
+        } catch {
+            return (TurnResult(text: nil, error: error, stored: box.sessionIDs.last, tokens: box.tokens), log)
+        }
+    }
+
+    final class TimedLog: @unchecked Sendable { var t0 = Date(); var rows: [(at: Double, rows: [ChatSegment])] = [] }
+
+    /// A turn that keeps every call of `onSegments` with its offset from the start of the call.
+    static func timedRows(_ a: HermesAgent, _ sessions: HermesSessions, _ text: String) async -> TimedLog {
+        let log = TimedLog()
+        log.t0 = Date()
+        _ = try? await HermesSignInNet.streamTurn(agent: a, sessions: sessions, storedSession: nil, text: text,
+                                                  onSession: { _ in }, onToken: { _ in },
+                                                  onSegments: { log.rows.append((Date().timeIntervalSince(log.t0), $0)) })
+        return log
+    }
+
+    static func describe(_ segs: [ChatSegment]) -> [String] {
+        segs.map { seg in
+            switch seg.kind {
+            case .text(let t, let role): return "\(role):\(t)"
+            case .step(let st): return "step:\(st.tool)|\(st.label)|\(st.detail ?? "-")|\(st.status)"
+            case .note(let n): return "note:\(n)"
+            case .hiddenSteps: return "hidden"
+            }
+        }
+    }
+
     static func chatError(_ r: TurnResult) -> HermesChatError? { r.error as? HermesChatError }
 
     // MARK: Main
@@ -660,6 +702,31 @@ enum HermesSignInTests {
         check("plain tool.complete", SI.decode(ev("tool.complete", "s1", #"{"name":"t"}"#)), .ignored)
         check("unknown event", SI.decode(ev("tool.progress")), .ignored)
         check("thinking is ignored", SI.decode(ev("thinking.delta", "s1", #"{"text":"hmm"}"#)), .ignored)
+        check("1 interim", SI.decode(ev("message.interim", "s1", #"{"text":"Looking.","already_streamed":true}"#)),
+              .interim(session: "s1", text: "Looking.", alreadyStreamed: true))
+        check("1 interim without already_streamed", SI.decode(ev("message.interim", "s1", #"{"text":"Looking."}"#)),
+              .interim(session: "s1", text: "Looking.", alreadyStreamed: false))
+        check("1 interim without text", SI.decode(ev("message.interim", "s1", "{}")), .ignored)
+        check("1 tool.start reads the id, the name and the context",
+              SI.decode(ev("tool.start", "s1", #"{"tool_id":"t1","name":"terminal","context":"ls -la","args":{"command":"SECRET"},"args_text":"SECRET","labels":["x"]}"#)),
+              .toolStart(session: "s1", id: "t1", name: "terminal", context: "ls -la"))
+        check("1 tool.start without a context", SI.decode(ev("tool.start", "s1", #"{"tool_id":"t1","name":"terminal"}"#)),
+              .toolStart(session: "s1", id: "t1", name: "terminal", context: ""))
+        check("1 tool.start without tool_id is ignored", SI.decode(ev("tool.start", "s1", #"{"name":"terminal"}"#)), .ignored)
+        check("1 tool.start without name is ignored", SI.decode(ev("tool.start", "s1", #"{"tool_id":"t1"}"#)), .ignored)
+        check("1 tool.complete reads the id and the summary",
+              SI.decode(ev("tool.complete", "s1", #"{"tool_id":"t1","name":"terminal","args":{},"result":"SECRET","summary":"3 files in 1.2s","inline_diff":"SECRET"}"#)),
+              .toolComplete(session: "s1", id: "t1", summary: "3 files in 1.2s", approvalHint: false))
+        check("1 tool.complete without a summary", SI.decode(ev("tool.complete", "s1", #"{"tool_id":"t1","name":"terminal"}"#)),
+              .toolComplete(session: "s1", id: "t1", summary: nil, approvalHint: false))
+        check("1 tool.complete without tool_id is ignored", SI.decode(ev("tool.complete", "s1", #"{"name":"terminal","summary":"x"}"#)), .ignored)
+        check("2 tool.complete whose result mentions the withdrawn approval",
+              SI.decode(ev("tool.complete", "s1", #"{"tool_id":"t1","name":"terminal","result":"approval was withdrawn before"}"#)),
+              .toolComplete(session: "s1", id: "t1", summary: nil, approvalHint: true))
+        check("3 complete with response_previewed", SI.decode(ev("message.complete", "s1", #"{"text":"done","status":"complete","response_previewed":true}"#)),
+              .complete(session: "s1", text: "done", status: "complete", error: nil, delivered: true))
+        check("3 complete with response_reused", SI.decode(ev("message.complete", "s1", #"{"text":"done","response_reused":true}"#)),
+              .complete(session: "s1", text: "done", status: "complete", error: nil, delivered: true))
         check("garbage", SI.decode("not json"), .ignored)
         check("array", SI.decode("[1,2]"), .ignored)
         check("empty", SI.decode(""), .ignored)
@@ -691,6 +758,87 @@ enum HermesSignInTests {
         check("approval flag", notes.approval, true)
         check("notes order", (try? notes.finalText(tooSlow: false, closedEarly: true, resumedFresh: true)) ?? "ERR",
               "Answer\n\n" + HermesChat.interruptedNote + "\n" + SI.approvalNote + "\n" + SI.newSessionNote)
+        print("Turn reducer: rows")
+        var rt = SI.Turn()
+        rt.session = "s1"
+        _ = rt.ingest(.delta(session: "s1", text: "Looking."), maxChars: 100)
+        _ = rt.ingest(.toolStart(session: "s2", id: "x", name: "foreign", context: "FOREIGN"), maxChars: 100)
+        check("4 a step of another session id is ignored", describe(rt.rows.segments), ["open:Looking."])
+        _ = rt.ingest(.toolStart(session: "s1", id: "t1", name: "terminal", context: "ls"), maxChars: 100)
+        check("4 a step of ours is a row, the text before it is interim", describe(rt.rows.segments), ["interim:Looking.", "step:terminal|ls|-|running"])
+        check("4 ... and the stream loop is told", rt.stepsTouched, true)
+        _ = rt.ingest(.toolComplete(session: "s1", id: "t1", summary: "ok", approvalHint: false), maxChars: 100)
+        check("4 a completion closes the step", describe(rt.rows.segments), ["interim:Looking.", "step:terminal|ls|ok|done"])
+        _ = rt.ingest(.start(session: "s1"), maxChars: 100)
+        check("4 message.start clears the rows", describe(rt.rows.segments), [])
+        var wait = SI.Turn()
+        wait.session = "s1"
+        wait.queuedBehindRunningTurn()
+        _ = wait.ingest(.toolStart(session: "s1", id: "t1", name: "terminal", context: "OLD"), maxChars: 100)
+        _ = wait.ingest(.interim(session: "s1", text: "OLD", alreadyStreamed: false), maxChars: 100)
+        check("4 a step frame while awaitingStart is ignored", describe(wait.rows.segments), [])
+        var fin = SI.Turn()
+        _ = fin.ingest(.delta(session: "", text: "Progress then answer"), maxChars: 100)
+        _ = fin.ingest(.complete(session: "", text: "Answer", status: "complete", error: nil), maxChars: 100)
+        check("the server's final text is the answer row", describe(fin.rows.segments), ["answer:Answer"])
+        var appr = SI.Turn()
+        _ = appr.ingest(.delta(session: "", text: "Answer"), maxChars: 100)
+        _ = appr.ingest(.serverRequest(id: "srq-1", method: "approval"), maxChars: 100)
+        check("an approval request is the existing sentence as a row, once",
+              describe(appr.rows.segments), ["interim:Answer", "note:" + SI.approvalNote])
+        _ = appr.ingest(.requestCancelled(method: "approval"), maxChars: 100)
+        check("... and not twice", appr.rows.segments.count, 2)
+        var out = SI.Turn()
+        _ = out.ingest(.toolStart(session: "", id: "t1", name: "terminal", context: "ls"), maxChars: 100)
+        let o1 = out.outcome(tooSlow: false, closedEarly: true, resumedFresh: false)
+        check("outcome: closed early is not ok and carries the interrupted note", o1.ok == false && o1.notes == [HermesChat.interruptedNote], true)
+        out.settleRows(ok: o1.ok, notes: o1.notes)
+        check("settle: the step stopped, the note is a row", describe(out.rows.segments), ["step:terminal|ls|-|stopped", "note:" + HermesChat.interruptedNote])
+        var hintFrom = SI.Turn()
+        hintFrom.session = "s1"
+        _ = hintFrom.ingest(.delta(session: "s1", text: "Working."), maxChars: 100)
+        _ = hintFrom.ingest(.toolComplete(session: "s2", id: "x", summary: nil, approvalHint: true), maxChars: 100)
+        // The hint is applied before the session guard, as at HEAD: a subagent runs under another session id, and a
+        // missed approval notice is worse than a spurious one (informational only).
+        check("25 a withdrawn approval hint inside a frame of another session still leaves the notice (as HEAD)", hintFrom.approval, true)
+        check("25 ... as one note row", describe(hintFrom.rows.segments), ["interim:Working.", "note:" + SI.approvalNote])
+        _ = hintFrom.ingest(.complete(session: "s1", text: "Done.", status: "complete", error: nil), maxChars: 100)
+        var hintLate = SI.Turn()
+        hintLate.session = "s1"
+        _ = hintLate.ingest(.complete(session: "s1", text: "Done.", status: "complete", error: nil), maxChars: 100)
+        _ = hintLate.ingest(.toolComplete(session: "s1", id: "y", summary: nil, approvalHint: true), maxChars: 100)
+        check("25 ... and so does one that comes after the turn is done", hintLate.approval, true)
+        var hintOurs = SI.Turn()
+        hintOurs.session = "s1"
+        _ = hintOurs.ingest(.toolComplete(session: "s1", id: "y", summary: nil, approvalHint: true), maxChars: 100)
+        check("25 ... while one from our session counts, once", hintOurs.approval && hintOurs.rows.segments.count == 1, true)
+        check("26 a tool name made only of format characters is ignored by the decoder",
+              SI.decode(ev("tool.start", "s1", #"{"tool_id":"t1","name":"\u200B\u202E"}"#)), .ignored)
+        // One function decides the notes: finalText appends exactly what outcome says.
+        var grid = 0, gridBad = 0
+        for status in ["complete", "interrupted", "error"] {
+            for failure in [nil, "boom"] as [String?] {
+                for over in [false, true] {
+                    for slow in [false, true] {
+                        for early in [false, true] {
+                            for appr in [false, true] {
+                                for fresh in [false, true] {
+                                    var t = SI.Turn()
+                                    _ = t.ingest(.delta(session: "", text: "Answer"), maxChars: 100)
+                                    t.status = status; t.failure = failure; t.overLimit = over; t.approval = appr
+                                    let o = t.outcome(tooSlow: slow, closedEarly: early, resumedFresh: fresh)
+                                    let got = (try? t.finalText(tooSlow: slow, closedEarly: early, resumedFresh: fresh)) ?? "ERR"
+                                    let want = o.notes.isEmpty ? "Answer" : "Answer\n\n" + o.notes.joined(separator: "\n")
+                                    grid += 1
+                                    if got != want { gridBad += 1 }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        check("27 finalText and outcome agree on \(grid) states", gridBad, 0)
         var q = SI.Turn()
         q.session = "s1"
         _ = q.ingest(.delta(session: "s1", text: "early old "), maxChars: 100)
@@ -1121,6 +1269,101 @@ enum HermesSignInTests {
         check("the fake received error -32601", (st["rejections"] as? [Int]) ?? [], [-32601])
         x = await turn(ag, ses, "withdrawn")
         check("withdrawn approval hint", x.text, "I could not run that.\n\n" + SI.approvalNote)
+
+        print("turn: steps and interim text")
+        await ctl("/_test/reset")
+        guard await signedIn(mem2, sessions: ses) != nil else { failures += 1; return }
+        let steps = await turnRows(ag, ses, "steps")
+        check("5 steps: interim text, done step with its summary, answer",
+              describe(steps.rows.last),
+              ["interim:Let me check the page.", "step:terminal|curl -s graph.facebook.com/v19.0/me|200 OK in 1.2s|done", "answer:The page is limited."])
+        check("5 steps: the returned string is the final text, as before", steps.result.text, "The page is limited.")
+        let keptRows = describe(steps.rows.last).joined(separator: "\n") + (steps.result.text ?? "")
+        checkTrue("6 no argument, result or reasoning left the decoder",
+                  !keptRows.contains("ARGS_MARKER_41") && !keptRows.contains("RESULT_MARKER_52") && !keptRows.contains("REASONING_MARKER_63"))
+        let two = await turnRows(ag, ses, "steps2")
+        check("end to end, two tools", describe(two.rows.last),
+              ["interim:Let me check the page.", "step:terminal|curl -s graph.facebook.com/v19.0/me|200 OK in 1.2s|done",
+               "interim:The restriction has an unlock date.", "step:mongo_query|automations-flow, last 48h|-|done",
+               "answer:**Yes.** The page is *limited* now."])
+        print("  e2e sign in segments: " + describe(two.rows.last).joined(separator: " ⏎ "))
+        print("  e2e sign in returned: " + (two.result.text ?? "-").replacingOccurrences(of: "\n", with: "\\n"))
+        let only = await turnRows(ag, ses, "interim-only")
+        check("7 interim not streamed, no delta before it: an interim row, then the answer",
+              describe(only.rows.last), ["interim:I will look at it.", "answer:Done looking."])
+        let dup = await turnRows(ag, ses, "interim-final")
+        check("an interim text delivered again by the final answer is not shown twice", describe(dup.rows.last), ["answer:Final words."])
+        let foreign = await turnRows(ag, ses, "steps-noturn")
+        check("tool events of another session id add nothing", describe(foreign.rows.last), ["answer:Own answer."])
+        let cut = await turnRows(ag, ses, "steps-cut")
+        check("the socket closes in the middle of a tool: the step is stopped, the note is a row",
+              describe(cut.rows.last), ["interim:Starting.", "step:terminal|sleep 100|-|stopped", "note:" + HermesChat.interruptedNote])
+        check("... and the string is as before", cut.result.text, "Starting.\n\n" + HermesChat.interruptedNote)
+        let err = await turnRows(ag, ses, "steps-error")
+        check("a turn that ends with an error: the step is stopped", describe(err.rows.last).contains("step:terminal|make|-|stopped"), true)
+        check("... and the string is as before: the text with the interrupted note", err.result.text, "Starting.\n\n" + HermesChat.interruptedNote)
+        check("... the interrupted note is a row", describe(err.rows.last).last, "note:" + HermesChat.interruptedNote)
+        let wd = await turnRows(ag, ses, "withdrawn")
+        check("a withdrawn approval is the existing sentence as a row, once", describe(wd.rows.last),
+              ["note:" + SI.approvalNote, "answer:I could not run that."])
+        let hello = await turnRows(ag, ses, "hi")
+        check("a turn with no step is one answer row", describe(hello.rows.last), ["answer:Hello from Steve."])
+        let all = [steps, two, only, dup, foreign, cut, err, wd, hello]
+        checkTrue("8 no row stays running after any turn",
+                  all.allSatisfy { r in !r.rows.last.contains { if case .step(let s) = $0.kind { return s.status == .running }; return false } })
+
+        print("turn: review fixes")
+        let pre = await turnRows(ag, ses, "interim-prefix")
+        check("20 a sentence streamed in part, then sent whole with already_streamed false, is one row",
+              describe(pre.rows.last), ["interim:Let me check the page.", "step:terminal|ls|ok|done", "answer:Done."])
+        check("20 ... the returned string is the final text", pre.result.text, "Done.")
+        let reuse = await turnRows(ag, ses, "reuse-id")
+        check("21 a tool_id used by two calls is two steps", describe(reuse.rows.last),
+              ["interim:First.", "step:terminal|ls|one|done", "interim:Again.", "step:terminal|ls|two|done", "answer:Answer."])
+        let think = await turnRows(ag, ses, "think-split")
+        check("22 a think block that opens before a tool and closes after it", describe(think.rows.last),
+              ["interim:Hello.", "step:terminal|ls|ok|done", "interim:Mid text.", "step:terminal|ls|ok|done", "answer:Answer."])
+        checkTrue("22 ... no call and no token shows the reasoning",
+                  !(think.rows.all.flatMap(describe) + think.result.tokens).joined().contains("plan part"))
+        let seq3 = await timedRows(ag, ses, "seq3")
+        print("  timing proof, sign in, seq3 (the fake pauses 0.5 s before each completion):")
+        for r in seq3.rows { print(String(format: "    +%.2fs  ", r.at) + describe(r.rows).map { $0.replacingOccurrences(of: "step:terminal|", with: "") }.joined(separator: " | ")) }
+        checkTrue("27 the second tool of a round is published as running before its completion frame",
+                  seq3.rows.contains { r in let d = describe(r.rows); return d.contains("step:terminal|two|-|running") && d.contains("step:terminal|one|ok|done") && !d.contains("step:terminal|three|-|running") && r.at < 0.45 })
+        checkTrue("27b ... and so is the third, with the second done, before the third completes",
+                  seq3.rows.contains { let d = describe($0.rows); return d.contains("step:terminal|three|-|running") && d.contains("step:terminal|two|ok|done") })
+        check("27c ... the rows at the end", describe(seq3.rows.last?.rows ?? []),
+              ["interim:Look.", "step:terminal|one|ok|done", "step:terminal|two|ok|done", "step:terminal|three|ok|done", "answer:Answer."])
+        let tt = await timedRows(ag, ses, "text-tool")
+        print("  timing proof, sign in, text-tool (a sentence and a tool start back to back, 0.6 s before the completion):")
+        for r in tt.rows { print(String(format: "    +%.2fs  ", r.at) + describe(r.rows).map { $0.replacingOccurrences(of: "step:terminal|", with: "") }.joined(separator: " | ")) }
+        checkTrue("27d a tool start right after the sentence before it is published at once",
+                  tt.rows.contains { describe($0.rows).contains("step:terminal|work|-|running") && $0.at < 0.5 })
+        let thinkOpen = await turnRows(ag, ses, "think-open")
+        check("28 a think tag with no closing tag: the rows show the whole turn, as the stored text holds it", describe(thinkOpen.rows.last),
+              ["interim:Hi. <think>plan", "step:terminal|ls|ok|done", "interim:More.", "step:terminal|ls|ok|done", "answer:Answer."])
+        let literal = await turnRows(ag, ses, "think-literal")
+        check("28b an answer that names the tag in inline code is shown whole", describe(literal.rows.last),
+              ["answer:Use the `<think>` tag for reasoning. Then answer."])
+        let burst = await turnRows(ag, ses, "burst")
+        checkTrue("23 a burst of a hundred tools makes few row updates (\(burst.rows.calls))", burst.rows.calls >= 1 && burst.rows.calls <= 2 * StepPublishBudget.perSecond + 2)
+        checkTrue("23 ... few token updates (\(burst.result.tokens.count))", burst.result.tokens.count <= 8)
+        check("23 ... the last rows: sixty steps, one hidden row, the answer",
+              [describe(burst.rows.last).filter { $0.hasPrefix("step:") }.count, describe(burst.rows.last).filter { $0 == "hidden" }.count,
+               describe(burst.rows.last).last == "answer:Burst done." ? 1 : 0], [60, 1, 1])
+        check("23 ... and the string", burst.result.text, "Burst done.")
+        // Privacy: every onSegments call, every onToken value, the returned string; every field the server sends and
+        // the app does not read has a marker.
+        let appr = await turnRows(ag, ses, "approval")
+        check("24 an approval request: the existing sentence is the only trace", describe(appr.rows.last),
+              ["note:" + SI.approvalNote, "answer:continued after the approval."])
+        let markers = ["ARGS_MARKER_41", "RESULT_MARKER_52", "REASONING_MARKER_63", "LABELS_MARKER_74", "STATUS_MARKER_85",
+                       "COMPLETE_REASONING_MARKER_96", "APPROVAL_COMMAND_MARKER_88", "rm -rf"]
+        for (name, run) in [("steps", steps), ("steps2", two), ("approval", appr), ("withdrawn", wd), ("interim-prefix", pre),
+                            ("reuse-id", reuse), ("think-split", think), ("burst", burst), ("hello", hello)] {
+            let seen = (run.rows.all.flatMap(describe) + run.result.tokens + [run.result.text ?? ""]).joined(separator: "\n")
+            checkTrue("24 \(name): no marker in any row, any token or the returned string", !markers.contains { seen.contains($0) })
+        }
 
         print("turn: caps and cancellation")
         await ctl("/_test/reset")

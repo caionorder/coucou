@@ -43,10 +43,4 @@ enum HermesAnnounce {
         if anyTurnWaiting { return current == .none ? .thinking : current }
         return (current == .thinking || current == .error) ? .none : current
     }
-
-    /// The island should open on the chat of the active agent instead of the overview: its pill carries an
-    /// unseen answer, or a turn is still running. Never while an approval or question card is pending.
-    static func opensOnChat(hermesChatActive: Bool, unseenAnswer: Bool, turnRunning: Bool, alertPending: Bool) -> Bool {
-        hermesChatActive && !alertPending && (unseenAnswer || turnRunning)
-    }
 }

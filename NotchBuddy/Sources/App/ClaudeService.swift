@@ -185,6 +185,10 @@ final class ClaudeService {
 
     var apiKey: String? { KeychainStore.shared.get("anthropic-api-key") }
 
+    /// A local provider (Ollama, LM Studio) is streaming an answer into the shared chat. Display only: it tells the
+    /// chat that the last text is still arriving. The writes that end it also write the message, which redraws.
+    private(set) var sharedChatStreaming = false
+
     /// Hermes turns in flight, by id. A second message may start while the first still runs.
     private struct HermesTurn {
         var task: Task<String, Error>?
@@ -236,6 +240,16 @@ final class ClaudeService {
         conversations.remove(id)
     }
 
+    /// A turn of this conversation has not produced its first text yet.
+    func isWaiting(_ id: ConversationID) -> Bool {
+        conversations[id].turns.values.contains { !$0.hasText }
+    }
+
+    /// A turn of any Hermes conversation has not produced its first text yet.
+    var anyHermesWaiting: Bool {
+        conversations.values.contains { $0.turns.values.contains { !$0.hasText } }
+    }
+
     /// The typing dots show while a running turn has not produced text yet. Every override this code sets (dots, or
     /// the error left by a failed sibling turn) is dropped by the rule in `HermesAnnounce.typingOverride`.
     private func refreshHermesTyping(_ state: AppState) {
@@ -281,16 +295,30 @@ final class ClaudeService {
 
     // MARK: - Chat (multi-turn, natural text + web search)
 
-    func chat(query: String, context: PromptContext?, state: AppState) async {
+    /// `target` is the conversation on screen when Send was pressed (the bubble went there): the request goes to
+    /// that one, never to whatever is on screen when this runs.
+    func chat(query: String, context: PromptContext?, state: AppState, target: ConversationID) async {
         if DemoEngine.shared.isActive {
             state.stateOverride = .thinking
             await DemoEngine.shared.streamChatResponse(for: query)
             state.stateOverride = nil
             return
         }
-        if state.chatProvider == .hermes { await chatHermes(query: query, context: context, state: state); return }
-        guard state.chatProvider == .anthropic else {
-            await chatOpenAICompatible(query: query, context: context, state: state)
+        if let agentName = target.hermesAgent {
+            await chatHermes(query: query, context: context, state: state, agentName: agentName)
+            return
+        }
+        // The shared chat never reaches a Hermes agent, even if the provider was switched to Hermes since Send.
+        // If the provider was never tracked (Hermes before this version) there is no provider to fall back on: nothing is sent.
+        guard let provider = state.chatProvider == .hermes ? state.lastSharedProvider : state.chatProvider else {
+            // Not reachable today (a shared target means the provider was not Hermes at the press). If it ever is,
+            // the user sees the existing provider error and the typing dots go, never a bubble with no answer.
+            state.stateOverride = nil
+            await showError(String(localized: "API key missing. Open settings."), state: state)
+            return
+        }
+        guard provider == .anthropic else {
+            await chatOpenAICompatible(query: query, context: context, state: state, provider: provider)
             return
         }
         guard let key = apiKey, !key.isEmpty else {
@@ -338,9 +366,8 @@ final class ClaudeService {
 
     // MARK: - OpenAI-compatible chat (Google Gemini / OpenAI / Ollama / LM Studio)
 
-    func chatOpenAICompatible(query: String, context: PromptContext?, state: AppState) async {
-        let provider = state.chatProvider
-        guard provider != .anthropic else { return }
+    func chatOpenAICompatible(query: String, context: PromptContext?, state: AppState, provider: ChatProvider) async {
+        guard provider != .anthropic, provider != .hermes else { return }
 
         let baseURL: String
         if provider == .ollama {
@@ -393,7 +420,7 @@ final class ClaudeService {
 
         let useStream = provider.isLocal
         var body: [String: Any] = [
-            "model": state.activeChatModel,
+            "model": state.chatModel(for: provider),
             "max_tokens": 4096,
             "messages": msgs,
         ]
@@ -407,11 +434,12 @@ final class ClaudeService {
 
         if useStream {
             // Add placeholder (hidden until first token via ChatBubble empty-content guard)
-            let placeholder = ChatMessage(role: .assistant, content: "")
+            let placeholder = ChatMessage(role: .assistant, content: "", provider: provider)
             let msgId = placeholder.id
+            sharedChatStreaming = true
             state.updateChat(.shared) { $0.append(placeholder) }
             state.stateOverride = .thinking
-            let modelCopy = state.activeChatModel
+            let modelCopy = state.chatModel(for: provider)
             let streamBody: [String: Any] = [
                 "model": modelCopy,
                 "messages": msgs,
@@ -432,14 +460,16 @@ final class ClaudeService {
                         if let idx = h.firstIndex(where: { $0.id == msgId }) { h[idx].content = visible }
                     }
                 }
+                sharedChatStreaming = false
                 conversationMessages.append(["role": "assistant", "content": final])
                 state.updateChat(.shared) { h in
                     if let idx = h.firstIndex(where: { $0.id == msgId }) { h[idx].content = final }
                 }
                 state.stateOverride = nil
-                state.view = .prompt
+                state.showSharedChatAnswer()
                 NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
             } catch let e as LocalChatError {
+                sharedChatStreaming = false
                 if !conversationMessages.isEmpty { conversationMessages.removeLast() }
                 state.updateChat(.shared) { $0.removeAll { $0.id == msgId } }
                 state.stateOverride = nil
@@ -456,6 +486,7 @@ final class ClaudeService {
                 }
                 await showError(msg, state: state)
             } catch {
+                sharedChatStreaming = false
                 if !conversationMessages.isEmpty { conversationMessages.removeLast() }
                 state.updateChat(.shared) { $0.removeAll { $0.id == msgId } }
                 state.stateOverride = nil
@@ -480,9 +511,9 @@ final class ClaudeService {
                 }
                 let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
                 conversationMessages.append(["role": "assistant", "content": trimmed])
-                state.updateChat(.shared) { $0.append(ChatMessage(role: .assistant, content: trimmed)) }
+                state.updateChat(.shared) { $0.append(ChatMessage(role: .assistant, content: trimmed, provider: provider)) }
                 state.stateOverride = nil
-                state.view = .prompt
+                state.showSharedChatAnswer()
                 NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
             } catch {
                 if !conversationMessages.isEmpty { conversationMessages.removeLast() }
@@ -524,8 +555,9 @@ final class ClaudeService {
 
     // MARK: - Hermes agents (stateless, streamed, no Mochi system prompt)
 
-    func chatHermes(query: String, context: PromptContext?, state: AppState) async {
-        guard let agent = state.activeHermesAgent else {
+    func chatHermes(query: String, context: PromptContext?, state: AppState, agentName: String) async {
+        // The agent the message was typed for, by name: a different active agent now does not take it over.
+        guard let agent = state.hermesAgents.first(where: { $0.name == agentName }) else {
             await showError(String(localized: "Connect a Hermes agent in Settings → Chat first."), state: state)
             return
         }
@@ -551,16 +583,7 @@ final class ClaudeService {
         let id = ConversationID.hermes(agent.name)
         let generation = ensureConversation(id)
         // No system message: Hermes layers it over the agent's own prompt.
-        var msgs: [[String: Any]] = []
-        for m in conversations[id].messages {
-            var simplified = m
-            if let content = m["content"] as? [[String: Any]],
-               let textBlock = content.first(where: { ($0["type"] as? String) == "text" }),
-               let text = textBlock["text"] as? String {
-                simplified["content"] = text
-            }
-            msgs.append(simplified)
-        }
+        var msgs = HermesChat.requestMessages(from: conversations[id].messages)
         let userText = openAIUserText(query: query, context: context, inlineFiles: true, firstTurn: conversations[id].messages.isEmpty)
         msgs.append(["role": "user", "content": userText])
         conversations.mutateIfPresent(id) { $0.messages.append(["role": "user", "content": userText]) }
@@ -579,15 +602,23 @@ final class ClaudeService {
         let encodedBody = signIn ? Data() : ((try? JSONSerialization.data(withJSONObject: body)) ?? Data())
         let storedSession = conversations[id].serverSession
         let task = Task { [state, msgId] () async throws -> String in
-            let onToken: @MainActor (String) -> Void = { visible in
-                if !visible.isEmpty, self.conversations[id].turns[turnId]?.hasText == false {
+            let firstText: @MainActor () -> Void = {
+                if self.conversations[id].turns[turnId]?.hasText == false {
                     // hide typing dots once no turn waits for text
                     self.conversations.mutateIfPresent(id) { $0.turns[turnId]?.hasText = true }
                     appendAppLog("nb.log", "hermes turn first text after=\(Self.seconds(since: startedAt))s")
                     self.refreshHermesTyping(state)
                 }
+            }
+            // One write per tick: the text and the rows of the turn arrive together. Display only; written by message id
+            // under the same rule as the text (a cleared or removed conversation is never brought back), and the first
+            // text or the first row hides the typing dots.
+            let onTurn: @MainActor (String?, [ChatSegment]?) -> Void = { visible, segments in
+                if visible?.isEmpty == false || segments?.isEmpty == false { firstText() }
                 state.updateChat(id, createIfMissing: false) { h in
-                    if let idx = h.firstIndex(where: { $0.id == msgId }) { h[idx].content = visible }
+                    guard let idx = h.firstIndex(where: { $0.id == msgId }) else { return }
+                    if let visible { h[idx].content = visible }
+                    if let segments { h[idx].segments = segments }
                 }
             }
             if signIn {
@@ -599,9 +630,10 @@ final class ClaudeService {
                             self.conversations.mutateIfPresent(id) { $0.serverSession = sessionId.isEmpty ? nil : sessionId }
                         }
                     },
-                    onToken: onToken)
+                    onToken: { onTurn($0, nil) }, onSegments: { onTurn(nil, $0) }, onTurn: onTurn)
             }
-            return try await HermesChat.streamChat(agent: agent, key: key, encodedBody: encodedBody, onToken: onToken)
+            return try await HermesChat.streamChat(agent: agent, key: key, encodedBody: encodedBody,
+                                                   onToken: { onTurn($0, nil) }, onSegments: { onTurn(nil, $0) }, onTurn: onTurn)
         }
         conversations.mutateIfPresent(id) { $0.turns[turnId]?.task = task }
         do {
@@ -644,7 +676,7 @@ final class ClaudeService {
             // A card on screen keeps the screen: the error is only signalled by the sound and the pill badge.
             if outcome == .badgeOnly {
                 // The text waits in the chat of this agent for when it is next shown.
-                state.updateChat(id, createIfMissing: false) { $0.append(ChatMessage(role: .assistant, content: msg)) }
+                state.updateChat(id, createIfMissing: false) { $0.append(ChatMessage(role: .assistant, content: msg, isNotice: true)) }
             } else { await showError(msg, state: state) }
         }
     }
@@ -762,11 +794,11 @@ final class ClaudeService {
         }
 
         // Add to display history
-        let answer = ChatMessage(role: .assistant, content: text)
+        let answer = ChatMessage(role: .assistant, content: text, provider: .anthropic)
         state.updateChat(.shared) { $0.append(answer) }
 
         state.stateOverride = nil
-        state.view = .prompt
+        state.showSharedChatAnswer()
         NotificationCenter.default.post(name: .triggerEmote, object: BotEmote.happy)
     }
 

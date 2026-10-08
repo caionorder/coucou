@@ -36,13 +36,6 @@ enum HermesAnnounceTests {
         check("nobody waits: other override kept", H.typingOverride(current: .other, anyTurnWaiting: false), O.other)
         check("nobody waits, no override", H.typingOverride(current: .none, anyTurnWaiting: false), O.none)
 
-        print("HermesAnnounce.opensOnChat")
-        check("unseen answer", H.opensOnChat(hermesChatActive: true, unseenAnswer: true, turnRunning: false, alertPending: false), true)
-        check("turn running", H.opensOnChat(hermesChatActive: true, unseenAnswer: false, turnRunning: true, alertPending: false), true)
-        check("nothing to show: overview", H.opensOnChat(hermesChatActive: true, unseenAnswer: false, turnRunning: false, alertPending: false), false)
-        check("card pending wins", H.opensOnChat(hermesChatActive: true, unseenAnswer: true, turnRunning: true, alertPending: true), false)
-        check("not the Hermes chat", H.opensOnChat(hermesChatActive: false, unseenAnswer: true, turnRunning: true, alertPending: false), false)
-
         if failures > 0 { print("\(failures) failure(s)"); exit(1) }
         print("All Hermes announce tests passed")
     }

@@ -465,7 +465,9 @@ enum HermesSignInNet {
         text: String,
         limits: HermesChat.Limits = .standard,
         onSession: @MainActor @escaping (String) -> Void,
-        onToken: @MainActor @escaping (String) -> Void
+        onToken: @MainActor @escaping (String) -> Void,
+        onSegments: @MainActor @escaping ([ChatSegment]) -> Void = { _ in },
+        onTurn: (@MainActor (String?, [ChatSegment]?) -> Void)? = nil
     ) async throws -> String {
         guard agent.connection == .signIn, HermesChat.isValidAgent(agent) else { throw HermesChatError.invalidURL }
         let host = HermesChat.hostLabel(agent.baseURL)
@@ -647,11 +649,42 @@ enum HermesSignInNet {
         // Stream until the terminal event. The turn may already be over: the server starts it before it answers.
         var tooSlow = false
         var closed = false
-        var lastUpdate = Date.distantPast
+        var lastTextUpdate = Date.distantPast
         let minInterval: TimeInterval = 1.0 / 15.0
+        var stepBudget = StepPublishBudget()
         var pingTimer = socket.arm(limits.pingInterval, .ping)
         let deadlineTimer = socket.arm(limits.duration, .deadline)
         defer { pingTimer.cancel(); deadlineTimer.cancel() }
+
+        /// One main actor hop and one write per tick: the text and the rows go out together (`onTurn`), or through the
+        /// two callbacks when the caller only has those.
+        func publish(content: String?, rows: [ChatSegment]?) async {
+            await MainActor.run {
+                if let onTurn { onTurn(content, rows) }
+                else {
+                    if let content { onToken(content) }
+                    if let rows { onSegments(rows) }
+                }
+            }
+        }
+
+        // The text keeps its gate (15 a second). A step, an interim text or a note change is published at once while
+        // the budget lasts (15 in any second, no timer: a round of a few tools always fits); when it is spent it waits,
+        // and goes out with the next frame of any kind or with the end of the turn.
+        var rowsPending = false
+        func flush(textChanged: Bool) async {
+            guard textChanged || rowsPending else { return }
+            let now = Date()
+            if textChanged, now.timeIntervalSince(lastTextUpdate) >= minInterval {
+                lastTextUpdate = now
+                rowsPending = false
+                await publish(content: LocalChat.progressiveFilter(turn.visibleSource),
+                              rows: HermesChat.displaySegments(turn.rows.segments))
+            } else if rowsPending, stepBudget.take(at: now) {
+                rowsPending = false
+                await publish(content: nil, rows: HermesChat.displaySegments(turn.rows.segments))
+            }
+        }
 
         loop: while !(turn.done || turn.overLimit), let ev = await socket.next() {
             switch ev {
@@ -659,14 +692,9 @@ enum HermesSignInNet {
                 if overBudget(bytes: t.utf8.count) { turn.overLimit = true; break loop }   // ends the turn like the text cap
                 let f = HermesSignIn.decode(t)
                 if case .serverRequest(let sid, _) = f { await socket.sendBestEffort(HermesSignIn.rejection(id: sid), timeout: 2) }
-                if turn.ingest(f, maxChars: limits.textChars) {
-                    let now = Date()
-                    if now.timeIntervalSince(lastUpdate) >= minInterval {
-                        lastUpdate = now
-                        let visible = LocalChat.progressiveFilter(turn.visibleSource)
-                        await MainActor.run { onToken(visible) }
-                    }
-                }
+                let textChanged = turn.ingest(f, maxChars: limits.textChars)
+                if turn.stepsTouched { turn.stepsTouched = false; rowsPending = true }
+                await flush(textChanged: textChanged)
             case .binary(let n):
                 if overBudget(bytes: n) { turn.overLimit = true; break loop }
             case .ping:
@@ -674,6 +702,7 @@ enum HermesSignInNet {
                 nextID += 1
                 await socket.sendBestEffort(HermesSignIn.request(id: id, method: "gateway.ping", params: [:]), timeout: 2)
                 pingTimer = socket.arm(limits.pingInterval, .ping)
+                await flush(textChanged: false)
             case .deadline:
                 tooSlow = true
                 break loop
@@ -681,21 +710,33 @@ enum HermesSignInNet {
                 closed = true
                 break loop
             case .timeout:
-                break
+                await flush(textChanged: false)
             }
         }
         let cancelled = Task.isCancelled
         if !cancelled, !turn.done, !tooSlow, !turn.overLimit { closed = true }
 
+        /// Whatever the way out from here on, no row stays running.
+        /// The last text (when the way out sends one) goes out in the same write as the last rows.
+        func settle(content: String? = nil) async {
+            if cancelled {
+                turn.settleRows(ok: false, notes: [])
+            } else {
+                let o = turn.outcome(tooSlow: tooSlow, closedEarly: closed, resumedFresh: resumedFresh)
+                turn.settleRows(ok: o.ok, notes: o.notes)
+            }
+            await publish(content: content, rows: HermesChat.finalDisplaySegments(turn.rows.segments))
+        }
+
         // A cap or a cancellation stops the agent too (best effort), unless the server already ended the turn.
         if !turn.done, !closed, cancelled || tooSlow || turn.overLimit {
             await socket.sendBestEffort(interruptFrame(), timeout: 2)
         }
-        if cancelled { throw CancellationError() }
-        if closed, !turn.done, turn.visibleSource.isEmpty { throw HermesChatError.unreachable(host) }
+        if cancelled { await settle(); throw CancellationError() }
+        if closed, !turn.done, turn.visibleSource.isEmpty { await settle(); throw HermesChatError.unreachable(host) }
 
         let visible = LocalChat.progressiveFilter(turn.visibleSource)
-        await MainActor.run { onToken(visible) }
+        await settle(content: visible)
         return try turn.finalText(tooSlow: tooSlow, closedEarly: closed, resumedFresh: resumedFresh)
     }
 }

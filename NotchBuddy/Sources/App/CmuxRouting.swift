@@ -1494,12 +1494,6 @@ struct CmuxPendingLaunch: Equatable {
     }
 }
 
-/// Text kept for the field of one prompt mode. Restored only into that same mode.
-struct CmuxDraft: Equatable {
-    var mode: CmuxPromptMode
-    var text: String
-}
-
 enum CmuxCardKind { case approval, question }
 
 struct CmuxQueuedCard: Equatable {

@@ -7,6 +7,8 @@ func safeWebURL(_ string: String?) -> URL? {
     guard let string,
           let url = URL(string: string.trimmingCharacters(in: .whitespacesAndNewlines)),
           let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http",
-          let host = url.host, !host.isEmpty else { return nil }
+          let host = url.host, !host.isEmpty,
+          // A user or a password in front of the host makes a link read as one site and go to another.
+          url.user == nil, url.password == nil else { return nil }
     return url
 }
