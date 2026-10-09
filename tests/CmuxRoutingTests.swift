@@ -1677,6 +1677,17 @@ enum CmuxRoutingTests {
               && CmuxRouting.timeRuleApplies(entry: entry("n", task: "T", surface: "", heard: true), treeKnown: true, liveKeys: nil)
               && CmuxRouting.timeRuleApplies(entry: heardEntry, treeKnown: false, liveKeys: nil))
 
+        // ── terminal host: cmux is never a terminal of the terminal pill ──
+        print("terminal host")
+        func host(_ term: String, _ bundle: String) -> String? { CmuxRouting.terminalHost(termProgram: term, bundleId: bundle)?.bundleId }
+        check("cmux bundle → nil", host("", "com.cmuxterm.app") == nil)
+        check("cmux bundle with TERM_PROGRAM=ghostty → nil", host("ghostty", "com.cmuxterm.app") == nil)
+        check("cmux bundle in another case → nil", host("ghostty", "COM.CmuxTerm.App") == nil)
+        check("Warp → Warp", host("WarpTerminal", "") == "dev.warp.Warp-Stable" && host("", "dev.warp.Warp-Stable") == "dev.warp.Warp-Stable")
+        check("iTerm → iTerm", host("iTerm.app", "") == "com.googlecode.iterm2" && host("", "com.googlecode.iterm2") == "com.googlecode.iterm2")
+        check("Ghostty (no cmux bundle) → Ghostty", host("ghostty", "") == "com.mitchellh.ghostty" && host("ghostty", "com.mitchellh.ghostty") == "com.mitchellh.ghostty")
+        check("an unknown app → nil", host("", "com.microsoft.VSCode") == nil)
+
         print(failures == 0 ? "\nAll cmux routing tests passed." : "\n\(failures) failure(s).")
         exit(failures == 0 ? 0 : 1)
     }

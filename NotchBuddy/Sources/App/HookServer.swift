@@ -532,6 +532,7 @@ final class HookServer: @unchecked Sendable {
         // • other valid coucou_agent → external pill (fire-and-forget, no approval card)
         // • Cursor bundle ID → agent_cursor
         // • VS Code → integration_claude
+        // • a known terminal (Warp, Terminal, iTerm…) → integration_claude, host recorded on the task
         #if !APPSTORE
         let isCodexEvent = rawAgent == "codex"
         #else
@@ -539,6 +540,7 @@ final class HookServer: @unchecked Sendable {
         #endif
         let agentId: String
         let isExternalAgent: Bool
+        var hostApp: String? = nil
         if isCodexEvent {
             agentId = "agent_codex"
             isExternalAgent = false
@@ -554,6 +556,10 @@ final class HookServer: @unchecked Sendable {
         } else if let id = cmuxTaskId {
             agentId = id
             isExternalAgent = false
+        } else if let host = Self.terminalHost(termProgram: termProgram, bundleId: bundleId) {
+            agentId = "integration_claude"
+            isExternalAgent = false
+            hostApp = host.bundleId
         } else {
             nbLog("Ignored \(name) from \(termProgram.isEmpty ? bundleId : termProgram) (\(projectName))")
             return
@@ -626,7 +632,9 @@ final class HookServer: @unchecked Sendable {
             #if !APPSTORE
             case let id where CmuxRouting.isCmuxTaskId(id): handledNote = String(localized: "Handled in cmux.")
             #endif
-            default:             handledNote = String(localized: "Handled in VS Code.")
+            default:
+                handledNote = claudeHostApp == nil ? String(localized: "Handled in VS Code.")
+                                                   : String(localized: "Handled in \(claudeHostName).")
             }
             var resolved = false
             #if !APPSTORE
@@ -662,7 +670,7 @@ final class HookServer: @unchecked Sendable {
 
         case "SessionStart":
             activeSessionId = sessionId
-            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKey) }
+            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKey, hostApp: hostApp, bundleId: bundleId) }
             if let idx = state.tasks.firstIndex(where: { $0.id == agentId }) { state.tasks[idx].finalLine = nil }
             #if !APPSTORE
             if cmuxTaskId == agentId {
@@ -689,7 +697,7 @@ final class HookServer: @unchecked Sendable {
 
         case "UserPromptSubmit":
             activeSessionId = sessionId
-            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKey) }
+            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKey, hostApp: hostApp, bundleId: bundleId) }
             if let idx = state.tasks.firstIndex(where: { $0.id == agentId }) { state.tasks[idx].finalLine = nil }
             setTaskState(agentId, .thinking, cmuxKey: cmuxKey)
             #if !APPSTORE
@@ -719,7 +727,7 @@ final class HookServer: @unchecked Sendable {
             // AskUserQuestion is handled via the dedicated --ask hook.
             // Skip state/step update here to avoid flickering over the question card.
             guard tool != "AskUserQuestion" else { break }
-            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKey) }
+            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKey, hostApp: hostApp, bundleId: bundleId) }
             setTaskState(agentId, .working, cmuxKey: cmuxKey)
             let input = payload["tool_input"] as? [String: Any] ?? [:]
             let parts = stepParts(tool: tool, input: input)
@@ -982,6 +990,15 @@ final class HookServer: @unchecked Sendable {
 
     // MARK: - Agent validation + dynamic pill
 
+    /// The terminal host of a Claude Code session. Not cmux in the GitHub build (see `CmuxRouting.terminalHost`).
+    private static func terminalHost(termProgram: String, bundleId: String) -> ClaudeHost? {
+        #if !APPSTORE
+        return CmuxRouting.terminalHost(termProgram: termProgram, bundleId: bundleId)
+        #else
+        return ClaudeHost.terminal(termProgram: termProgram, bundleId: bundleId)
+        #endif
+    }
+
     /// Validates a coucou_agent name: lowercase, digits and hyphens, 1–24 chars.
     /// "claude" is reserved and rejected so it cannot impersonate the Claude Code pill.
     /// Returns the name unchanged if valid, nil otherwise.
@@ -1127,7 +1144,12 @@ final class HookServer: @unchecked Sendable {
         } else {
             pillId = "integration_claude"
         }
-        guard isCodexRequest || isCopilotRequest || isMuseRequest || isHermesRequest || isCursorEditor || isVSCodeEditor || cmuxTaskId != nil else {
+        // Terminal sessions: only when turned on in Settings, else the terminal asks itself. A cmux session
+        // is never a terminal session here: it belongs to the cmux pill (cmuxTaskId).
+        let terminalHost = isCursorEditor || isVSCodeEditor || cmuxTaskId != nil ? nil
+            : Self.terminalHost(termProgram: termProgram, bundleId: bundleId)
+        let isTerminal = terminalHost != nil && ClaudeHost.terminalCardsEnabled
+        guard isCodexRequest || isCopilotRequest || isMuseRequest || isHermesRequest || isCursorEditor || isVSCodeEditor || cmuxTaskId != nil || isTerminal else {
             Task.detached { [weak self] in
                 self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
                 close(fd)
@@ -1224,7 +1246,7 @@ final class HookServer: @unchecked Sendable {
         let gen = cardGeneration
         activeSessionId = sessionId
 
-        upsertWorkspaceTask(id: pillId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKeyOfRequest)
+        upsertWorkspaceTask(id: pillId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKeyOfRequest, hostApp: terminalHost?.bundleId, bundleId: bundleId)
         setTaskState(pillId, .approval, cmuxKey: cmuxKeyOfRequest)
         state.pendingApproval = ApprovalInfo(sessionId: sessionId, tool: tool,
                                               command: command, inputKey: inputKey, pillId: pillId)
@@ -1257,7 +1279,9 @@ final class HookServer: @unchecked Sendable {
                                               now: Date().timeIntervalSinceReferenceDate)
                     ? String(localized: "Still waiting in cmux.") : String(localized: "Handled in cmux.")
             #endif
-            default:             note = String(localized: "Handled in VS Code.")
+            default:
+                note = self.claudeHostApp == nil ? String(localized: "Handled in VS Code.")
+                                                 : String(localized: "Handled in \(self.claudeHostName).")
             }
             // A cmux card that reads EOF while still young was answered in the terminal: no dialog is left.
             var answeredInTerminal = false
@@ -1290,7 +1314,9 @@ final class HookServer: @unchecked Sendable {
             #if !APPSTORE
             case let id where CmuxRouting.isCmuxTaskId(id): note = String(localized: "Still waiting in cmux.")
             #endif
-            default:             note = String(localized: "Still waiting in VS Code.")
+            default:
+                note = self.claudeHostApp == nil ? String(localized: "Still waiting in VS Code.")
+                                                 : String(localized: "Still waiting in \(self.claudeHostName).")
             }
             self.dismissApprovalCard(note: note)
         }
@@ -1421,7 +1447,12 @@ final class HookServer: @unchecked Sendable {
         } else {
             pillId = "integration_claude"
         }
-        guard isCodexRequest || isCursorEditor || isVSCodeEditor || cmuxTaskId != nil else {
+        // Terminal sessions: only when turned on in Settings, else the terminal asks itself. A cmux session
+        // is never a terminal session here: it belongs to the cmux pill (cmuxTaskId).
+        let terminalHost = isCursorEditor || isVSCodeEditor || cmuxTaskId != nil ? nil
+            : Self.terminalHost(termProgram: termProgram, bundleId: bundleId)
+        let isTerminal = terminalHost != nil && ClaudeHost.terminalCardsEnabled
+        guard isCodexRequest || isCursorEditor || isVSCodeEditor || cmuxTaskId != nil || isTerminal else {
             Task.detached { [weak self] in
                 self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
                 close(fd)
@@ -1496,7 +1527,7 @@ final class HookServer: @unchecked Sendable {
             ? "\(pillId)+\(cwd)"
             : sessionId
 
-        upsertWorkspaceTask(id: pillId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKeyOfRequest)
+        upsertWorkspaceTask(id: pillId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKeyOfRequest, hostApp: terminalHost?.bundleId, bundleId: bundleId)
         setTaskState(pillId, .question, cmuxKey: cmuxKeyOfRequest)
         state.pendingQuestion = parsed
         state.isPinned = true
@@ -1536,11 +1567,21 @@ final class HookServer: @unchecked Sendable {
         }
     }
 
+    /// "VS Code", "Warp"… — where the Claude Code pill's current session runs.
+    @MainActor
+    private var claudeHostName: String { ClaudeHost.name(for: claudeHostApp) }
+
+    /// Bundle id of the app the Claude Code pill's session runs in; nil for a VS Code session.
+    @MainActor
+    private var claudeHostApp: String? {
+        AppState.shared.tasks.first { $0.id == "integration_claude" }?.hostApp
+    }
+
     /// Updates or transiently creates a workspace pill (VS Code or Cursor) task.
     /// If the task already exists (persistent), just updates name/cwd.
     /// If missing (transient), creates it and inserts after the main pill.
     @MainActor
-    private func upsertWorkspaceTask(id: String, projectName: String, cwd: String = "", cmuxKey: String? = nil) {
+    private func upsertWorkspaceTask(id: String, projectName: String, cwd: String = "", cmuxKey: String? = nil, hostApp: String? = nil, bundleId: String = "") {
         #if !APPSTORE
         if CmuxRouting.isCmuxTaskId(id) { upsertCmuxTask(id: id, projectName: projectName, cwd: cwd, key: cmuxKey); return }
         #endif
@@ -1548,14 +1589,18 @@ final class HookServer: @unchecked Sendable {
         if let idx = state.tasks.firstIndex(where: { $0.id == id }) {
             state.tasks[idx].name = projectName
             if !cwd.isEmpty { state.tasks[idx].sessionCwd = cwd }
+            if id == "integration_claude" { state.tasks[idx].hostApp = hostApp }
+            if !bundleId.isEmpty { state.tasks[idx].sessionBundleId = bundleId }
             return
         }
         // Transient: create and insert after the main pill
         let def = PillCatalog.definition(for: id)
         let color = def?.color ?? "#C0C4CC"
         let source = def?.source ?? .agent
-        let task = AgentTask(id: id, name: projectName, color: color,
+        var task = AgentTask(id: id, name: projectName, color: color,
                              state: .idle, steps: [], source: source, isIntegration: true)
+        if id == "integration_claude" { task.hostApp = hostApp }
+        if !bundleId.isEmpty { task.sessionBundleId = bundleId }
         if let mainIdx = state.tasks.firstIndex(where: { $0.id == state.mainPillId }) {
             state.tasks.insert(task, at: mainIdx + 1)
         } else {
@@ -4988,8 +5033,12 @@ def main():
     except Exception:
         pass  # Always exit cleanly — never block the agent
 
-    # Gemini CLI, Antigravity, Muse Code and Copilot CLI expect {} on stdout (empty = no decision)
-    if agent in ('gemini', 'antigravity', 'muse', 'copilot'):
+    # Antigravity needs a decision on PreToolUse ({} reads as a denial). "ask" keeps its own
+    # permission prompt (and the user's Always Allow); Coucou never allows a tool by itself.
+    if agent == 'antigravity' and event == 'PreToolUse':
+        sys.stdout.write('{"decision":"ask"}\\n')
+        sys.stdout.flush()
+    elif agent in ('gemini', 'antigravity', 'muse', 'copilot'):
         sys.stdout.write('{}\\n')
         sys.stdout.flush()
 
@@ -5289,8 +5338,12 @@ def main():
     except Exception:
         pass  # Always exit cleanly — never block the agent
 
-    # Gemini CLI, Antigravity, Muse Code and Copilot CLI expect {} on stdout (empty = no decision)
-    if agent in ('gemini', 'antigravity', 'muse', 'copilot'):
+    # Antigravity needs a decision on PreToolUse ({} reads as a denial). "ask" keeps its own
+    # permission prompt (and the user's Always Allow); Coucou never allows a tool by itself.
+    if agent == 'antigravity' and event == 'PreToolUse':
+        sys.stdout.write('{"decision":"ask"}\\n')
+        sys.stdout.flush()
+    elif agent in ('gemini', 'antigravity', 'muse', 'copilot'):
         sys.stdout.write('{}\\n')
         sys.stdout.flush()
 

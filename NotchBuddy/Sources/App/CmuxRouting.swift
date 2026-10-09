@@ -1663,4 +1663,16 @@ struct CmuxStopRecord {
     mutating func forget(_ key: String) { keys.remove(key) }
 }
 
+
+extension CmuxRouting {
+    /// The terminal a Claude Code session runs in (Warp, Terminal, iTerm…), for the terminal pill. cmux is not one:
+    /// its sessions go to the cmux pill, and one that pill does not take stays ignored. cmux sets TERM_PROGRAM=ghostty,
+    /// so the bundle id decides when it is present.
+    static func terminalHost(termProgram: String, bundleId: String) -> ClaudeHost? {
+        if bundleId.lowercased() == CmuxRouting.bundleId { return nil }
+        let host = ClaudeHost.terminal(termProgram: termProgram, bundleId: bundleId)
+        return host?.bundleId == CmuxRouting.bundleId ? nil : host
+    }
+}
+
 #endif
