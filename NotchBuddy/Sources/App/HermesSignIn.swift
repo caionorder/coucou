@@ -269,10 +269,23 @@ enum HermesSignIn {
         return String(decoding: d, as: UTF8.self)
     }
 
-    /// Every server request is refused with "method not found": nothing is ever approved or answered by Coucou.
+    /// Every server request the app does not handle (sudo, secret, vault, clarify, an unknown method) is refused with "method
+    /// not found": nothing is ever approved or answered by Coucou. 4404 is not used for these: where this client is the only one
+    /// attached, Hermes settles a declined request with a result whose `value` the prompt would read as the typed answer.
     static func rejection(id: Any) -> String {
         let obj: [String: Any] = ["jsonrpc": "2.0", "id": id,
                                   "error": ["code": -32601, "message": "Method not found"] as [String: Any]]
+        guard let d = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) else { return "{}" }
+        return String(decoding: d, as: UTF8.self)
+    }
+
+    /// "This client does not show it" (4404, `NOT_SHOWN_CODE` of tui_gateway/server_requests.py): for an approval the app
+    /// does not take. Hermes counts it for this client only and leaves the request alive for the others (a Hermes app on
+    /// the same session can still answer). Where this client is the only one attached, Hermes settles the request at once
+    /// with its default, a deny; it never allows.
+    static func decline(id: Any) -> String {
+        let obj: [String: Any] = ["jsonrpc": "2.0", "id": id,
+                                  "error": ["code": 4404, "message": "Not shown by this client"] as [String: Any]]
         guard let d = try? JSONSerialization.data(withJSONObject: obj, options: [.sortedKeys]) else { return "{}" }
         return String(decoding: d, as: UTF8.self)
     }
@@ -392,6 +405,9 @@ enum HermesSignIn {
         var status = ""
         var overLimit = false
         var approval = false
+        /// The app took at least one approval request of this turn: a "withdrawn approval" hint is then about a request
+        /// that was shown, not the one the app could not give.
+        var approvalsHandled = false
         /// The submit was queued behind a running turn and its `message.start` has not arrived: every delta and
         /// terminal event until that start belongs to the earlier turn.
         var awaitingStart = false
@@ -449,7 +465,7 @@ enum HermesSignIn {
             case .toolComplete(let s, let id, let summary, let hint):
                 // The hint is applied before the session guard, as it always was: a subagent runs under another session
                 // id, and a missed approval notice is worse than a spurious one (the notice is informational only).
-                if hint { noteApproval() }
+                if hint, !approvalsHandled { noteApproval() }
                 guard !other(s), !done, !awaitingStart else { return false }
                 rows.apply(.toolFinished(id: id, detail: summary))
                 stepsTouched = true
@@ -471,14 +487,21 @@ enum HermesSignIn {
                 if method == "approval" { noteApproval() }
                 return false
             case .requestCancelled(let method):
-                if method == "approval" { noteApproval() }
+                // After an answer the server may withdraw the request it just took ("resolved"): not a missing approval.
+                if method == "approval", !approvalsHandled { noteApproval() }
                 return false
             case .approvalHint:
-                noteApproval()
+                if !approvalsHandled { noteApproval() }
                 return false
             case .ready, .result, .failure, .ignored:
                 return false
             }
+        }
+
+        /// A row of one fixed sentence (the result of an approval). Display only.
+        mutating func addNote(_ text: String) {
+            rows.apply(.note(text))
+            stepsTouched = true
         }
 
         private mutating func resetContent() {

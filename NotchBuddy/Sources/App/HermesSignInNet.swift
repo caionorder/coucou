@@ -467,7 +467,8 @@ enum HermesSignInNet {
         onSession: @MainActor @escaping (String) -> Void,
         onToken: @MainActor @escaping (String) -> Void,
         onSegments: @MainActor @escaping ([ChatSegment]) -> Void = { _ in },
-        onTurn: (@MainActor (String?, [ChatSegment]?) -> Void)? = nil
+        onTurn: (@MainActor (String?, [ChatSegment]?) -> Void)? = nil,
+        approvals: HermesApprovalHooks = .none
     ) async throws -> String {
         guard agent.connection == .signIn, HermesChat.isValidAgent(agent) else { throw HermesChatError.invalidURL }
         let host = HermesChat.hostLabel(agent.baseURL)
@@ -533,7 +534,16 @@ enum HermesSignInNet {
         }
         try Task.checkCancellation()
         guard let socket = opened else { throw HermesChatError.unreachable(host) }
+        let approvalTurn0 = HermesApproval.nextTurnToken()
 
+        defer {
+            // Whatever the way out (even a throw): no answer stays waiting, and the app drops what this turn asked.
+            socket.stopAccepting()
+            socket.failAllAnswers()
+            let h = approvals
+            let token = approvalTurn0
+            Task { @MainActor in h.turnEnded(token, .turnEnded) }
+        }
         var turn = HermesSignIn.Turn()
         var nextID = 1
         var resumedFresh = false
@@ -551,7 +561,140 @@ enum HermesSignInNet {
             (agent.profile.isEmpty || agent.profile == "default") ? [:] : ["profile": agent.profile]
         }
 
-        /// Sends a request and waits for its answer. Server requests are refused, never answered.
+        // MARK: Approvals. Nothing below ever answers a request by itself: an answer leaves only as the result of
+        // `.answer`, which the app posts after a click on a button of the card of exactly that request.
+        let approvalTurn = approvalTurn0
+        var approvalsAdvertised = false
+        var known: [String: HermesApprovalRequest] = [:]          // taken by the app, by request id
+        var frameToRequest: [String: String] = [:]                // server request frame id -> request id
+        var answers: [Int: HermesAnswerCommand] = [:]             // `approval.respond` in flight, by rpc id
+        var answering = Set<String>()
+        var failedRequests: [String: HermesApprovalRequest] = [:] // answers the server did not take
+        var pendingQuery: (id: Int, known: Set<String>, at: Date)?
+        var lastRaw = ""
+
+        func makeAnswer(for request: HermesApprovalRequest) -> HermesApprovalAnswer {
+            return { [socket] choice in
+                let waiter = HermesAnswerWaiter()
+                let command = HermesAnswerCommand(request: request, choice: choice, waiter: waiter)
+                guard socket.post(.answer(command)) else { return .unknown }
+                return await waiter.wait()
+            }
+        }
+
+        func forget(_ requestID: String) {
+            known[requestID] = nil
+            for (frame, rid) in frameToRequest where rid == requestID { frameToRequest[frame] = nil }
+        }
+
+        func withdraw(_ requestID: String, _ reason: HermesApproval.WithdrawReason) async {
+            guard known[requestID] != nil, !answering.contains(requestID) else { return }
+            forget(requestID)
+            await MainActor.run { approvals.withdrawn(requestID, reason) }
+            turn.addNote(HermesApproval.chatNote(withdrawn: reason))
+        }
+
+        func finishAnswer(_ rpcID: Int, _ outcome: HermesApproval.AnswerOutcome) {
+            guard let c = answers.removeValue(forKey: rpcID) else { return }
+            let rid = c.request.requestID
+            answering.remove(rid)
+            forget(rid)
+            if outcome == .failed { failedRequests[rid] = c.request }
+            turn.addNote(HermesApproval.chatNote(choice: c.choice, outcome: outcome))
+            c.waiter.settle(outcome)
+        }
+
+        func handleAnswer(_ c: HermesAnswerCommand) async {
+            guard known[c.request.requestID] != nil, !answering.contains(c.request.requestID) else { c.waiter.settle(.tooLate); return }
+            // A choice that was not offered is never built into a frame: nothing leaves, and the answer says it was not taken.
+            guard let params = HermesApproval.respondParams(c.request, c.choice) else { c.waiter.settle(.failed); return }
+            let id = nextID
+            nextID += 1
+            answers[id] = c
+            answering.insert(c.request.requestID)
+            do { try await socket.sendText(HermesSignIn.request(id: id, method: "approval.respond", params: params)) }
+            catch { finishAnswer(id, .unknown); return }
+            _ = socket.arm(limits.rpcTimeout, .answerTimeout(id))
+        }
+
+        /// Frames about approvals. True when the frame was dealt with here and must not reach the reducer or the refusal.
+        func inbound(_ t: String, _ f: HermesSignIn.Frame) async -> Bool {
+            switch f {
+            case .serverRequest(let frameID, "approval"):
+                if approvalsAdvertised, !turn.session.isEmpty,
+                   let request = HermesApproval.parseSignIn(t, agent: agent.name),
+                   case .signIn(_, let session) = request.origin, session == turn.session {
+                    if known[request.requestID] != nil { return true }
+                    let answer = makeAnswer(for: request)
+                    let accepted = await MainActor.run { approvals.offer(request, approvalTurn, answer) }
+                    if accepted {
+                        known[request.requestID] = request
+                        frameToRequest[frameID] = request.requestID
+                        turn.approvalsHandled = true
+                        if let p = HermesApproval.receivedParams(request) {
+                            let id = nextID
+                            nextID += 1
+                            await socket.sendBestEffort(HermesSignIn.request(id: id, method: "approval.received", params: p), timeout: 2)
+                        }
+                        return true
+                    }
+                }
+                // Not showable: this client declines it (4404: not shown here), so the agent does not wait for the whole
+                // server timeout and the request stays alive for any other client. The old error answer (-32601) would
+                // settle it for every client. 4404 only goes to a server that advertised `approval` in its answer to
+                // `client.capabilities`: a frame that comes before that answer, a server that does not know the method and
+                // one that answers without `approval` keep today's refusal (-32601). The sentence stays.
+                let reply = approvalsAdvertised ? HermesSignIn.decline(id: frameID) : HermesSignIn.rejection(id: frameID)
+                await socket.sendBestEffort(reply, timeout: 2)
+                _ = turn.ingest(f, maxChars: limits.textChars)
+                return true
+            case .result(let rid, _):
+                if answers[rid] != nil {
+                    finishAnswer(rid, HermesApproval.interpretRespond(resolved: HermesApproval.parseResolved(t, id: rid)))
+                    return true
+                }
+                if let q = pendingQuery, q.id == rid {
+                    pendingQuery = nil
+                    guard let ids = HermesApproval.parsePendingIDs(t, id: rid) else { return true }
+                    let gone = q.known.filter { !ids.contains($0) && known[$0] != nil && !answering.contains($0) }
+                    if !gone.isEmpty {
+                        await MainActor.run { approvals.retain(ids, q.known, approvalTurn) }
+                        for r in gone { forget(r); turn.addNote(HermesApproval.chatNote(withdrawn: .stale)) }
+                    }
+                    // An answer the server did not take comes back as a fresh card, once, while the server still lists it.
+                    for (r, request) in failedRequests {
+                        failedRequests[r] = nil
+                        guard ids.contains(r), known[r] == nil else { continue }
+                        let answer = makeAnswer(for: request)
+                        if await MainActor.run(body: { approvals.offer(request, approvalTurn, answer) }) {
+                            known[r] = request
+                            // The frame id is registered again: a `request.cancel` for it withdraws the card at once.
+                            if case .signIn(let frameID, _) = request.origin { frameToRequest[frameID] = r }
+                        }
+                    }
+                    return true
+                }
+                return false
+            case .failure(let rid, _, _):
+                if answers[rid] != nil { finishAnswer(rid, .failed); return true }
+                if let q = pendingQuery, q.id == rid { pendingQuery = nil; return true }
+                return false
+            default:
+                break
+            }
+            if t.contains("request.cancel"), let c = HermesApproval.parseCancel(t), let rid = frameToRequest[c.frameID] {
+                await withdraw(rid, c.reason)
+                return true
+            }
+            if t.contains("approval.cancelled"), let c = HermesApproval.parseCancelled(t) {
+                for rid in c.ids { await withdraw(rid, c.reason) }
+                return true
+            }
+            return false
+        }
+
+        /// Sends a request and waits for its answer. Server requests are refused, never answered (an approval the app
+        /// took is answered only after a click).
         func rpc(_ method: String, _ params: [String: Any]) async throws -> HermesSignIn.Frame {
             let id = nextID
             nextID += 1
@@ -568,17 +711,20 @@ enum HermesSignInNet {
                 case .text(let t):
                     if overBudget(bytes: t.utf8.count) { throw HermesChatError.server(String(localized: "Hermes sent more data than Coucou accepts.")) }
                     let f = HermesSignIn.decode(t)
-                    if case .serverRequest(let sid, _) = f {
+                    if await inbound(t, f) {
+                    } else if case .serverRequest(let sid, _) = f {
                         await socket.sendBestEffort(HermesSignIn.rejection(id: sid), timeout: 2)
                         _ = turn.ingest(f, maxChars: limits.textChars)
                     } else if !turn.session.isEmpty {
                         _ = turn.ingest(f, maxChars: limits.textChars)
                     }
                     switch f {
-                    case .result(let rid, _) where rid == id: return f
+                    case .result(let rid, _) where rid == id: lastRaw = t; return f
                     case .failure(let rid, _, _) where rid == id: return f
                     default: break
                     }
+                case .answer(let c): await handleAnswer(c)
+                case .answerTimeout(let rid): finishAnswer(rid, .unknown)
                 case .binary(let n):
                     if overBudget(bytes: n) { throw HermesChatError.server(String(localized: "Hermes sent more data than Coucou accepts.")) }
                 case .closed: throw HermesChatError.unreachable(host)
@@ -588,6 +734,24 @@ enum HermesSignInNet {
             }
             if Task.isCancelled { throw CancellationError() }
             throw HermesChatError.unreachable(host)
+        }
+
+        // The app says once per connection that it answers server requests: without it Hermes withdraws an approval
+        // at once. An older server that does not know the method keeps today's behaviour.
+        let capabilitiesID = nextID
+        do {
+            switch try await rpc("client.capabilities", HermesApproval.capabilitiesParams()) {
+            case .result:
+                approvalsAdvertised = HermesApproval.parseCapabilities(lastRaw, id: capabilitiesID)?.contains("approval") == true
+            default:
+                break
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch HermesChatError.unreachable(let h) {
+            throw HermesChatError.unreachable(h)
+        } catch {
+            // Not answered in time: the session calls below tell whether the socket is still usable.
         }
 
         // Session: resume the stored one, else create (also when the resume failed: the server may have lost it).
@@ -691,8 +855,11 @@ enum HermesSignInNet {
             case .text(let t):
                 if overBudget(bytes: t.utf8.count) { turn.overLimit = true; break loop }   // ends the turn like the text cap
                 let f = HermesSignIn.decode(t)
-                if case .serverRequest(let sid, _) = f { await socket.sendBestEffort(HermesSignIn.rejection(id: sid), timeout: 2) }
-                let textChanged = turn.ingest(f, maxChars: limits.textChars)
+                var textChanged = false
+                if await !inbound(t, f) {
+                    if case .serverRequest(let sid, _) = f { await socket.sendBestEffort(HermesSignIn.rejection(id: sid), timeout: 2) }
+                    textChanged = turn.ingest(f, maxChars: limits.textChars)
+                }
                 if turn.stepsTouched { turn.stepsTouched = false; rowsPending = true }
                 await flush(textChanged: textChanged)
             case .binary(let n):
@@ -702,6 +869,14 @@ enum HermesSignInNet {
                 nextID += 1
                 await socket.sendBestEffort(HermesSignIn.request(id: id, method: "gateway.ping", params: [:]), timeout: 2)
                 pingTimer = socket.arm(limits.pingInterval, .ping)
+                // Another client may have answered without a withdrawal reaching us: ask what is still pending.
+                if !known.isEmpty || !failedRequests.isEmpty, pendingQuery == nil || Date().timeIntervalSince(pendingQuery!.at) > 45 {
+                    let qid = nextID
+                    nextID += 1
+                    pendingQuery = (qid, Set(known.keys), Date())
+                    await socket.sendBestEffort(HermesSignIn.request(id: qid, method: "approval.pending",
+                                                                     params: HermesApproval.pendingParams(session: runtimeID)), timeout: 2)
+                }
                 await flush(textChanged: false)
             case .deadline:
                 tooSlow = true
@@ -711,10 +886,23 @@ enum HermesSignInNet {
                 break loop
             case .timeout:
                 await flush(textChanged: false)
+            case .answer(let c):
+                await handleAnswer(c)
+                if turn.stepsTouched { turn.stepsTouched = false; rowsPending = true }
+                await flush(textChanged: false)
+            case .answerTimeout(let rid):
+                finishAnswer(rid, .unknown)
+                if turn.stepsTouched { turn.stepsTouched = false; rowsPending = true }
+                await flush(textChanged: false)
             }
         }
         let cancelled = Task.isCancelled
         if !cancelled, !turn.done, !tooSlow, !turn.overLimit { closed = true }
+        // The turn is over: nothing it asked is answerable any more, and no answer in flight stays waiting.
+        socket.stopAccepting()
+        socket.failAllAnswers()
+        let endReason: HermesApproval.WithdrawReason = closed && !turn.done ? .socketLost : .turnEnded
+        await MainActor.run { approvals.turnEnded(approvalTurn, endReason) }
 
         /// Whatever the way out from here on, no row stays running.
         /// The last text (when the way out sends one) goes out in the same write as the last rows.
@@ -756,6 +944,10 @@ final class HermesSocket: @unchecked Sendable {
         case ping
         case deadline
         case timeout
+        /// An answer to an approval, posted by the app after a click. Handled by the loop that owns the socket.
+        case answer(HermesAnswerCommand)
+        /// The `approval.respond` with this rpc id got no answer in time.
+        case answerTimeout(Int)
     }
 
     private let session: URLSession
@@ -767,6 +959,9 @@ final class HermesSocket: @unchecked Sendable {
     private var owed = false
     private var reader: Task<Void, Never>?
     private let handshaker: Handshaker
+    private let answerLock = NSLock()
+    private var accepting = true
+    private var posted: [HermesAnswerWaiter] = []
 
     /// How the WebSocket handshake ended.
     enum Handshake: Sendable, Equatable {
@@ -902,10 +1097,29 @@ final class HermesSocket: @unchecked Sendable {
                 binary += 1
                 if binary > maxBinaryFrames { return false }
             case .closed, .timeout: return false
-            case .ping, .deadline: break
+            case .ping, .deadline, .answerTimeout: break
+            case .answer(let c): c.waiter.settle(.unknown)
             }
         }
         return false
+    }
+
+    /// Hands an event to the loop that owns the socket. False once the loop is gone: the caller must not wait.
+    func post(_ event: Event) -> Bool {
+        answerLock.withLock {
+            guard accepting else { return false }
+            if case .answer(let c) = event { posted.append(c.waiter) }
+            if case .enqueued = continuation.yield(event) { return true }
+            return false
+        }
+    }
+
+    func stopAccepting() { answerLock.withLock { accepting = false } }
+
+    /// Settles every answer that was posted and never reached the loop (or is still waiting for its result).
+    func failAllAnswers() {
+        let waiters = answerLock.withLock { () -> [HermesAnswerWaiter] in let w = posted; posted = []; return w }
+        for w in waiters { w.settle(.unknown) }
     }
 
     func arm(_ seconds: TimeInterval, _ event: Event) -> Task<Void, Never> {

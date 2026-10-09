@@ -685,6 +685,22 @@ enum HermesChat {
         /// What a line changed: the text grew, a step or a note changed.
         struct Change { var text = false; var steps = false }
 
+        /// `approval.request` frames seen and not yet dealt with by the loop.
+        var approvalData: [String] = []
+
+        mutating func takeApprovalData() -> [String] {
+            let d = approvalData
+            approvalData = []
+            return d
+        }
+
+        /// A request the app did not take: the one sentence, once. True when the rows changed.
+        mutating func noteApprovalNotTaken() -> Bool {
+            if turn.segments.contains(where: { $0.kind == .note(HermesChat.approvalNote) }) { return false }
+            turn.apply(.note(HermesChat.approvalNote))
+            return true
+        }
+
         mutating func ingest(_ line: String, maxChars: Int) -> Change {
             var change = Change()
             if let frame = frames.feed(line), let name = frame.event {
@@ -696,11 +712,8 @@ enum HermesChat {
                         change.steps = true
                     }
                 case "approval.request":
-                    // The payload (the command) is not read: only the fact that one was asked.
-                    if !turn.segments.contains(where: { $0.kind == .note(HermesChat.approvalNote) }) {
-                        turn.apply(.note(HermesChat.approvalNote))
-                        change.steps = true
-                    }
+                    // The loop reads it (`HermesApproval.parseAPIEvent`) and offers it to the app; nothing else here does.
+                    if approvalData.count < 16 { approvalData.append(frame.data) }
                 default: break   // hermes.status and any other name
                 }
             }
@@ -721,6 +734,41 @@ enum HermesChat {
         }
     }
 
+    /// The sentences the chat keeps after an answer, handed from the answer (any task) to the loop that owns the rows.
+    final class ApprovalNotes: @unchecked Sendable {
+        private let lock = NSLock()
+        private var pending: [String] = []
+        func add(_ s: String) { lock.withLock { pending.append(s) } }
+        func drain() -> [String] { lock.withLock { let p = pending; pending = []; return p } }
+    }
+
+    /// One answer: `POST <root>/v1/runs/<run id>/approval` with the key of the turn. 10 s, no redirect, and NEVER repeated:
+    /// a second send after the body left could answer twice. Called only after a click, through the closure of the request.
+    static func postApproval(root: String, key: String, request: HermesApprovalRequest,
+                             choice: HermesApproval.Choice) async -> HermesApproval.AnswerOutcome {
+        guard let req = HermesApproval.answerRequest(apiRoot: root, key: key, request: request, choice: choice) else { return .failed }
+        let session = URLSession(configuration: .ephemeral)
+        defer { session.finishTasksAndInvalidate() }
+        do {
+            let (bytes, response) = try await session.bytes(for: req, delegate: RequestGate())
+            var body = Data()
+            for try await b in bytes {
+                body.append(b)
+                if body.count >= 4096 { break }
+            }
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            return HermesApproval.interpretHTTP(status: status, resolved: HermesApproval.parseHTTPResolved(body))
+        } catch {
+            // The connection never opened: nothing left the machine. Anything later: nobody knows.
+            switch (error as? URLError)?.code {
+            case .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed, .secureConnectionFailed, .notConnectedToInternet:
+                return .failed
+            default:
+                return .unknown
+            }
+        }
+    }
+
     static func streamChat(
         agent: HermesAgent,
         key: String,
@@ -728,7 +776,8 @@ enum HermesChat {
         limits: Limits = .standard,
         onToken: @MainActor @escaping (String) -> Void,
         onSegments: @MainActor @escaping ([ChatSegment]) -> Void = { _ in },
-        onTurn: (@MainActor (String?, [ChatSegment]?) -> Void)? = nil
+        onTurn: (@MainActor (String?, [ChatSegment]?) -> Void)? = nil,
+        approvals: HermesApprovalHooks = .none
     ) async throws -> String {
         guard let url = chatURL(for: agent) else { throw HermesChatError.invalidURL }
         var req = URLRequest(url: url, timeoutInterval: 300)
@@ -761,6 +810,36 @@ enum HermesChat {
         }
 
         var state = StreamState()
+        // Approvals of this stream: what the app took, the notes of the answers (written by the answer, read by the loop).
+        let approvalToken = HermesApproval.nextTurnToken()
+        let notes = ApprovalNotes()
+        var known = Set<String>()
+        let root = apiRoot(baseURL: agent.baseURL, profile: agent.profile)
+        defer {
+            // Whatever the way out (even a throw): the requests of this stream are not answerable any more.
+            let h = approvals
+            Task { @MainActor in h.turnEnded(approvalToken, .turnEnded) }
+        }
+        func makeAnswer(for request: HermesApprovalRequest) -> HermesApprovalAnswer {
+            return { choice in
+                let outcome = await HermesChat.postApproval(root: root, key: key, request: request, choice: choice)
+                notes.add(HermesApproval.chatNote(choice: choice, outcome: outcome))
+                return outcome
+            }
+        }
+        /// An `approval.request` frame: taken by the app, or left to Hermes with the one sentence. True when rows changed.
+        func handleApproval(_ data: String) async -> Bool {
+            guard let request = HermesApproval.parseAPIEvent(data, agent: agent.name) else { return state.noteApprovalNotTaken() }
+            if known.contains(request.requestID) { return false }
+            if known.count < 16 {
+                let answer = makeAnswer(for: request)
+                if await MainActor.run(body: { approvals.offer(request, approvalToken, answer) }) {
+                    known.insert(request.requestID)
+                    return false
+                }
+            }
+            return state.noteApprovalNotTaken()
+        }
         var line: [UInt8] = []
         var lineTooLong = false
         var tooSlow = false
@@ -803,7 +882,9 @@ enum HermesChat {
                 if line.last == 0x0D { line.removeLast() }
                 let text = String(decoding: line, as: UTF8.self)
                 line.removeAll(keepingCapacity: true)
-                let change = state.ingest(text, maxChars: limits.textChars)
+                var change = state.ingest(text, maxChars: limits.textChars)
+                for data in state.takeApprovalData() where await handleApproval(data) { change.steps = true }
+                for n in notes.drain() { state.turn.apply(.note(n)); change.steps = true }
                 // The text keeps its gate (15 a second). A step or a note change is published at once while the budget
                 // lasts (15 in any second, no timer: a round of a few tools always fits); when the budget is spent it
                 // waits, and goes out with the next line of any kind (a keepalive too) or with the end of the turn.
@@ -823,11 +904,16 @@ enum HermesChat {
             }
             if !lineTooLong, !tooSlow, !state.overLimit, !line.isEmpty {
                 _ = state.ingest(String(decoding: line, as: UTF8.self), maxChars: limits.textChars)
+                for data in state.takeApprovalData() { _ = await handleApproval(data) }
             }
         } catch {
             if Task.isCancelled { await settle(ok: false, notes: []); throw CancellationError() }
             broken = true
         }
+        // The stream is over: nothing it asked can be answered any more (a late answer would be refused by the server).
+        let endReason: HermesApproval.WithdrawReason = broken ? .socketLost : .turnEnded
+        await MainActor.run { approvals.turnEnded(approvalToken, endReason) }
+        for n in notes.drain() { state.turn.apply(.note(n)) }
         if Task.isCancelled { await settle(ok: false, notes: []); throw CancellationError() }
         if broken && state.text.isEmpty { await settle(ok: false, notes: []); throw HermesChatError.unreachable(host) }
         let lastVisible = LocalChat.progressiveFilter(state.text)

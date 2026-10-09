@@ -20,7 +20,16 @@ Routes (prefix is "", "/p/default" or "/p/mark"):
         "steps"          -> text, a tool (running then completed, real hermes.tool.progress shape), text
         "steps2"         -> text, two tools, text, one more tool, the answer
         "steps_off"      -> the same text as "steps" with no named frame at all
-        "approval"       -> text, a named approval.request frame (its command is a marker that must never be read)
+        "approval"       -> text, a named approval.request frame (a marker command, no request id: not answerable)
+        "approval-wait"  -> text, an approval.request (request id rq-1, four choices), then keepalive lines until
+                            POST <prefix>/v1/runs/<run id>/approval answers it (or approval_wait seconds pass), then
+                            "ran: <choice>" / "blocked: deny" / "no answer"
+        "approval-two"   -> two approval.request frames (rq-a, rq-b), each answered by its own POST
+        "approval-end"   -> an approval.request, then the stream ends while it is pending
+        "approval-long"  -> an approval.request whose command is over the ceiling
+        "approval-bidi"  -> an approval.request with a right to left override and zero width characters
+        "approval-bad-run" -> an approval.request whose run_id has path characters
+        "approval-smart" -> an approval.request with choices once and deny (smart denied)
         "long_label"     -> a tool whose label is 5000 characters
         "status"         -> a named hermes.status frame between two texts
         "cut_in_tool"    -> text, a tool that starts and never finishes, then the connection closes
@@ -33,17 +42,23 @@ Routes (prefix is "", "/p/default" or "/p/mark"):
         "think_open"     -> a <think> that never closes, across two tools, then the answer
         "think_literal"  -> an answer that names the tag in inline code
         "bigmodels"      -> (GET /big/v1/models) a 100 KB body
+  POST <prefix>/v1/runs/<run id>/approval -> the approval endpoint of the real server (api_server_runs.py): bearer of the key
+        that started the stream, body {"choice", "request_id"}: 200 {"object": "hermes.run.approval_response", "run_id",
+        "choice", "request_id", "resolved": 1}, 409 approval_not_pending, 400 for a bad choice or id, 404 for another key.
 Test control (shared by both endpoints):
   POST /_test/reset                    counters and failures back to zero
   POST /_test/config {"models_drop": N, "chat_drop": N, "chat_stall": seconds, "chat_stall_count": N, "chat_status": 500,
-                      "models_stall": seconds, "models_stall_count": N}
+                      "models_stall": seconds, "models_stall_count": N, "approval_status": N, "approval_wait": seconds}
+        approval_status: every approval POST answers this status (401, 404, 500...)
+        approval_wait: how long an approval scenario waits for the POST (default 6)
         models_drop: accept the next N models requests and close the connection without answering
         chat_drop: accept the next N chat requests, READ THE WHOLE BODY, then close without answering (the request
           reached the server, so the client must not send it again)
         models_stall: hold the response headers of the next models_stall_count models requests for that long
         chat_stall: hold the response headers of the next chat_stall_count chat requests for that long
         chat_status: answer every chat request with this status
-  GET  /_test/state                    {"models_hits": n, "chat_hits": n}
+  GET  /_test/state                    {"models_hits": n, "chat_hits": n, "approval_posts": n, "stream_closed": n}
+  GET  /_test/posts                    {"posts": [every approval POST: path, bearer, body, profile]}
   GET  /_test/last_body                the raw JSON body of the last chat request (as the client sent it)
 Wrong/missing key -> 401 gateway_auth_failed. Unknown profile -> 404.
 Response header X-Test-Model echoes the request "model"; X-Test-System is "1" if a system
@@ -54,6 +69,7 @@ import json
 import socket
 import socketserver
 import struct
+import secrets
 import sys
 import threading
 import time
@@ -82,16 +98,20 @@ LOCK = threading.Lock()
 CONFIG = {}
 COUNTS = {}
 LAST = {"body": b""}
+APPROVALS = {}   # run id -> {"bearer", "request_ids": {id: entry}}
+POSTS = []       # every approval POST: path, bearer, body, status
 
 
 def reset():
     with LOCK:
         CONFIG.clear()
         CONFIG.update({"models_drop": 0, "chat_drop": 0, "chat_stall": 0, "chat_stall_count": 0, "chat_status": 0,
-                       "models_stall": 0, "models_stall_count": 0})
+                       "models_stall": 0, "models_stall_count": 0, "approval_status": 0, "approval_wait": 6})
         COUNTS.clear()
-        COUNTS.update({"models_hits": 0, "chat_hits": 0, "other_hits": 0})
+        COUNTS.update({"models_hits": 0, "chat_hits": 0, "other_hits": 0, "approval_posts": 0, "stream_closed": 0})
         LAST["body"] = b""
+        APPROVALS.clear()
+        POSTS.clear()
 
 
 reset()
@@ -139,6 +159,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/_test/state":
             with LOCK:
                 return self.send_json(200, json.dumps(COUNTS).encode())
+        if path == "/_test/posts":
+            with LOCK:
+                return self.send_json(200, json.dumps({"posts": POSTS}).encode())
         if path == "/_test/last_body":
             with LOCK:
                 return self.send_json(200, LAST["body"] or b"{}")
@@ -180,6 +203,40 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_json(401, envelope("Invalid API key", "invalid_request_error", "gateway_auth_failed"))
         self.send_json(200, json.dumps({"object": "list", "data": [{"id": MODEL_IDS[profile]}]}).encode())
 
+    def approval_post(self, profile, tail, raw):
+        """POST <prefix>/v1/runs/<run id>/approval, as the real handler answers it (api_server_runs.py)."""
+        run_id = tail[len("/v1/runs/"):-len("/approval")]
+        try:
+            body = json.loads(raw or b"{}")
+        except ValueError:
+            body = None
+        with LOCK:
+            COUNTS["approval_posts"] += 1
+            forced = CONFIG["approval_status"]
+            POSTS.append({"path": self.path, "bearer": self.headers.get("Authorization", ""), "body": body, "profile": profile})
+        if profile == "__unknown__":
+            return self.send_json(404, envelope("no such profile", "not_found", "profile_not_found"))
+        if forced:
+            return self.send_json(forced, envelope("injected", "server_error", "injected"))
+        if not self.authed(profile):
+            return self.send_json(401, envelope("Invalid API key", "invalid_request_error", "gateway_auth_failed"))
+        with LOCK:
+            run = APPROVALS.get(run_id)
+        if run is None or run["bearer"] != self.headers.get("Authorization", ""):
+            return self.send_json(404, envelope("run not found", "not_found", "run_not_found"))
+        if not isinstance(body, dict) or body.get("choice") not in ("once", "session", "always", "deny") \
+                or not isinstance(body.get("request_id"), str) or not body.get("request_id"):
+            return self.send_json(400, envelope("bad choice or request id", "invalid_request_error", "invalid_choice"))
+        with LOCK:
+            entry = run["requests"].get(body["request_id"])
+            if entry is None or entry["choice"] is not None or run["ended"]:
+                code = "approval_not_active" if run["ended"] else "approval_not_pending"
+                return self.send_json(409, envelope("nothing is waiting", "conflict", code))
+            entry["choice"] = body["choice"]
+            entry["event"].set()
+        return self.send_json(200, json.dumps({"object": "hermes.run.approval_response", "run_id": run_id,
+                                               "choice": body["choice"], "request_id": body["request_id"], "resolved": 1}).encode())
+
     def do_POST(self):
         if self.path.split("?")[0] in ("/_test/reset", "/_test/config"):
             n = int(self.headers.get("Content-Length", 0))
@@ -197,6 +254,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             req = {}
         profile, tail = self.route()
+        if tail.startswith("/v1/runs/") and tail.endswith("/approval"):
+            return self.approval_post(profile, tail, raw)
         if tail == "/v1/chat/completions":
             with LOCK:
                 LAST["body"] = raw
@@ -254,8 +313,33 @@ class Handler(BaseHTTPRequestHandler):
                 raise Gone()
             time.sleep(0.005)
 
+        run_id = "chatcmpl-" + secrets.token_hex(15)[:29]
+        run = {"bearer": self.headers.get("Authorization", ""), "requests": {}, "ended": False}
+        with LOCK:
+            APPROVALS[run_id] = run
+
+        def approval_event(request_id, command, choices=("once", "session", "always", "deny"), rid=None, **extra):
+            """The frame of api_server.py: the queue's data plus event, run_id, timestamp, session_id and choices."""
+            payload = {"event": "approval.request", "run_id": rid or run_id, "timestamp": 1.0, "session_id": "s1",
+                       "choices": list(choices), "request_id": request_id, "command": command, "description": "recursive delete",
+                       "pattern_key": "recursive delete", "pattern_keys": ["recursive delete"],
+                       "allow_permanent": "always" in choices, "allow_session": "session" in choices}
+            payload.update(extra)
+            entry = {"choice": None, "event": threading.Event()}
+            with LOCK:
+                run["requests"][request_id] = entry
+            return "event: approval.request\ndata: " + json.dumps(payload) + "\n\n", entry
+
+        def wait_for(entries):
+            with LOCK:
+                limit = CONFIG["approval_wait"]
+            end = time.time() + limit
+            while time.time() < end and not all(e["event"].is_set() for e in entries):
+                emit(": keepalive\n\n")
+                time.sleep(0.05)
+
         def chunk(delta, finish=None, **more):
-            c = {"object": "chat.completion.chunk", "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+            c = {"object": "chat.completion.chunk", "id": run_id, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
             c.update(more)
             return "data: " + json.dumps(c) + "\n\n"
 
@@ -273,7 +357,8 @@ class Handler(BaseHTTPRequestHandler):
             return ("event: hermes.tool.progress\ndata: " + json.dumps(
                 {"tool": tool, "toolCallId": call_id, "status": "completed"}) + "\n\n")
 
-        own_stream = ("steps", "steps2", "steps_off", "approval", "long_label", "status", "cut_in_tool", "think_split", "reuse_id", "burst",
+        own_stream = ("steps", "steps2", "steps_off", "approval", "approval-wait", "approval-two", "approval-end", "approval-long",
+                      "approval-bidi", "approval-bad-run", "approval-smart", "long_label", "status", "cut_in_tool", "think_split", "reuse_id", "burst",
                       "seq3", "text_tool", "think_open", "think_literal", "media")
         try:
             emit(chunk({"role": "assistant"}))
@@ -301,9 +386,41 @@ class Handler(BaseHTTPRequestHandler):
             elif last_user == "approval":
                 emit(chunk({"content": "I need to run a command."}))
                 emit("event: approval.request\ndata: " + json.dumps(
-                    {"event": "approval.request", "run_id": "chatcmpl-1", "command": APPROVAL_MARKER, "description": "danger",
+                    {"event": "approval.request", "run_id": run_id, "command": APPROVAL_MARKER, "description": "danger",
                      "session_id": "s1", "timestamp": 1.0, "choices": ["once", "deny"]}) + "\n\n")
                 emit(chunk({"content": "\n\nWaiting."}))
+                emit(chunk({}, "stop"))
+            elif last_user in ("approval-wait", "approval-smart", "approval-long", "approval-bidi", "approval-bad-run", "approval-end"):
+                emit(chunk({"content": "I need to run a command."}))
+                command = "rm -rf /tmp/x " + APPROVAL_MARKER
+                choices = ("once", "session", "always", "deny")
+                rid = None
+                if last_user == "approval-smart":
+                    choices = ("once", "deny")
+                elif last_user == "approval-long":
+                    command = "echo first\n" + ("x" * 2600) + APPROVAL_MARKER
+                elif last_user == "approval-bidi":
+                    command = "cat \u202egpj.sh\u202c \u200b" + APPROVAL_MARKER
+                elif last_user == "approval-bad-run":
+                    rid = "chatcmpl-ab/../x"
+                frame, entry = approval_event("rq-1", command, choices, rid=rid)
+                emit(frame)
+                if last_user == "approval-end":
+                    time.sleep(0.4)
+                    with LOCK:
+                        run["ended"] = True
+                    return
+                wait_for([entry])
+                choice = entry["choice"]
+                emit(chunk({"content": "\n\n" + ("no answer" if choice is None else "blocked: deny" if choice == "deny" else "ran: " + choice)}))
+                emit(chunk({}, "stop"))
+            elif last_user == "approval-two":
+                emit(chunk({"content": "Two commands."}))
+                fa, ea = approval_event("rq-a", "echo a " + APPROVAL_MARKER)
+                fb, eb = approval_event("rq-b", "echo b " + APPROVAL_MARKER)
+                emit(fa + fb)
+                wait_for([ea, eb])
+                emit(chunk({"content": "\n\na:%s b:%s" % (ea["choice"], eb["choice"])}))
                 emit(chunk({}, "stop"))
             elif last_user == "long_label":
                 emit(chunk({"content": "Working."}))
@@ -413,7 +530,11 @@ class Handler(BaseHTTPRequestHandler):
                 emit(chunk({}, "stop", usage={"total_tokens": 3}))
             emit("data: [DONE]\n\n")
         except Gone:
-            pass
+            with LOCK:
+                COUNTS["stream_closed"] += 1
+        finally:
+            with LOCK:
+                run["ended"] = True
 
 
 class FastBindHTTPServer(socketserver.ThreadingMixIn, HTTPServer):

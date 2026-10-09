@@ -233,6 +233,7 @@ final class AppState: ObservableObject {
             UserDefaults.standard.set(HermesChat.encodeAgents(hermesAgents), forKey: "hermesAgents")
             let gone = Set(oldValue.map { $0.name }).subtracting(hermesAgents.map { $0.name })
             discardHermesConversations(of: gone.sorted())
+            for name in gone { HermesApprovalCenter.shared.agentRemoved(name) }
         }
     }
     @Published var hermesChatAgent: String = "" {
@@ -739,6 +740,11 @@ final class AppState: ObservableObject {
 
     // Pending approval request from Claude Code hook
     @Published var pendingApproval: ApprovalInfo? = nil
+
+    /// Height of the island while the whole text of a long Hermes command is read (nil: the card of every day).
+    @Published var approvalReadingHeight: CGFloat? = nil {
+        didSet { ApprovalReadingLayout.height = approvalReadingHeight }
+    }
 
     // Pending AskUserQuestion from Claude Code hook
     @Published var pendingQuestion: AskQuestion? = nil {

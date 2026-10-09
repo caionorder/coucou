@@ -136,6 +136,26 @@ for key, where in missing_pt:
 for key, value, where in lost_placeholders:
     failures.append("pt-BR value changes the placeholders: %r -> %r (%s)" % (key, value, where))
 
+# Shipped keys the Hermes approval card shares with the app on main: they must keep the languages (and the extraction state)
+# they ship with, so a new screen cannot rename a shipped text by adding translations to its key. A comparison with main
+# itself is not possible here (CI runs from a checkout). The card's own words have their own keys ("Scope: ...").
+ALL_LANGS = ["ar", "bn", "en", "es", "fr", "hi", "id", "pt-BR", "ru", "zh-Hans"]
+SHIPPED_PINS = {
+    "Allow": ALL_LANGS, "Deny": ALL_LANGS, "Always": ALL_LANGS, "needs permission": ALL_LANGS,
+    "Session": ["pt-BR"],   # the fallback name of a session pill and a text sent to the iPhone: pt-BR only on main
+}
+print("shipped keys the card relies on")
+for key, langs in SHIPPED_PINS.items():
+    entry = strings.get(key, {})
+    have = sorted(entry.get("localizations", {}).keys())
+    check(have == sorted(langs), "%r keeps its languages (%s)" % (key, ", ".join(langs) if len(langs) < 3 else "all 10"))
+check(strings.get("Session", {}).get("extractionState") == "manual", "'Session' keeps extractionState manual")
+check(strings["Session"]["localizations"]["pt-BR"]["stringUnit"]["value"] == "Sessão", "'Session' still reads 'Sessão' in pt-BR")
+for scope in ("once", "session", "always"):
+    entry = strings.get("Scope: " + scope, {})
+    check(sorted(entry.get("localizations", {}).keys()) == sorted(ALL_LANGS), "'Scope: %s' (the selector word) has its own key in all 10 languages" % scope)
+check("Once" not in strings, "no leftover 'Once' key")
+
 # the extractor must see the forms the app relies on
 for probe in ("Settings…", "Allow", "Language", "Open Coucou", "Connected · %@", "Hermes agents"):
     check(any(norm(k) == norm(probe) for k in extracted), "extractor finds %r" % probe)

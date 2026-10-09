@@ -80,7 +80,8 @@ final class DemoEngine: ObservableObject {
 
     /// Real things waiting for the user right now, read from the live state at each call.
     var realPending: DemoGuard.Pending {
-        var pending = DemoGuard.Pending(approval: HookServer.shared.hasRealPendingApproval,
+        // A Hermes request that waits (on screen or in line) is real too: the demo never covers it.
+        var pending = DemoGuard.Pending(approval: HookServer.shared.hasRealPendingApproval || HermesApprovalCenter.shared.hasWaiting,
                                         question: HookServer.shared.hasRealPendingQuestion)
         #if !APPSTORE
         pending.cmuxQueued = HookServer.shared.hasQueuedCmuxCards

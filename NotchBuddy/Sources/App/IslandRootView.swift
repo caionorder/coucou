@@ -157,6 +157,13 @@ struct IslandContainer: View {
                 islandHeight = newView == .prompt ? chatPromptHeight : h
             }
         }
+        // A long Hermes command is read in a taller island, and the island comes back when it is folded.
+        .onChange(of: state.approvalReadingHeight) { _, _ in
+            guard state.mode == .expanded, state.view == .approval else { return }
+            let (_, h) = islandSize(mode: .expanded, view: .approval, progress: state.uploadProgress,
+                                    nw: state.notchWidth, nh: state.notchHeight)
+            withAnimation(openSpring) { islandHeight = h }
+        }
         .onChange(of: state.promptMessageCount) { _, _ in
             guard state.mode == .expanded, state.view == .prompt else { return }
             withAnimation(openSpring) { islandHeight = chatPromptHeight }
@@ -468,7 +475,7 @@ struct IslandContentView: View {
                     // Views that fill available height instead of the fixed 98pt content frame:
                     // chat (prompt) is always flexible; mail is flexible only when active so
                     // it doesn't push the ZStack taller when inactive.
-                    let isTall = v == .prompt || (v == .mail && active)
+                    let isTall = v == .prompt || (v == .mail && active) || (v == .approval && active && state.approvalReadingHeight != nil)
                     let anim: Animation = active
                         ? .spring(response: 0.4, dampingFraction: 0.8).delay(0.16)
                         : .easeIn(duration: 0.16)
