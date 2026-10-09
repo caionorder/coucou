@@ -125,6 +125,9 @@ final class HookServer: @unchecked Sendable {
         // Not resolved by an event (timeout, the hook went away): the dialog may still be open in cmux.
         if !resolved, let p = AppState.shared.pendingApproval {
             markCmuxDialogOpen(cardKey, tool: p.tool, inputKey: p.inputKey)
+        } else if resolved, let p = AppState.shared.pendingApproval {
+            timeline(.permission(key: TimelineNames.pairingKey(tool: p.tool, inputKey: p.inputKey), label: p.command,
+                                 outcome: .handled, allowedWord: String(localized: "allowed")), cardKey)
         }
         #endif
         // cancelApprovalFDSource() triggers the cancel handler which closes the fd.
@@ -171,7 +174,11 @@ final class HookServer: @unchecked Sendable {
         #if !APPSTORE
         cardKey = cmuxShownKey
         cmuxShownPayload = nil
-        if leftOpen { markCmuxDialogOpen(cardKey, tool: "AskUserQuestion", inputKey: nil) }
+        if leftOpen {
+            markCmuxDialogOpen(cardKey, tool: "AskUserQuestion", inputKey: nil)
+        } else {
+            timeline(.question(text: "", more: 0, outcome: .handled), cardKey)
+        }
         #endif
         cancelQuestionFDSource()
         pendingQuestionFD = -1
@@ -235,6 +242,17 @@ final class HookServer: @unchecked Sendable {
             source?.cancel()
         }
         if !sid.isEmpty { RecapStore.shared.recordQuestionAnswered(sessionId: sid) }
+        #if !APPSTORE
+        // The labels chosen on the card, in the order of its questions.
+        if let asked = AppState.shared.pendingQuestion {
+            let labels = asked.questions.compactMap { item -> String? in
+                if let one = answers[item.question] as? String { return one }
+                if let many = answers[item.question] as? [String] { return many.joined(separator: ", ") }
+                return nil
+            }
+            timeline(.question(text: "", more: 0, outcome: .answered(labels.joined(separator: ", "))), cmuxShownKey)
+        }
+        #endif
         dismissQuestionCard(note: "")
     }
 
@@ -651,6 +669,12 @@ final class HookServer: @unchecked Sendable {
                 refreshCmuxMeta(taskId: agentId, cwd: cwd, key: cmuxKey)
                 handleCmuxSessionStart(agentId: agentId, key: cmuxKey, payload: payload, cwd: cwd)
                 requestCmuxDiscovery()
+                // A new conversation (startup, clear) starts a new timeline; a compaction keeps it and says so.
+                switch payload["source"] as? String {
+                case "startup", "clear": timeline(.reset, cmuxKey)
+                case "compact": timeline(.notice(String(localized: "Conversation compacted.")), cmuxKey)
+                default: break
+                }
             }
             #endif
             nbLog("SessionStart \(isExternalAgent ? agentId : projectName) (\(sessionId.prefix(8)))")
@@ -674,7 +698,7 @@ final class HookServer: @unchecked Sendable {
             if let prompt = payload["prompt"] as? String, !prompt.isEmpty {
                 appendStep(id: agentId, step: stepPrefix(forKey: cmuxKey) + String(prompt.prefix(60)))
                 #if !APPSTORE
-                if cmuxTaskId == agentId { appendCmuxMessage(cmuxKey, role: .user, text: prompt, limit: 2000) }
+                timeline(.prompt(prompt), cmuxKey)
                 #endif
             }
             #if !APPSTORE
@@ -698,8 +722,14 @@ final class HookServer: @unchecked Sendable {
             if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKey) }
             setTaskState(agentId, .working, cmuxKey: cmuxKey)
             let input = payload["tool_input"] as? [String: Any] ?? [:]
-            let step = localizedStep(tool: tool, input: input)
-            appendStep(id: agentId, step: stepPrefix(forKey: cmuxKey) + step)
+            let parts = stepParts(tool: tool, input: input)
+            appendStep(id: agentId, step: stepPrefix(forKey: cmuxKey) + (parts.detail.map { "\(parts.verb) · \($0)" } ?? parts.verb))
+            #if !APPSTORE
+            if cmuxKey != nil {
+                timeline(.toolStarted(key: timelineKey(tool: tool, input: input), tool: parts.verb,
+                                      symbol: TimelineNames.symbol(forTool: tool), label: parts.timelineDetail ?? ""), cmuxKey)
+            }
+            #endif
             nbLog("PreToolUse \(tool)")
 
         case "PostToolUse":
@@ -707,16 +737,40 @@ final class HookServer: @unchecked Sendable {
             // Live diff for Edit / MultiEdit / Write
             let diffTool = payload["tool_name"] as? String ?? ""
             let diffInput = payload["tool_input"] as? [String: Any] ?? [:]
+            var timelineEdit: ChatEdit? = nil
             if let diff = buildFileDiff(tool: diffTool, input: diffInput, pillId: agentId) {
                 let idx = state.appendSessionDiff(diff, for: agentId)
                 let step = String.makeDiffStep(filename: diff.name, added: diff.added, removed: diff.removed, diffId: idx)
                 appendStep(id: agentId, step: step)
                 RecapStore.shared.recordFileDiff(sessionId: recapSessionId, path: diff.name, added: diff.added, removed: diff.removed)
+                #if !APPSTORE
+                // The same diff and the id the store gave it: the timeline row opens that diff.
+                if cmuxKey != nil { timelineEdit = Self.timelineEdit(diff: diff, diffId: idx) }
+                #endif
             }
+            #if !APPSTORE
+            if cmuxKey != nil {
+                let parts = stepParts(tool: diffTool, input: diffInput)
+                timeline(.toolFinished(key: timelineKey(tool: diffTool, input: diffInput), tool: parts.verb,
+                                       symbol: TimelineNames.symbol(forTool: diffTool), label: parts.timelineDetail ?? "",
+                                       failedWord: nil, edit: timelineEdit, allowedWord: String(localized: "allowed")), cmuxKey)
+            }
+            #endif
 
         case "PostToolUseFailure":
             setTaskState(agentId, .working, cmuxKey: cmuxKey)
             appendStep(id: agentId, step: stepPrefix(forKey: cmuxKey) + String(localized: "⚠ failed"))
+            #if !APPSTORE
+            if cmuxKey != nil {
+                let failedTool = payload["tool_name"] as? String ?? ""
+                let failedInput = payload["tool_input"] as? [String: Any] ?? [:]
+                let parts = stepParts(tool: failedTool, input: failedInput)
+                timeline(.toolFinished(key: timelineKey(tool: failedTool, input: failedInput), tool: parts.verb,
+                                       symbol: TimelineNames.symbol(forTool: failedTool), label: parts.timelineDetail ?? "",
+                                       failedWord: String(localized: "⚠ failed"), edit: nil,
+                                       allowedWord: String(localized: "allowed")), cmuxKey)
+            }
+            #endif
 
         case "Notification":
             let message = payload["message"] as? String ?? ""
@@ -726,6 +780,9 @@ final class HookServer: @unchecked Sendable {
             var badgeSet = false
             if lower.contains("rate limit") || lower.contains("limite d") {
                 kind = "ratelimit"
+                #if !APPSTORE
+                timeline(.notice(String(localized: "Rate limit reached.")), cmuxKey)
+                #endif
                 setTaskState(agentId, .ratelimit, cmuxKey: cmuxKey)
                 SoundEngine.shared.play("rate")
             } else if message.hasSuffix("?") {
@@ -775,7 +832,7 @@ final class HookServer: @unchecked Sendable {
             let finalText = DiffEngine.toOneLine(rawFinal)
             #if !APPSTORE
             if cmuxTaskId == agentId {
-                appendCmuxMessage(cmuxKey, role: .assistant, text: rawFinal, limit: 4000)
+                timeline(.answer(rawFinal), cmuxKey)
                 refreshCmuxMeta(taskId: agentId, cwd: cwd, key: cmuxKey)
                 requestCmuxDiscovery()
             }
@@ -859,6 +916,9 @@ final class HookServer: @unchecked Sendable {
             if let key = cmuxKey { cmuxStopRecord.stopFailed(key) }
             #endif
             RecapStore.shared.stop(sessionId: recapSessionId)
+            #if !APPSTORE
+            timeline(.ended(ok: false, note: String(localized: "The turn ended with an error.")), cmuxKey)
+            #endif
             setTaskState(agentId, .error, cmuxKey: cmuxKey)
             SoundEngine.shared.play("error")
             #if !APPSTORE
@@ -881,6 +941,9 @@ final class HookServer: @unchecked Sendable {
 
         case "Interrupt":
             // Codex: user stopped the turn
+            #if !APPSTORE
+            timeline(.ended(ok: false, note: String(localized: "Interrupted.")), cmuxKey)
+            #endif
             RecapStore.shared.stop(sessionId: recapSessionId)
             activeSessionId = nil
             setTaskState(agentId, .idle, cmuxKey: cmuxKey)
@@ -1090,6 +1153,19 @@ final class HookServer: @unchecked Sendable {
 
         let command = toolInput["command"] as? String ?? tool
 
+        #if !APPSTORE
+        // The request waits, in line or on screen. A card asking again (promoted, requeued) changes nothing.
+        if cmuxTaskId != nil {
+            // The row of a request names the tool by its own verb and shows the whole command up to the cut, white
+            // space folded: nothing is guessed from the first word.
+            let parts = stepParts(tool: tool, input: toolInput)
+            let wording = parts.timelineDetail.map { "\(parts.plainVerb) · \($0)" } ?? parts.plainVerb
+            timeline(.permission(key: timelineKey(tool: tool, input: toolInput), label: wording,
+                                 outcome: .waiting, allowedWord: String(localized: "allowed")),
+                     CmuxRouting.surfaceKey(payload: payload))
+        }
+        #endif
+
         // Read before a displaced or requeued card leaves the screen.
         let cardWasVisible = CardInputLock.cardVisible(approvalFD: pendingApprovalFD, questionFD: pendingQuestionFD,
                                                        approvalShown: state.pendingApproval != nil,
@@ -1252,6 +1328,14 @@ final class HookServer: @unchecked Sendable {
         let source = approvalFDSource
         approvalFDSource = nil
 
+        #if !APPSTORE
+        // "ask" hands the request to the terminal (marked below); the other answers settle the row.
+        if decision != "ask", let p = AppState.shared.pendingApproval {
+            timeline(.permission(key: TimelineNames.pairingKey(tool: p.tool, inputKey: p.inputKey), label: p.command,
+                                 outcome: decision == "allow" || decision == "always" ? .allowed : .denied,
+                                 allowedWord: String(localized: "allowed")), cardKey)
+        }
+        #endif
         let json: String
         switch decision {
         case "allow":  json = #"{"permissionDecision":"allow"}"#
@@ -1344,6 +1428,14 @@ final class HookServer: @unchecked Sendable {
             }
             return
         }
+
+        #if !APPSTORE
+        // The question waits, in line or on screen: its first question and how many more the card holds.
+        if cmuxTaskId != nil, let first = parsed.questions.first {
+            timeline(.question(text: first.question, more: parsed.questions.count - 1, outcome: .waiting),
+                     CmuxRouting.surfaceKey(payload: payload))
+        }
+        #endif
 
         // Read before a displaced or requeued card leaves the screen.
         let cardWasVisible = CardInputLock.cardVisible(approvalFD: pendingApprovalFD, questionFD: pendingQuestionFD,
@@ -1623,6 +1715,13 @@ final class HookServer: @unchecked Sendable {
     private func markCmuxDialogOpen(_ key: String?, tool: String, inputKey: String?) {
         guard let key else { return }
         cmuxOpenDialogs[key] = CmuxRouting.DialogMark(tool: tool, inputKey: inputKey)
+        // Every request handed back to the terminal passes here: its row says it waits there.
+        if tool == "AskUserQuestion" {
+            timeline(.question(text: "", more: 0, outcome: .inTerminal), key)
+        } else if let inputKey {
+            timeline(.permission(key: TimelineNames.pairingKey(tool: tool, inputKey: inputKey), label: tool,
+                                 outcome: .inTerminal, allowedWord: String(localized: "allowed")), key)
+        }
     }
 
     @MainActor
@@ -1739,6 +1838,7 @@ final class HookServer: @unchecked Sendable {
     private func setCmuxSurfaceState(taskId: String, key: String, _ newState: BotState) {
         guard cmuxRegistry.surface(key: key) != nil else { return }
         cmuxRegistry.setState(key: key, newState.rawValue)
+        CmuxTimelines.shared.setLive(key, newState)
         refoldCmuxTask(taskId)
     }
 
@@ -1842,7 +1942,7 @@ final class HookServer: @unchecked Sendable {
         for cardId in cmuxQueue.removeAll(surfaceKey: key) { dropCmuxHeld(cardId, leftOpen: false) }
         cmuxOpenDialogs[key] = nil
         cmuxStopRecord.forget(key)
-        state.cmuxTranscripts[key] = nil
+        CmuxTimelines.shared.remove(key)
         // Through the path that refreshes an open field; the draft typed before the session was resolved goes too.
         let closed = PromptSlot.Content.cmuxReply(taskId: taskId, surfaceKey: key)
         let heldText = !state.promptDrafts.text(for: closed).isEmpty
@@ -1891,19 +1991,6 @@ final class HookServer: @unchecked Sendable {
     private func openCmuxReplyTask() -> String? {
         if case .reply(let id)? = AppState.shared.cmuxPrompt { return id }
         return nil
-    }
-
-    /// Adds a message to the transcript of a session, keeping the last `maxTranscript`.
-    @MainActor
-    private func appendCmuxMessage(_ key: String?, role: ChatRole, text: String, limit: Int) {
-        guard let key else { return }
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        let state = AppState.shared
-        var list = state.cmuxTranscripts[key] ?? []
-        list.append(ChatMessage(role: role, content: String(trimmed.prefix(limit))))
-        if list.count > CmuxRouting.maxTranscript { list.removeFirst(list.count - CmuxRouting.maxTranscript) }
-        state.cmuxTranscripts[key] = list
     }
 
     /// A new chat started by the user: when its surface reports in, type the first prompt.
@@ -2002,7 +2089,10 @@ final class HookServer: @unchecked Sendable {
         // Registry entries whose pill is gone (late event after SessionEnd) must not count toward the cap.
         let live = Set(state.tasks.map { $0.id })
         for stale in cmuxRegistry.taskIds where !live.contains(stale) {
-            for s in cmuxRegistry.surfaces(ofTask: stale) { cmuxStopRecord.forget(s.key) }
+            for s in cmuxRegistry.surfaces(ofTask: stale) {
+                cmuxStopRecord.forget(s.key)
+                CmuxTimelines.shared.remove(s.key)
+            }
             cmuxRegistry.remove(taskId: stale)
         }
         let idle = CmuxRouting.evictableIdle(
@@ -2247,7 +2337,7 @@ final class HookServer: @unchecked Sendable {
     private func dropCmuxHeld(_ id: Int, leftOpen: Bool = true) {
         guard let held = cmuxHeld.removeValue(forKey: id) else { return }
         held.source.cancel()
-        if leftOpen { markCmuxDialogOpen(from: held) }
+        if leftOpen { markCmuxDialogOpen(from: held) } else { timelineHandled(held) }
         cmuxQueue.remove(id: id)
         releaseCmuxSurfaceIfSettled(held.taskId, key: held.surfaceKey)
     }
@@ -2267,6 +2357,7 @@ final class HookServer: @unchecked Sendable {
         for id in cmuxQueue.resolve(event: event, sessionId: sessionId, tool: tool, inputKey: inputKey) {
             guard let held = cmuxHeld.removeValue(forKey: id) else { continue }
             held.source.cancel()
+            timelineHandled(held)
             releaseCmuxSurfaceIfSettled(held.taskId, key: held.surfaceKey)
         }
     }
@@ -2471,9 +2562,70 @@ final class HookServer: @unchecked Sendable {
         return aliases[name.lowercased()] ?? name
     }
 
+    // MARK: - cmux timeline
+
+    #if !APPSTORE
+    /// One event of the timeline of a cmux session. Nothing else is read or written here; the timeline is memory only.
+    @MainActor
+    private func timeline(_ event: TimelineEvent, _ key: String?) {
+        // A session the registry does not hold (past the cap, or just gone) has no timeline: the rule of every event.
+        guard let key, cmuxRegistry.surface(key: key) != nil else { return }
+        CmuxTimelines.shared.apply(event, to: key)
+    }
+
+    /// A queued card the terminal answered (or that nobody answers any more): its row says so.
+    @MainActor
+    private func timelineHandled(_ held: CmuxHeld) {
+        if held.parsed != nil {
+            timeline(.question(text: "", more: 0, outcome: .handled), held.surfaceKey)
+        } else {
+            let tool = held.payload["tool_name"] as? String ?? "Tool"
+            let input = held.payload["tool_input"] as? [String: Any] ?? [:]
+            timeline(.permission(key: timelineKey(tool: tool, input: input), label: tool, outcome: .handled,
+                                 allowedWord: String(localized: "allowed")), held.surfaceKey)
+        }
+    }
+
+    /// The key that pairs the events of one tool call (see `TimelineNames.pairingKey`): the tool and the sorted input,
+    /// the same match the app already trusts to pair a PostToolUse with the approval on screen.
+    private func timelineKey(tool: String, input: [String: Any]) -> String {
+        TimelineNames.pairingKey(tool: tool, inputKey: Self.approvalInputKey(input))
+    }
+
+    /// The row of a file edit: counts, the changed lines (the store keeps six), and the id of the full diff.
+    private static func timelineEdit(diff: FileDiff, diffId: Int) -> ChatEdit {
+        var lines: [ChatEditLine] = []
+        outer: for hunk in diff.hunks {
+            for line in hunk.lines where line.kind != .context {
+                lines.append(ChatEditLine(kind: line.kind == .added ? .added : .removed, text: line.text))
+                if lines.count >= TimelineStore.maxPreviewLines { break outer }
+            }
+        }
+        return ChatEdit(callId: "", tool: "", symbol: nil, name: diff.name, path: diff.path, added: diff.added,
+                        removed: diff.removed, isNewFile: diff.isNewFile, tooLarge: diff.tooLarge, preview: lines, diffId: diffId)
+    }
+    #endif
+
     // MARK: - Localized step labels
 
     private func localizedStep(tool: String, input: [String: Any]) -> String {
+        let parts = stepParts(tool: tool, input: input)
+        return parts.detail.map { "\(parts.verb) · \($0)" } ?? parts.verb
+    }
+
+    /// The step wording in parts: the verb (a word of ours) and the detail (the command, file or query), nil when the
+    /// step has none; `localizedStep` is these two joined with " · ". The timeline reads the same wording once, with
+    /// two differences that never reach the ticker: `timelineDetail` folds every run of white space before the cut (a
+    /// long run of spaces cannot push the end of a command out of sight), and `plainVerb` is the verb of the tool itself,
+    /// not the one guessed from the first word of the command (the row of a request must not flatter it).
+    private struct StepParts {
+        var verb: String
+        var detail: String?
+        var timelineDetail: String?
+        var plainVerb: String
+    }
+
+    private func stepParts(tool: String, input: [String: Any]) -> StepParts {
         let labels: [String: String] = [
             "Bash":         String(localized: "step.runs",       defaultValue: "Runs"),
             "Read":         String(localized: "step.reads",      defaultValue: "Reads"),
@@ -2502,9 +2654,17 @@ final class HookServer: @unchecked Sendable {
             label = parts.count >= 2 ? "\(parts[0]) · \(parts.dropFirst().joined(separator: "__"))" : rest
         }
 
+        /// The text of the command or query, cut for the ticker and folded and cut for the timeline.
+        func texted(_ verb: String, _ raw: String) -> StepParts {
+            StepParts(verb: verb, detail: oneLine(raw), timelineDetail: oneLine(raw, collapse: true), plainVerb: label)
+        }
+        func plain(_ detail: String?) -> StepParts {
+            StepParts(verb: label, detail: detail, timelineDetail: detail, plainVerb: label)
+        }
+
         // Bash: infer a more precise verb from the command
         if tool == "Bash", let cmd = input["command"] as? String {
-            return "\(bashVerb(cmd)) · \(oneLine(cmd))"
+            return texted(bashVerb(cmd), cmd)
         }
 
         // apply_patch: extract the first file name from the patch
@@ -2513,23 +2673,23 @@ final class HookServer: @unchecked Sendable {
                 for prefix in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
                     if line.hasPrefix(prefix) {
                         let path = String(line.dropFirst(prefix.count))
-                        return "\(label) · \(URL(fileURLWithPath: path).lastPathComponent)"
+                        return plain(URL(fileURLWithPath: path).lastPathComponent)
                     }
                 }
             }
-            return label
+            return plain(nil)
         }
 
         if let cmd = input["command"] as? String {
-            return "\(label) · \(oneLine(cmd))"
+            return texted(label, cmd)
         } else if let path = input["path"] as? String {
-            return "\(label) · \(URL(fileURLWithPath: path).lastPathComponent)"
+            return plain(URL(fileURLWithPath: path).lastPathComponent)
         } else if let file = input["file_path"] as? String {
-            return "\(label) · \(URL(fileURLWithPath: file).lastPathComponent)"
+            return plain(URL(fileURLWithPath: file).lastPathComponent)
         } else if let query = input["query"] as? String {
-            return "\(label) · \(oneLine(query))"
+            return texted(label, query)
         }
-        return label
+        return plain(nil)
     }
 
     /// Infers a localized verb from a shell command's first word.
@@ -2587,8 +2747,14 @@ final class HookServer: @unchecked Sendable {
     }
 
     /// Collapses whitespace so a multi-line command stays one ticker row.
-    private func oneLine(_ text: String, limit: Int = 60) -> String {
-        let collapsed = text.split(whereSeparator: { $0.isNewline || $0 == "\t" })
+    private func oneLine(_ text: String, limit: Int = 60, collapse: Bool = false) -> String {
+        #if !APPSTORE
+        // The timeline folds every run of white space first, so the cut is at the real text.
+        let source = collapse ? TimelineStore.wording(text, max: 4000) : text
+        #else
+        let source = text
+        #endif
+        let collapsed = source.split(whereSeparator: { $0.isNewline || $0 == "\t" })
                             .joined(separator: " ")
         return collapsed.count > limit ? String(collapsed.prefix(limit)) + "…" : collapsed
     }

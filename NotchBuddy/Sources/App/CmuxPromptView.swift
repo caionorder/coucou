@@ -33,6 +33,10 @@ struct CmuxPromptView: View {
     @State private var textOwner: PromptSlot.Content?
     /// A chip click is in flight: the retarget it causes is the user's own, so it needs no notice.
     @State private var chipClicked = false
+    /// The diff card of a file edit of the timeline, while one is open over the reply view.
+    @State private var activeDiff: FileDiff?
+    /// The field had focus when the diff card opened: only then does it get it back.
+    @State private var fieldHadFocus = false
 
     private var mode: CmuxPromptMode { state.cmuxPrompt ?? .newChat }
 
@@ -117,21 +121,10 @@ struct CmuxPromptView: View {
         return nil
     }
 
-    private var transcript: [ChatMessage] {
-        if isReply, let key = targetKey { return state.cmuxTranscripts[key] ?? [] }
-        return []
-    }
-
     /// The session that answers: its label (the string the header and chips show) in the colour of its pill.
     private var replySpeaker: ChatSpeaker {
         let label = replyTask.flatMap { t in HookServer.shared.cmuxSurfaces(for: t.id).first { $0.key == targetKey }?.label }
         return ChatSpeaker(name: label ?? replyTask?.name ?? "cmux", colorHex: replyTask?.color ?? "#8E939C")
-    }
-
-    private var typing: Bool {
-        guard let key = targetKey, let raw = HookServer.shared.cmuxSurface(key: key)?.state,
-              let s = BotState(rawValue: raw) else { return false }
-        return [.thinking, .working, .searching].contains(s)
     }
 
     var body: some View {
@@ -214,6 +207,13 @@ struct CmuxPromptView: View {
             .padding(.trailing, 16)
             .padding(.top, 12)
             .padding(.bottom, 14)
+
+            // The diff of a file edit, drawn as the overview draws it: its own background and gutter.
+            if let diff = activeDiff {
+                CardBackground(wash: nil)
+                DiffCardView(diff: diff, onDismiss: { closeDiff() })
+                    .transition(.opacity)
+            }
         }
         .overlay(alignment: .bottom) { ChatResizeGrip(state: state) }
         .padding(.bottom, 10)
@@ -225,18 +225,22 @@ struct CmuxPromptView: View {
             renderedKey = resolvedKey
             state.cmuxRenderedContent = renderedContent
             loadDraft()
+            CmuxTimelines.shared.show(isReply ? renderedKey : nil)
         }
         .onDisappear {
             if state.cmuxRenderedContent == renderedContent { state.cmuxRenderedContent = nil }
+            CmuxTimelines.shared.show(nil)
         }
         .onChange(of: state.cmuxPrompt) { _, _ in launcherId = .claude }
         .onChange(of: state.cmuxDefaultFolder) { _, _ in loadFolders() }
         .onChange(of: state.cmuxRecentFolders) { _, _ in loadFolders() }
         // The registry moved the session of this pill (discovery, a closed session, a chip): show the new one.
         .onChange(of: resolvedKey) { _, new in renderedKey = new }
+        .onChange(of: renderedKey) { _, new in CmuxTimelines.shared.show(isReply ? new : nil) }
         // The field shows the draft of what is rendered; what is typed is kept for it.
         .onChange(of: renderedContent) { _, new in
             state.cmuxRenderedContent = new
+            activeDiff = nil
             loadDraft()
         }
         // A draft written from outside (a launch that timed out, a prompt that could not be typed, a send that ended).
@@ -313,27 +317,24 @@ struct CmuxPromptView: View {
     // MARK: bodies
 
     @ViewBuilder private var replyBody: some View {
-        if !transcript.isEmpty || typing {
-            let who = replySpeaker
-            ScrollViewReader { proxy in
-                ScrollView(.vertical, showsIndicators: false) {
-                    ChatTurnList(messages: transcript, speaker: { _ in who }, streamingLast: false, typing: typing)
-                        .padding(.vertical, 2)
-                }
-                .pinnedScrollTracking($pinned) { scrollToEnd(proxy) }
-                .onChange(of: transcript) { _, _ in if pinned { scrollToEnd(proxy) } }
-                .onChange(of: typing) { _, _ in if pinned { scrollToEnd(proxy) } }
-                .onAppear { pinned = true; scrollToEnd(proxy) }
-            }
-            .frame(maxHeight: .infinity)
-        } else {
-            Spacer()
-        }
+        CmuxTimelineBody(screen: CmuxTimelines.shared.screen, speaker: replySpeaker, pinned: $pinned)
+            .environment(\.chatOpenEdit) { edit in openDiff(of: edit) }
     }
 
-    private func scrollToEnd(_ proxy: ScrollViewProxy) {
-        if typing { proxy.scrollTo("typing", anchor: .bottom) }
-        else if let last = transcript.last { proxy.scrollTo(last.id, anchor: .bottom) }
+    /// The full diff while the store still has it, else the card rebuilt from the row. The field gives up focus.
+    private func openDiff(of edit: ChatEdit) {
+        // A stored diff is shown only when it is the file of the row (its path cleaned as the row's was).
+        let stored = replyTask.flatMap { t in
+            edit.diffId.flatMap { id in state.sessionDiffs[t.id]?.first { $0.id == id && TimelineStore.wording($0.path, max: TimelineStore.maxPathChars) == edit.path } }
+        }
+        fieldHadFocus = focused
+        focused = false
+        withAnimation { activeDiff = stored ?? FileDiff.rebuilt(from: edit) }
+    }
+
+    private func closeDiff() {
+        withAnimation { activeDiff = nil }
+        if fieldHadFocus { focused = true }
     }
 
     @ViewBuilder private var newChatBody: some View {

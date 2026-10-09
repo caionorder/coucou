@@ -11,6 +11,68 @@ struct ChatStep: Equatable {
     var detail: String?              // web socket only: the summary of the completion, cut
     var status: Status
     enum Status: Equatable { case running, done, stopped }   // stopped: the turn ended while it ran
+    /// SF Symbol for the chip of this tool in the summary row; nil keeps the generic one. Only the cmux timeline sets it.
+    var symbol: String? = nil
+}
+
+/// One changed line of a file edit, as the edit row keeps it (the view maps it to a diff line).
+struct ChatEditLine: Equatable {
+    enum Kind: Equatable { case context, added, removed }
+    var kind: Kind
+    var text: String
+}
+
+/// A file edit of a turn: counts and a few changed lines, never the whole diff. Produced only by the cmux timeline.
+struct ChatEdit: Equatable {
+    var callId: String
+    var tool: String                 // the chip word, already localized ("Edita")
+    var symbol: String?              // SF Symbol for its chip
+    var name: String                 // file name
+    var path: String
+    var added: Int
+    var removed: Int
+    var isNewFile: Bool
+    var tooLarge: Bool
+    var preview: [ChatEditLine]      // may be empty (too large, or dropped by the cap)
+    var diffId: Int?                 // id in the owner's diff store, to open the full diff
+
+    /// The edit as a step: for the live box and the summary. Tool, file name, "+12 −3".
+    var asStep: ChatStep {
+        var counts: [String] = []
+        if added > 0 { counts.append("+\(added)") }
+        if removed > 0 { counts.append("−\(removed)") }
+        return ChatStep(callId: callId, tool: tool, label: name, detail: counts.isEmpty ? nil : counts.joined(separator: " "),
+                        status: .done, symbol: symbol)
+    }
+}
+
+/// A moment where the agent waits for the user: a permission or a question. Shown, never answerable from a row.
+struct ChatMoment: Equatable {
+    enum Kind: Equatable { case permission, question }
+    enum Outcome: Equatable { case waiting, inTerminal, handled, allowed, denied, answered(String) }
+    var kind: Kind
+    var callId: String               // pairs a permission with its step; "" for a question
+    var text: String                 // permission: the step wording. question: the question text
+    var more: Int                    // further questions of the same card
+    var outcome: Outcome
+
+    /// Outcomes only move forward: waiting, in the terminal, handled, then a decision.
+    var rank: Int { Self.rank(of: outcome) }
+
+    static func rank(of outcome: Outcome) -> Int {
+        switch outcome {
+        case .waiting: return 0
+        case .inTerminal: return 1
+        case .handled: return 2
+        case .allowed, .denied, .answered: return 3
+        }
+    }
+
+    /// The agent waits for the user: a waiting card, or a request handed to the terminal.
+    var waitsForUser: Bool { outcome == .waiting || outcome == .inTerminal }
+
+    /// Stays outside the fold of the work: a question and its answer, a request still open, a denied one.
+    var staysVisible: Bool { kind == .question || waitsForUser || outcome == .denied }
 }
 
 /// One row of an agent turn.
@@ -22,14 +84,16 @@ struct ChatSegment: Identifiable, Equatable {
         case step(ChatStep)
         case note(String)            // an already localized sentence: approval needed, answer cut…
         case hiddenSteps             // older steps were dropped (cap)
+        case edit(ChatEdit)          // a file edit (cmux timeline only)
+        case moment(ChatMoment)      // a permission or a question (cmux timeline only)
     }
     enum TextRole: Equatable { case open, interim, answer }
 
-    /// A step, or the row that stands for dropped steps.
+    /// A step, a file edit, or the row that stands for dropped steps.
     var isStepRow: Bool {
         switch kind {
-        case .step, .hiddenSteps: return true
-        case .text, .note: return false
+        case .step, .hiddenSteps, .edit: return true
+        case .text, .note, .moment: return false
         }
     }
 }
@@ -340,7 +404,7 @@ struct ChatTurnBuilder: Equatable {
 
     /// One line, no control or format character (the rule `HermesAgentNames.clean` uses), cut to `max` characters.
     /// Server strings are untrusted: they are only ever drawn as verbatim text.
-    private static func oneLine(_ raw: String, max: Int) -> String {
+    static func oneLine(_ raw: String, max: Int) -> String {
         var out = String.UnicodeScalarView()
         // `max * 4` scalars is more than `max` characters can need here; a huge string is not walked to its end.
         for u in raw.unicodeScalars.prefix(max * 4) {

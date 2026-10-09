@@ -72,6 +72,9 @@ jobs:
       - name: Test cmux routing
         run: bash scripts/test-cmux-routing.sh
 
+      - name: Test cmux timeline
+        run: bash scripts/test-cmux-timeline.sh
+
       - name: Diff engine tests
         run: bash scripts/test-diff-engine.sh
 

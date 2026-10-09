@@ -99,6 +99,7 @@ enum ChatAnswerStyleTests {
             case .group(_, let mode): return "group:\(mode)"
             case .card(_, _, let open): return open ? "card:open" : "card"
             case .note: return "note"
+            case .moment: return "moment"
             }
         }.joined(separator: ",")
     }
@@ -207,6 +208,7 @@ enum ChatAnswerStyleTests {
                 case .group(let g, _): seen += g.rows.map(\.id)
                 case .card(let id, _, _): seen.append(id)
                 case .note(let id, _): seen.append(id)
+                case .moment(let id, _): seen.append(id)
                 }
             }
             return seen.sorted() == segs.map(\.id).sorted() && Set(seen).count == seen.count
@@ -856,7 +858,150 @@ enum ChatAnswerStyleTests {
             return on && a && !b
         }())
 
+        timelineCases()
+
         print(failures == 0 ? "\nAll ChatAnswerStyle tests passed." : "\n\(failures) ChatAnswerStyle test(s) FAILED.")
         exit(failures == 0 ? 0 : 1)
+    }
+
+    // MARK: - cmux timeline rows (edits and moments)
+
+    static func edit(_ id: Int, _ path: String = "A.swift", added: Int = 3, removed: Int = 1, diffId: Int? = nil) -> ChatSegment {
+        ChatSegment(id: id, kind: .edit(ChatEdit(callId: "e\(id)", tool: "Edita", symbol: "pencil", name: path, path: "/p/" + path,
+                                                 added: added, removed: removed, isNewFile: false, tooLarge: false, preview: [], diffId: diffId)))
+    }
+    static func moment(_ id: Int, _ kind: ChatMoment.Kind, _ outcome: ChatMoment.Outcome, key: String = "") -> ChatSegment {
+        ChatSegment(id: id, kind: .moment(ChatMoment(kind: kind, callId: key, text: "t", more: 0, outcome: outcome)))
+    }
+
+    static func timelineCases() {
+        print("ChatTurnLayout: edits and moments")
+        let answer = text(99, "Done.", .answer)
+
+        // 44
+        let t44 = [step(0, "Lê"), step(1, "Executa"), edit(2), step(3, "Lê"), answer]
+        let i44 = ChatTurnLayout.items(segments: t44, running: false)
+        checkTrue("44 steps, an edit, steps, an answer: one folded group that holds the edit, then the card",
+                  shape(i44) == "group:folded,card" && {
+                      if case .group(let g, _) = i44[0] { return g.rows.count == 4 && g.rows.contains { if case .edit = $0.kind { return true }; return false } }
+                      return false
+                  }())
+
+        // 45
+        checkTrue("45 one step and one edit, no interim: mode rows",
+                  shape(ChatTurnLayout.items(segments: [step(0, "Lê"), edit(1)], running: false)) == "group:rows")
+        checkTrue("45b three rows with an edit fold",
+                  shape(ChatTurnLayout.items(segments: [step(0, "Lê"), edit(1), edit(2, "B.swift")], running: false)) == "group:folded")
+
+        // 46
+        let t46 = [step(0, "Lê"), moment(1, .permission, .waiting, key: "k"), step(2, "Executa", "x", .running)]
+        let i46 = ChatTurnLayout.items(segments: t46, running: true)
+        checkTrue("46 a waiting moment in the middle of a run: emitted right after the group, never inside it",
+                  shape(i46) == "group:live,moment" && {
+                      if case .group(let g, _) = i46[0] { return g.rows.count == 2 && !g.rows.contains { if case .moment = $0.kind { return true }; return false } }
+                      return false
+                  }())
+
+        // 47
+        let t47 = [step(0, "Lê"), step(1, "Lê"), step(2, "Lê"),
+                   moment(3, .permission, .denied, key: "a"), moment(4, .question, .answered("A")),
+                   moment(5, .permission, .handled, key: "b"), answer]
+        let i47 = ChatTurnLayout.items(segments: t47, running: false)
+        checkTrue("47 a denied permission and an answered question stay outside, a handled permission stays in the group",
+                  shape(i47) == "group:folded,moment,moment,card" && {
+                      if case .group(let g, _) = i47[0] { return g.rows.count == 4 && g.rows.last?.id == 5 }
+                      return false
+                  }())
+        checkTrue("47b a handled question stays outside",
+                  shape(ChatTurnLayout.items(segments: [step(0, "Lê"), moment(1, .question, .handled)], running: false)) == "group:rows,moment")
+        checkTrue("47c an in terminal permission stays outside",
+                  shape(ChatTurnLayout.items(segments: [step(0, "Lê"), moment(1, .permission, .inTerminal, key: "k")], running: false)) == "group:rows,moment")
+        checkTrue("47d a moment alone, with no group before it, is its own item",
+                  shape(ChatTurnLayout.items(segments: [moment(0, .permission, .waiting, key: "k")], running: true)) == "moment")
+
+        // 48
+        let t48 = [step(0, "Lê"), moment(1, .permission, .allowed, key: "z"), step(2, "Lê"), step(3, "Lê")]
+        let i48 = ChatTurnLayout.items(segments: t48, running: false)
+        checkTrue("48 an allowed moment with no step is a row of the group and does not count",
+                  shape(i48) == "group:folded" && {
+                      if case .group(let g, _) = i48[0] { return g.rows.count == 4 && ChatWorkSummary(group: g).count == 3 }
+                      return false
+                  }())
+
+        // 49
+        let g49 = ChatTurnLayout.WorkGroup(id: 0, rows: [step(0, "Lê"), edit(1), edit(2, "B.swift"), step(3, "Executa")])
+        let s49 = ChatWorkSummary(group: g49)
+        checkTrue("49 ChatWorkSummary: an edit counts in count and in its tool chip",
+                  s49.count == 4 && s49.tools.first == ChatWorkSummary.ToolCount(tool: "Edita", count: 2, symbol: "pencil"))
+        checkTrue("49b the other tools keep no symbol of their own", s49.tools.contains { $0.tool == "Lê" && $0.symbol == nil })
+
+        // 50
+        let g50 = ChatTurnLayout.WorkGroup(id: 0, rows: [edit(0, "A.swift", added: 12, removed: 3, diffId: 1), step(1, "Lê"),
+                                                         edit(2, "B.swift", added: 40, removed: 0, diffId: 2),
+                                                         edit(3, "A.swift", added: 2, removed: 1, diffId: 3)])
+        let f50 = ChatWorkSummary.files(group: g50)
+        checkTrue("50 files(group:): two edits of one path are one entry with summed counts and the newest diff id, in order of first edit",
+                  f50.map(\.name) == ["A.swift", "B.swift"] && f50[0].added == 14 && f50[0].removed == 4 && f50[0].diffId == 3
+                  && f50[1].added == 40 && f50[1].removed == 0)
+        let many = ChatTurnLayout.WorkGroup(id: 0, rows: (0..<60).map { edit($0, "f\($0).swift") })
+        checkTrue("50b at most 40 files", ChatWorkSummary.files(group: many).count == 40)
+
+        // 51
+        checkTrue("51 hasWork: an edit is work, a moment alone is not",
+                  ChatTurnLayout.hasWork([edit(0)]) && !ChatTurnLayout.hasWork([moment(0, .permission, .waiting, key: "k")])
+                  && !ChatTurnLayout.hasWork([moment(0, .question, .answered("x"))]))
+
+        // 52
+        let waitOnly = ChatTurnLayout.items(segments: [moment(0, .permission, .waiting, key: "k")], running: true)
+        let deniedOnly = ChatTurnLayout.items(segments: [moment(0, .permission, .denied, key: "k")], running: true)
+        checkTrue("52 showsOwnDots: false for a running turn whose only item is a waiting moment, true when it is a denied one",
+                  !ChatTurnLayout.showsOwnDots(items: waitOnly, running: true, typing: true)
+                  && ChatTurnLayout.showsOwnDots(items: deniedOnly, running: true, typing: true))
+        checkTrue("52b the typing anchor gives way to a block that waits for the user",
+                  ChatTurnLayout.anchorReplacesDots(typing: true, streamingLast: true, lastSegments: [moment(0, .permission, .waiting, key: "k")])
+                  && !ChatTurnLayout.anchorReplacesDots(typing: false, streamingLast: true, lastSegments: [moment(0, .permission, .waiting, key: "k")]))
+
+        // 53
+        let g53 = ChatTurnLayout.WorkGroup(id: 0, rows: [step(0, "Lê"), step(1, "Executa", "x", .running), edit(2)])
+        checkTrue("53 liveStep: the running step, else the last row, an edit included",
+                  ChatWorkSummary.liveStep(group: g53)?.segmentId == 1
+                  && ChatWorkSummary.liveStep(group: .init(id: 0, rows: [step(0, "Lê"), edit(1)]))?.segmentId == 1
+                  && ChatWorkSummary.liveStep(group: .init(id: 0, rows: [step(0, "Lê"), edit(1)]))?.step.tool == "Edita")
+        checkTrue("53b a running step that waits for the user is not the live one",
+                  ChatWorkSummary.liveStep(group: .init(id: 0, rows: [step(0, "Lê"), step(1, "Executa", "x", .running)]), awaiting: ["c1"])?.segmentId == 0
+                  && ChatWorkSummary.liveStep(group: .init(id: 0, rows: [step(0, "Executa", "x", .running)]), awaiting: ["c0"]) == nil)
+        checkTrue("53c with no awaiting key nothing changes (the default)",
+                  ChatWorkSummary.liveStep(group: g53) == ChatWorkSummary.liveStep(group: g53, awaiting: []))
+
+        // 53d: a request handled in the terminal is most likely allowed there: its running step is the live one
+        let t53d = [step(0, "Lê"), step(1, "Executa", "x", .running), moment(2, .permission, .handled, key: "c1")]
+        let i53d = ChatTurnLayout.items(segments: t53d, running: true)
+        checkTrue("53d a handled permission is not awaiting: its running step is the live step",
+                  ChatTurnLayout.awaitingKeys(i53d) == []
+                  && ChatWorkSummary.liveStep(group: { if case .group(let g, _) = i53d[0] { return g }; return .init(id: 0, rows: []) }(),
+                                              awaiting: ChatTurnLayout.awaitingKeys(i53d))?.segmentId == 1)
+        checkTrue("53e a permission that was allowed, denied or handled is not in the set, one that waits or is in the terminal is",
+                  ChatTurnLayout.awaitingKeys(ChatTurnLayout.items(segments: [step(0, "Lê"), moment(1, .permission, .allowed, key: "k"), moment(2, .permission, .denied, key: "d")], running: false)) == []
+                  && ChatTurnLayout.awaitingKeys(ChatTurnLayout.items(segments: [step(0, "Lê"), moment(1, .permission, .waiting, key: "w"), moment(2, .permission, .inTerminal, key: "t")], running: true)) == ["w", "t"])
+
+        // 54
+        let t54 = [step(0, "Lê"), edit(1), step(2, "Executa", "x", .running), moment(3, .permission, .waiting, key: "c2")]
+        let i54 = ChatTurnLayout.items(segments: t54, running: true)
+        checkTrue("54 a running turn with an edit and a waiting moment: the group is live, the moment follows it",
+                  shape(i54) == "group:live,moment" && ChatTurnLayout.awaitingKeys(i54) == ["c2"])
+        checkTrue("54b the header says the turn waits for the user, and only then",
+                  ChatTurnHeader.turnLabel(running: true, isNotice: false, hasAnswer: false, waitsForUser: ChatTurnLayout.waitsForUser(t54)) == .waitingForYou
+                  && ChatTurnHeader.turnLabel(running: true, isNotice: false, hasAnswer: false, waitsForUser: ChatTurnLayout.waitsForUser([step(0, "Lê")])) == .working
+                  && ChatTurnHeader.label(running: false, isNotice: false, hasAnswer: true) == .answered
+                  && ChatTurnHeader.turnLabel(running: true, isNotice: true, hasAnswer: false, waitsForUser: true) == .none)
+
+        // 55: a turn with only steps and text gives exactly the items it gives today
+        let screenshot = screenshotTurn()
+        checkTrue("55 a turn with only steps and text: the screenshot turn is still one folded group and one card",
+                  shape(ChatTurnLayout.items(segments: screenshot, running: false)) == "group:folded,card"
+                  && shape(ChatTurnLayout.items(segments: screenshotTurn(answerRole: .open), running: true)) == "group:live,card:open"
+                  && shape(ChatTurnLayout.items(segments: [step(0, "a"), step(1, "b"), note(2)], running: false)) == "group:rows,note"
+                  && ChatTurnHeader.label(running: true, isNotice: false, hasAnswer: false) == .working
+                  && ChatWorkSummary.liveStep(group: .init(id: 0, rows: [step(0, "a"), step(1, "b", "x", .running)]))?.number == 2)
     }
 }

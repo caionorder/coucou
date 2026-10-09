@@ -9,6 +9,21 @@ import SwiftUI
     static var memory = ChatFoldMemory<UUID>()
 }
 
+/// What a tap on a file edit does: the owner of the chat shows the diff. nil by default: in the Hermes chat and the shared
+/// chat there is no edit, and nothing here is tappable.
+typealias ChatOpenEdit = @MainActor (ChatEdit) -> Void
+
+private struct ChatOpenEditKey: EnvironmentKey {
+    static var defaultValue: ChatOpenEdit? { nil }
+}
+
+extension EnvironmentValues {
+    var chatOpenEdit: ChatOpenEdit? {
+        get { self[ChatOpenEditKey.self] }
+        set { self[ChatOpenEditKey.self] = newValue }
+    }
+}
+
 // MARK: - The block of one agent turn
 
 /// Header (dot, name, label), the work of the turn (steps and interim sentences: rows, a live box while it runs, or
@@ -54,6 +69,30 @@ struct AgentTurnBlock: View, Equatable {
 
     private var color: Color { Color(hex: speaker.colorHex) }
 
+    /// The items of a block, one chunk each; items that are moments and follow one another share a chunk. A chunk is
+    /// identified by the id of its first item, exactly as each item always was, so the rows of the Hermes chat and of the
+    /// shared chat (one item per chunk) keep their SwiftUI identity.
+    private struct Chunk: Identifiable {
+        struct Row: Identifiable {
+            let id: Int
+            let index: Int
+        }
+        let id: Int
+        var rows: [Row]
+    }
+
+    private static func chunks(of items: [ChatTurnLayout.Item]) -> [Chunk] {
+        var out: [Chunk] = []
+        for (index, item) in items.enumerated() {
+            if case .moment = item, let last = out.last, case .moment = items[last.rows[last.rows.count - 1].index] {
+                out[out.count - 1].rows.append(Chunk.Row(id: item.id, index: index))
+            } else {
+                out.append(Chunk(id: item.id, rows: [Chunk.Row(id: item.id, index: index)]))
+            }
+        }
+        return out
+    }
+
     /// Hermes can run tools in parallel: only the last running step shimmers, the others show a static row.
     private var shimmerId: Int? {
         segments.last { if case .step(let s) = $0.kind { return s.status == .running }; return false }?.id
@@ -63,8 +102,15 @@ struct AgentTurnBlock: View, Equatable {
         let items = ChatTurnLayout.items(segments: segments, running: running, media: media.enabled)
         VStack(alignment: .leading, spacing: 9) {
             if showsHeader { header }
-            ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-                itemView(item, index: index, items: items)
+            ForEach(Self.chunks(of: items)) { chunk in
+                if chunk.rows.count == 1 {
+                    itemView(items[chunk.rows[0].index], index: chunk.rows[0].index, items: items)
+                } else {
+                    // The moments of a turn that sit together are one quiet list, each row identified by its item id.
+                    VStack(alignment: .leading, spacing: 3) {
+                        ForEach(chunk.rows) { row in itemView(items[row.index], index: row.index, items: items) }
+                    }
+                }
             }
             if ChatTurnLayout.showsOwnDots(items: items, running: running, typing: typing) { TypingDotsView() }
         }
@@ -82,6 +128,7 @@ struct AgentTurnBlock: View, Equatable {
             switch label {
             case .working: Text("working…").font(.system(size: 12)).foregroundColor(Color(hex: "#8E939C")).lineLimit(1)
             case .answered: Text("answered").font(.system(size: 12)).foregroundColor(Color(hex: "#8E939C")).lineLimit(1)
+            case .waitingForYou: Text("waiting for you").font(.system(size: 12, weight: .medium)).foregroundColor(Color(hex: "#F5A524")).lineLimit(1)
             case .none: EmptyView()
             }
         }
@@ -107,7 +154,12 @@ struct AgentTurnBlock: View, Equatable {
     private func hasWork(before index: Int, in items: [ChatTurnLayout.Item]) -> Bool {
         items[..<index].contains { item in
             guard case .group(let group, _) = item else { return false }
-            return group.rows.contains { if case .step = $0.kind { return true }; return false }
+            return group.rows.contains {
+                switch $0.kind {
+                case .step, .edit: return true
+                default: return false
+                }
+            }
         }
     }
 
@@ -125,7 +177,11 @@ struct AgentTurnBlock: View, Equatable {
                 let open = isExpanded(group.id, items)
                 VStack(alignment: .leading, spacing: 6) {
                     ChatStepsSummaryRow(summary: ChatWorkSummary(group: group), expanded: open) { toggle(group.id, items) }
-                    if open { ChatStepsList(rows: group.rows).equatable() }
+                    if open {
+                        ChatStepsList(rows: group.rows).equatable()
+                    } else if case let files = ChatWorkSummary.files(group: group), !files.isEmpty {
+                        ChatFilesStrip(files: files)
+                    }
                 }
             }
         case .card(let id, let text, let open):
@@ -141,18 +197,34 @@ struct AgentTurnBlock: View, Equatable {
                 .foregroundColor(Color(hex: "#8E939C"))
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
+        case .moment(_, let moment):
+            ChatMomentRow(moment: moment).equatable()
         }
     }
 
     /// The box of a running turn: the current step, its number, the interim sentence. The dots show only while no
     /// step runs and no text is on screen (the model is thinking between tools).
     @ViewBuilder private func liveBox(_ group: ChatTurnLayout.WorkGroup, items: [ChatTurnLayout.Item]) -> some View {
-        let live = ChatWorkSummary.liveStep(group: group)
+        // A call that waits for the user is shown by its moment: its step is not the live one, and nothing is typing.
+        let awaiting = ChatTurnLayout.awaitingKeys(items)
+        let live = ChatWorkSummary.liveStep(group: group, awaiting: awaiting)
         let textOnScreen = items.contains { if case .card = $0 { return true }; return false }
-        ChatLiveStepBox(step: live?.step, shimmer: live?.segmentId == shimmerId && live?.step.status == .running,
-                        number: live?.number, sentence: ChatWorkSummary.liveSentence(group: group),
-                        waiting: live?.step.status != .running && !textOnScreen)
+        let waitsForUser = items.contains { if case .moment(_, let m) = $0 { return m.waitsForUser }; return false }
+        let sentence = ChatWorkSummary.liveSentence(group: group)
+        let files = ChatWorkSummary.files(group: group)
+        let drawsBox = live != nil || sentence != nil || !waitsForUser
+        let box = ChatLiveStepBox(step: live?.step, shimmer: live?.segmentId == shimmerId && live?.step.status == .running,
+                                  number: live?.number, sentence: sentence,
+                                  waiting: live?.step.status != .running && !textOnScreen && !waitsForUser)
             .equatable()
+        if files.isEmpty {
+            if drawsBox { box }
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
+                if drawsBox { box }
+                ChatFilesStrip(files: files)
+            }
+        }
     }
 
     @ViewBuilder private func workRow(_ segment: ChatSegment) -> some View {
@@ -165,6 +237,10 @@ struct AgentTurnBlock: View, Equatable {
             Text("Earlier steps hidden")
                 .font(.system(size: 11))
                 .foregroundColor(Color(hex: "#6B7079"))
+        case .edit(let edit):
+            ChatEditRow(edit: edit, showsPreview: false).equatable()
+        case .moment(let moment):
+            ChatMomentRow(moment: moment).equatable()
         case .note:
             EmptyView()
         }
@@ -226,7 +302,7 @@ struct ChatStepsSummaryRow: View {
             ForEach(shown.tools, id: \.tool) { entry in
                 QuietChip {
                     HStack(spacing: 4) {
-                        Image(systemName: ChatWorkSummary.symbol(for: entry.tool))
+                        Image(systemName: entry.symbol ?? ChatWorkSummary.symbol(for: entry.tool))
                             .font(.system(size: 9.5))
                             .foregroundColor(Color(hex: "#6B7079"))
                         Text(verbatim: entry.tool)
@@ -284,6 +360,10 @@ struct ChatStepsList: View, Equatable {
                     Text("Earlier steps hidden")
                         .font(.system(size: 11))
                         .foregroundColor(Color(hex: "#6B7079"))
+                case .edit(let edit):
+                    ChatEditRow(edit: edit, showsPreview: true).equatable()
+                case .moment(let moment):
+                    ChatMomentRow(moment: moment).equatable()
                 case .note:
                     EmptyView()
                 }
@@ -331,6 +411,359 @@ struct ChatLiveStepBox: View, Equatable {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color.white.opacity(0.04))
         .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+}
+
+// MARK: - Files and moments of a cmux turn
+
+/// A file edit, drawn like a step: the done mark, the word, the file name, the counts. Open, its changed lines follow.
+/// A tap opens the diff when the owner of the chat allows it.
+struct ChatEditRow: View, Equatable {
+    let edit: ChatEdit
+    /// The changed lines under the row: in the open list. A short turn draws the row alone.
+    var showsPreview = true
+    @Environment(\.chatOpenEdit) private var open
+
+    nonisolated static func == (a: ChatEditRow, b: ChatEditRow) -> Bool { a.edit == b.edit && a.showsPreview == b.showsPreview }
+
+    var body: some View {
+        if let open {
+            Button { open(edit) } label: { content(tappable: true) }
+                .buttonStyle(.plain)
+                .accessibilityLabel(Text(verbatim: "\(edit.tool) \(edit.name)"))
+                .accessibilityHint(Text("Open diff"))
+        } else {
+            content(tappable: false)
+        }
+    }
+
+    private func content(tappable: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 8, weight: .regular))
+                    .foregroundColor(Color(hex: "#454850"))
+                    .frame(width: 12, alignment: .center)
+                Text(verbatim: edit.tool)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundColor(Color(hex: "#6B7079"))
+                    .lineLimit(1)
+                    .layoutPriority(1)
+                Text(verbatim: edit.name)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundColor(Color(hex: "#C5C8CD"))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                EditCounts(added: edit.added, removed: edit.removed)
+                Spacer(minLength: 0)
+                if tappable {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundColor(Color(hex: "#6B7079"))
+                }
+            }
+            .frame(height: 18)
+            .contentShape(Rectangle())
+            if showsPreview && !edit.preview.isEmpty {
+                EditPreview(lines: edit.preview).padding(.leading, 18)
+            }
+        }
+        .padding(.vertical, showsPreview && !edit.preview.isEmpty ? 4 : 0)
+    }
+}
+
+/// `+12 −3`, in the colours of the diff card. A zero count is not drawn.
+private struct EditCounts: View {
+    let added: Int
+    let removed: Int
+    var body: some View {
+        HStack(spacing: 4) {
+            if added > 0 { Text(verbatim: "+\(added)").foregroundColor(Color(hex: "#22C55E")) }
+            if removed > 0 { Text(verbatim: "−\(removed)").foregroundColor(Color(hex: "#F4505E")) }
+        }
+        .font(.system(size: 10, weight: .medium).monospaced())
+        .lineLimit(1)
+        .fixedSize()
+    }
+}
+
+/// The changed lines of an edit, in the dark inset of the code blocks of the card, through the diff card's own line row.
+private struct EditPreview: View {
+    let lines: [ChatEditLine]
+
+    private func diffLine(_ line: ChatEditLine) -> DiffLine {
+        let kind: DiffLine.Kind
+        switch line.kind {
+        case .context: kind = .context
+        case .added: kind = .added
+        case .removed: kind = .removed
+        }
+        return DiffLine(kind: kind, text: line.text, origLine: -1, newLine: -1)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                DiffLineRowView(line: diffLine(line), inset: 8)
+            }
+        }
+        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(hex: "#0D0E12"))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.white.opacity(0.08), lineWidth: 1))
+        .accessibilityHidden(true)
+    }
+}
+
+/// The files edited in a folded or running turn: one chip per file with its counts, at most three, then `+N`. Always
+/// visible, so which files changed does not hide in the fold. A chip opens the newest diff of its file when the owner
+/// of the chat allows it. Nothing when no file was edited.
+struct ChatFilesStrip: View {
+    let files: [ChatWorkSummary.FileCount]
+
+    var body: some View {
+        if !files.isEmpty {
+            ViewThatFits(in: .horizontal) {
+                chips(limit: 3, fixed: true)
+                chips(limit: 2, fixed: true)
+                chips(limit: 1, fixed: true)
+                chips(limit: 1, fixed: false)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func chips(limit: Int, fixed: Bool) -> some View {
+        let shown = Array(files.prefix(limit))
+        let extra = files.count - shown.count
+        return HStack(spacing: 6) {
+            ForEach(shown, id: \.path) { file in FileChip(file: file, fixed: fixed) }
+            if extra > 0 {
+                QuietChip {
+                    Text(verbatim: "+\(extra)")
+                        .font(.system(size: 11.5))
+                        .foregroundColor(Color(hex: "#6B7079"))
+                }
+            }
+        }
+        .modifier(StripFit(fixed: fixed))
+    }
+}
+
+private struct StripFit: ViewModifier {
+    let fixed: Bool
+    func body(content: Content) -> some View {
+        if fixed { content.fixedSize() } else { content }
+    }
+}
+
+/// One file of the strip: the family of the tool chips, with a hairline so it reads as something to tap.
+private struct FileChip: View {
+    let file: ChatWorkSummary.FileCount
+    let fixed: Bool
+    @Environment(\.chatOpenEdit) private var open
+
+    var body: some View {
+        if let open {
+            Button { open(file.latest) } label: { label }
+                .buttonStyle(.plain)
+                .accessibilityLabel(Text(verbatim: file.name))
+                .accessibilityHint(Text("Open diff"))
+        } else {
+            label
+        }
+    }
+
+    private var label: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "pencil")
+                .font(.system(size: 9.5))
+                .foregroundColor(Color(hex: "#6B7079"))
+            Text(verbatim: file.name)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundColor(Color(hex: "#C5C8CD"))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            EditCounts(added: file.added, removed: file.removed)
+        }
+        .padding(.horizontal, 9).padding(.vertical, 4)
+        .background(Color.white.opacity(0.07))
+        .clipShape(Capsule())
+        .overlay(Capsule().strokeBorder(Color.white.opacity(0.10), lineWidth: 1))
+        .contentShape(Capsule())
+    }
+}
+
+/// A permission or a question of the turn. Shown, never answerable: no row here is a button. What is open is the one
+/// loud thing of a turn (amber), a denied request is quiet with its command struck, a question shows its answer.
+struct ChatMomentRow: View, Equatable {
+    let moment: ChatMoment
+
+    nonisolated static func == (a: ChatMomentRow, b: ChatMomentRow) -> Bool { a.moment == b.moment }
+
+    private let dim = Color(hex: "#6B7079")
+    private let amber = Color(hex: "#F5A524")
+    private let bad = Color(hex: "#F4505E")
+
+    /// The step wording is "verb · detail": the verb is a word of ours, the detail text of the agent.
+    private var parts: (verb: String, detail: String) {
+        guard moment.kind == .permission, let r = moment.text.range(of: " · ") else { return (moment.text, "") }
+        return (String(moment.text[..<r.lowerBound]), String(moment.text[r.upperBound...]))
+    }
+
+    var body: some View {
+        switch moment.outcome {
+        case .waiting, .inTerminal: openRow
+        case .denied: deniedRow
+        case .answered(let labels): questionOrQuiet(trailing: AnyView(answer(labels)))
+        case .handled, .allowed: questionOrQuiet(trailing: AnyView(MomentCapsule(word: Text(wordOfOutcome), color: dim, dot: false)))
+        }
+    }
+
+    private var wordOfOutcome: LocalizedStringKey {
+        switch moment.outcome {
+        case .waiting: return moment.kind == .question ? "waiting for your answer" : "waiting for your approval"
+        case .inTerminal: return "waiting in the terminal"
+        case .handled: return "answered in the terminal"
+        case .allowed: return "allowed"
+        case .denied: return "denied"
+        case .answered: return ""
+        }
+    }
+
+    /// Waiting for the card or for the terminal: the ask box of the card family at row size.
+    private var openRow: some View {
+        HStack(spacing: 8) {
+            Image(systemName: moment.kind == .question ? "questionmark.bubble.fill" : "lock.fill")
+                .font(.system(size: 10))
+                .foregroundColor(amber)
+            if moment.kind == .permission {
+                Text(verbatim: parts.verb)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundColor(amber)
+                    .lineLimit(1)
+                    .layoutPriority(1)
+                if !parts.detail.isEmpty {
+                    Text(verbatim: parts.detail)
+                        .font(.system(size: 11.5))
+                        .foregroundColor(Color(hex: "#F3D9A6"))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            } else {
+                questionText(color: Color(hex: "#F3D9A6"))
+            }
+            Spacer(minLength: 8)
+            MomentCapsule(word: Text(wordOfOutcome), color: amber)
+        }
+        .padding(.horizontal, 10).padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(amber.opacity(0.09))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(amber.opacity(0.25), lineWidth: 1))
+        .accessibilityElement(children: .combine)
+    }
+
+    private var deniedRow: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 9))
+                .foregroundColor(dim)
+                .frame(width: 12, alignment: .center)
+            Text(verbatim: parts.verb)
+                .font(.system(size: 11.5, weight: .medium))
+                .foregroundColor(dim)
+                .lineLimit(1)
+                .layoutPriority(1)
+            if !parts.detail.isEmpty {
+                Text(verbatim: parts.detail)
+                    .font(.system(size: 11.5))
+                    .foregroundColor(dim)
+                    .strikethrough(true, color: dim)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+            }
+            Spacer(minLength: 8)
+            MomentCapsule(word: Text("denied"), color: bad)
+        }
+        .frame(minHeight: 20)
+        .accessibilityElement(children: .combine)
+    }
+
+    /// A question that was answered or settled, or a permission settled with no step to carry the word.
+    @ViewBuilder private func questionOrQuiet(trailing: AnyView) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: moment.kind == .question ? "questionmark.bubble" : "lock.fill")
+                .font(.system(size: moment.kind == .question ? 10 : 9))
+                .foregroundColor(moment.kind == .question ? Color(hex: "#8E939C") : dim)
+                .frame(width: 12, alignment: .center)
+            if moment.kind == .question {
+                questionText(color: Color(hex: "#C5C8CD"))
+            } else {
+                Text(verbatim: parts.verb)
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundColor(dim)
+                    .lineLimit(1)
+                    .layoutPriority(1)
+                if !parts.detail.isEmpty {
+                    Text(verbatim: parts.detail)
+                        .font(.system(size: 11.5))
+                        .foregroundColor(dim)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+            Spacer(minLength: 8)
+            trailing
+        }
+        .frame(minHeight: 20)
+        .accessibilityElement(children: .combine)
+    }
+
+    private func questionText(color: Color) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 5) {
+            Text(verbatim: moment.text)
+                .font(.system(size: 11.5))
+                .foregroundColor(color)
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+            if moment.more > 0 {
+                Text(verbatim: "+\(moment.more)")
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundColor(dim)
+                    .fixedSize()
+            }
+        }
+    }
+
+    private func answer(_ labels: String) -> some View {
+        Text(verbatim: "→ \(labels)")
+            .font(.system(size: 11.5, weight: .semibold))
+            .foregroundColor(Color(hex: "#F1F2F4"))
+            .lineLimit(1)
+            .truncationMode(.tail)
+    }
+}
+
+/// The word an outcome says, in the capsule of the card's status words.
+private struct MomentCapsule: View {
+    let word: Text
+    let color: Color
+    var dot = true
+
+    var body: some View {
+        HStack(spacing: 4) {
+            if dot { Circle().fill(color).frame(width: 5, height: 5) }
+            word
+                .font(.system(size: 10.5, weight: .semibold))
+                .foregroundColor(color)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 7).padding(.vertical, 2.5)
+        .background(color.opacity(0.15))
+        .clipShape(Capsule())
+        .fixedSize()
     }
 }
 
@@ -445,10 +878,11 @@ struct ChatTurnList: View {
                                 showsHeader: header(for: speaker, after: index > 0 ? shown[index - 1] : nil, who: who),
                                 segments: Self.segments(of: message, streaming: running),
                                 running: running,
-                                label: ChatTurnHeader.label(
+                                label: ChatTurnHeader.turnLabel(
                                     running: running,
                                     isNotice: message.isNotice,
-                                    hasAnswer: ChatTurnHeader.hasAnswer(segments: message.segments, content: message.content)),
+                                    hasAnswer: ChatTurnHeader.hasAnswer(segments: message.segments, content: message.content),
+                                    waitsForUser: ChatTurnLayout.waitsForUser(message.segments)),
                                 messageID: message.id)
                                 .equatable()
                         }

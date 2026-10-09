@@ -27,17 +27,20 @@ enum ChatTurnLayout {
         case group(WorkGroup, mode: Mode)
         case card(id: Int, text: String, open: Bool)
         case note(id: Int, text: String)
+        /// A permission or a question that stays outside the fold (cmux timeline only; Hermes never has one).
+        case moment(id: Int, ChatMoment)
 
         var id: Int {
             switch self {
             case .group(let group, _): return group.id
-            case .card(let id, _, _), .note(let id, _): return id
+            case .card(let id, _, _), .note(let id, _), .moment(let id, _): return id
             }
         }
     }
 
     /// Every segment lands in exactly one item (a text with nothing but whitespace makes none). A note never folds:
-    /// inside a run of work it is emitted right after the group. `media`: the answers of this agent may carry media
+    /// inside a run of work it is emitted right after the group. So does a moment that stays visible (`ChatMoment.staysVisible`);
+    /// any other moment joins the run and is seen when the group is open. `media`: the answers of this agent may carry media
     /// directives (`ChatMediaDirectives`): a text that is only directives, or only the start of one, makes no card
     /// until something to draw is there.
     static func items(segments: [ChatSegment], running: Bool, media: Bool = false) -> [Item] {
@@ -47,14 +50,28 @@ enum ChatTurnLayout {
 
         func flush() {
             if !run.isEmpty { out.append(.group(WorkGroup(id: run[0].id, rows: run), mode: .rows)); run = [] }
-            for n in held { if case .note(let t) = n.kind { out.append(.note(id: n.id, text: t)) } }
+            for n in held {
+                switch n.kind {
+                case .note(let t): out.append(.note(id: n.id, text: t))
+                case .moment(let m): out.append(.moment(id: n.id, m))
+                default: break
+                }
+            }
             held = []
         }
 
         for segment in segments {
             switch segment.kind {
-            case .step, .hiddenSteps:
+            case .step, .hiddenSteps, .edit:
                 run.append(segment)
+            case .moment(let m):
+                if !m.staysVisible {
+                    run.append(segment)
+                } else if run.isEmpty {
+                    out.append(.moment(id: segment.id, m))
+                } else {
+                    held.append(segment)
+                }
             case .text(let t, let role):
                 if role == .interim {
                     run.append(segment)
@@ -90,10 +107,10 @@ enum ChatTurnLayout {
         var steps = 0, interim = false, hidden = false
         for row in group.rows {
             switch row.kind {
-            case .step: steps += 1
+            case .step, .edit: steps += 1
             case .hiddenSteps: hidden = true
             case .text: interim = true
-            case .note: break
+            case .note, .moment: break
             }
         }
         if steps == 0 && !hidden { return .rows }
@@ -101,15 +118,42 @@ enum ChatTurnLayout {
         return .folded
     }
 
-    /// The turn has a work group: a step, a dropped steps row or an interim sentence. A note or an answer is not work.
+    /// The turn has a work group: a step, a file edit, a dropped steps row or an interim sentence. A note, a moment or
+    /// an answer is not work.
     static func hasWork(_ segments: [ChatSegment]) -> Bool {
         segments.contains { segment in
             switch segment.kind {
-            case .step, .hiddenSteps: return true
+            case .step, .hiddenSteps, .edit: return true
             case .text(_, let role): return role == .interim
-            case .note: return false
+            case .note, .moment: return false
             }
         }
+    }
+
+    /// The agent waits for the user: a permission or a question that is open, or handed to the terminal, and nothing
+    /// else is still running (a tool that runs in parallel with the request keeps the turn at work).
+    static func waitsForUser(_ segments: [ChatSegment]) -> Bool {
+        var awaiting = Set<String>()
+        var waits = false
+        for segment in segments {
+            guard case .moment(let m) = segment.kind, m.waitsForUser else { continue }
+            waits = true
+            if m.kind == .permission { awaiting.insert(m.callId) }
+        }
+        guard waits else { return false }
+        return !segments.contains { segment in
+            if case .step(let step) = segment.kind { return step.status == .running && !awaiting.contains(step.callId) }
+            return false
+        }
+    }
+
+    /// The pairing keys of the permissions that wait for the user: the steps of those calls are shown by their moment.
+    /// A request handled where Coucou does not hear is not here: it was most likely allowed in the terminal, so its step
+    /// is the live one while it runs (`close` drops a step whose request never reached a decision).
+    static func awaitingKeys(_ items: [Item]) -> Set<String> {
+        var keys = Set<String>()
+        for case .moment(_, let m) in items where m.kind == .permission && m.waitsForUser { keys.insert(m.callId) }
+        return keys
     }
 
     /// The block of a turn shows the typing dots itself when it runs and draws nothing alive: no live group and no
@@ -121,6 +165,8 @@ enum ChatTurnLayout {
         return running && !items.contains { item in
             switch item {
             case .group(_, .live), .card: return true
+            // A turn that waits for the user is not typing.
+            case .moment(_, let m): return m.waitsForUser
             default: return false
             }
         }
@@ -132,7 +178,8 @@ enum ChatTurnLayout {
     /// `lastSegments`: the segments of the last message when it is the running agent message, else nil.
     static func anchorReplacesDots(typing: Bool, streamingLast: Bool, lastSegments: [ChatSegment]?, media: Bool = false) -> Bool {
         guard typing, streamingLast, let segments = lastSegments, !segments.isEmpty else { return false }
-        return hasWork(segments) || showsOwnDots(items: items(segments: segments, running: true, media: media), running: true, typing: false)
+        return hasWork(segments) || waitsForUser(segments)
+            || showsOwnDots(items: items(segments: segments, running: true, media: media), running: true, typing: false)
     }
 
     /// A finished turn with a folded group, interim text in it and no answer: what the agent said must not be hidden.
@@ -154,7 +201,23 @@ enum ChatTurnLayout {
 // MARK: - Summary of a group
 
 struct ChatWorkSummary: Equatable {
-    struct ToolCount: Equatable { let tool: String; let count: Int }
+    struct ToolCount: Equatable {
+        let tool: String
+        let count: Int
+        /// SF Symbol of the first row of that tool, when it brought one (cmux). nil: the table below.
+        var symbol: String? = nil
+    }
+    /// A file edited in the group: the counts of all its edits and the newest of them.
+    struct FileCount: Equatable {
+        let path: String
+        let name: String
+        let added: Int
+        let removed: Int
+        let latest: ChatEdit
+        /// The diff of the newest edit that kept one.
+        var diffId: Int? { latest.diffId }
+    }
+    static let maxFiles = 40
     enum State: Equatable { case done, running, stopped }
     struct LiveStep: Equatable { let step: ChatStep; let segmentId: Int; let number: Int? }
 
@@ -169,17 +232,22 @@ struct ChatWorkSummary: Equatable {
     init(group: ChatTurnLayout.WorkGroup) {
         var order: [String] = []
         var counts: [String: Int] = [:]
+        var symbols: [String: String] = [:]
         var n = 0, hidden = false, stopped = false, running = false
         for row in group.rows {
             switch row.kind {
             case .step(let s):
                 n += 1
-                if counts[s.tool] == nil { order.append(s.tool) }
+                if counts[s.tool] == nil { order.append(s.tool); if let sym = s.symbol { symbols[s.tool] = sym } }
                 counts[s.tool, default: 0] += 1
                 if s.status == .stopped { stopped = true }
                 if s.status == .running { running = true }
+            case .edit(let e):
+                n += 1
+                if counts[e.tool] == nil { order.append(e.tool); if let sym = e.symbol { symbols[e.tool] = sym } }
+                counts[e.tool, default: 0] += 1
             case .hiddenSteps: hidden = true
-            case .text, .note: break
+            case .text, .note, .moment: break
             }
         }
         count = n
@@ -190,7 +258,7 @@ struct ChatWorkSummary: Equatable {
                 let ca = counts[a.element] ?? 0, cb = counts[b.element] ?? 0
                 return ca != cb ? ca > cb : a.offset < b.offset
             }
-            .map { ToolCount(tool: $0.element, count: counts[$0.element] ?? 0) }
+            .map { ToolCount(tool: $0.element, count: counts[$0.element] ?? 0, symbol: symbols[$0.element]) }
         state = stopped ? .stopped : (running ? .running : .done)
     }
 
@@ -210,18 +278,42 @@ struct ChatWorkSummary: Equatable {
         }
     }
 
-    /// The last running step (the one that shimmers), else the last step. `number` is its 1 based position among
-    /// the steps of the group, nil once steps were dropped.
-    static func liveStep(group: ChatTurnLayout.WorkGroup) -> LiveStep? {
+    /// The last running step (the one that shimmers), else the last step; a file edit is a candidate too. `number` is
+    /// its 1 based position among the steps of the group, nil once steps were dropped. `awaiting`: pairing keys of
+    /// calls that wait for the user; their running step is shown by its moment, so it is not the live one.
+    static func liveStep(group: ChatTurnLayout.WorkGroup, awaiting: Set<String> = []) -> LiveStep? {
         var steps: [(segment: ChatSegment, step: ChatStep)] = []
         var hidden = false
         for row in group.rows {
             if case .step(let s) = row.kind { steps.append((row, s)) }
+            if case .edit(let e) = row.kind { steps.append((row, e.asStep)) }
             if case .hiddenSteps = row.kind { hidden = true }
         }
-        guard !steps.isEmpty else { return nil }
-        let index = steps.lastIndex { $0.step.status == .running } ?? steps.count - 1
+        let shown = steps.indices.filter { !(steps[$0].step.status == .running && awaiting.contains(steps[$0].step.callId)) }
+        guard !shown.isEmpty else { return nil }
+        let index = shown.last { steps[$0].step.status == .running } ?? shown[shown.count - 1]
         return LiveStep(step: steps[index].step, segmentId: steps[index].segment.id, number: hidden ? nil : index + 1)
+    }
+
+    /// The files edited in the group: distinct paths in order of first edit, counts summed, at most `maxFiles`.
+    static func files(group: ChatTurnLayout.WorkGroup) -> [FileCount] {
+        var order: [String] = []
+        var sums: [String: (added: Int, removed: Int, latest: ChatEdit)] = [:]
+        for row in group.rows {
+            guard case .edit(let e) = row.kind else { continue }
+            if var entry = sums[e.path] {
+                entry.added += e.added
+                entry.removed += e.removed
+                entry.latest = e
+                sums[e.path] = entry
+            } else {
+                order.append(e.path)
+                sums[e.path] = (e.added, e.removed, e)
+            }
+        }
+        return order.prefix(maxFiles).compactMap { path in
+            sums[path].map { FileCount(path: path, name: $0.latest.name, added: $0.added, removed: $0.removed, latest: $0.latest) }
+        }
     }
 
     /// The last interim sentence of the group.
@@ -236,13 +328,20 @@ struct ChatWorkSummary: Equatable {
 // MARK: - Header label
 
 enum ChatTurnHeader {
-    enum Label: Equatable { case working, answered, none }
+    enum Label: Equatable { case working, answered, waitingForYou, none }
 
     /// The pending placeholder (no message yet) is not labelled here: its block carries `.working` itself.
     static func label(running: Bool, isNotice: Bool, hasAnswer: Bool) -> Label {
         if isNotice { return .none }
         if running { return .working }
         return hasAnswer ? .answered : .none
+    }
+
+    /// The same, for a turn that may wait for the user (cmux only: no other chat has a moment). A turn that waits says
+    /// so before anything else; with `waitsForUser` false it is exactly `label`.
+    static func turnLabel(running: Bool, isNotice: Bool, hasAnswer: Bool, waitsForUser: Bool) -> Label {
+        if !isNotice && waitsForUser { return .waitingForYou }
+        return label(running: running, isNotice: isNotice, hasAnswer: hasAnswer)
     }
 
     /// The message has an answer to label: a text with the role of an answer (interim sentences are not one), or the

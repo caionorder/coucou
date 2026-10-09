@@ -44,6 +44,7 @@
 		18D47AE663EB96BE5638D5F7 /* ClaudePlanCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4263B550838CC5614569D13 /* ClaudePlanCardView.swift */; };
 		1969590AFEE6CB21404346F1 /* CalcomPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3104222B3F17BA5E8DEA5277 /* CalcomPoller.swift */; };
 		1B9DC40E30AD7F75AB0B37F4 /* HermesChat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 782AD2764A58AE9CC258C4BB /* HermesChat.swift */; };
+		1BC48CAA95291BD297197139 /* CmuxTimelines.swift in Sources */ = {isa = PBXBuildFile; fileRef = F139094AE3618C68A9C99478 /* CmuxTimelines.swift */; };
 		1D23613B270FE8B11C5E27A7 /* IslandDisplayChoice.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A09E73F1E58019EF6EA2A62 /* IslandDisplayChoice.swift */; };
 		1DAB0704A136FF8E6FB34191 /* ClaudeResponseText.swift in Sources */ = {isa = PBXBuildFile; fileRef = 444604C7E2C530B664849EF9 /* ClaudeResponseText.swift */; };
 		1DCF28998358810CDBC93F91 /* ClaudeHookDetection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EA7D927F6BB2667D37AA963 /* ClaudeHookDetection.swift */; };
@@ -70,6 +71,7 @@
 		2CC2E3B688B15BBEB3AE3BCE /* WindowContextCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = E91B733ADC638E14E9BB6EFA /* WindowContextCapture.swift */; };
 		2DEB459FBD0BA3CEAAA5FDE9 /* ClaudeService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A83D5410BD030B243ADDCFF4 /* ClaudeService.swift */; };
 		2F36E3C6C073E968A682AFA4 /* NotionPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE03E03D1804B0B92C5C2DAD /* NotionPoller.swift */; };
+		33670FEB42399DA375B07BA5 /* CmuxTimeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1D3052265DA69B2DF9F0B87 /* CmuxTimeline.swift */; };
 		338D51E52A6CEE7AD4FA21AD /* CmuxRouting.swift in Sources */ = {isa = PBXBuildFile; fileRef = F767D5651FFD45E956A57D4A /* CmuxRouting.swift */; };
 		33F5C1E7EE5BCFFAB985B557 /* CmuxRouting.swift in Sources */ = {isa = PBXBuildFile; fileRef = F767D5651FFD45E956A57D4A /* CmuxRouting.swift */; };
 		3756B7E1A55D9CEC8C4D34A4 /* IslandStateMachine.swift in Sources */ = {isa = PBXBuildFile; fileRef = D8212018F09EA1E96FBD63CD /* IslandStateMachine.swift */; };
@@ -144,6 +146,7 @@
 		74E97082F2241C36E5DD22EE /* MochiActivityState.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE18399D1CD69468CCF57966 /* MochiActivityState.swift */; };
 		770F21C6A4D840AD3B0A9CB9 /* MochiLive.swift in Sources */ = {isa = PBXBuildFile; fileRef = 265262A422C270C1798F4A80 /* MochiLive.swift */; };
 		779B79945201A0D81568FB51 /* ChatMediaSniff.swift in Sources */ = {isa = PBXBuildFile; fileRef = F41E2A6611D303C615F292A4 /* ChatMediaSniff.swift */; };
+		78934A7CA41110AFE4166A72 /* CmuxTimelineView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2126CD8DDFB3F1EB187430A /* CmuxTimelineView.swift */; };
 		78B3C6814431B2DD9D1F4949 /* SoundEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1BE21C2B315D37AA70ED45E9 /* SoundEngine.swift */; };
 		78F045A55E6F4EEA5787EEEF /* MochiStill.swift in Sources */ = {isa = PBXBuildFile; fileRef = 045E7300878138F0AC385920 /* MochiStill.swift */; };
 		78FCEDC8F78B683AB10E6529 /* NotionPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE03E03D1804B0B92C5C2DAD /* NotionPoller.swift */; };
@@ -183,6 +186,7 @@
 		8E9A18333EE821A3CF9F7E34 /* DiffEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = B32FB972D02162720E566674 /* DiffEngine.swift */; };
 		8FC5907E9506DC79EB1DDC3C /* ChatMarkdown.swift in Sources */ = {isa = PBXBuildFile; fileRef = D797CC384B5BC70D34F121BC /* ChatMarkdown.swift */; };
 		908043F62E2C31F5FBC0A0C4 /* ShortcutsSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62CF42AE7611EF212CA0458F /* ShortcutsSettingsView.swift */; };
+		911BA43F386B3418A8CE87E3 /* CmuxTimelines.swift in Sources */ = {isa = PBXBuildFile; fileRef = F139094AE3618C68A9C99478 /* CmuxTimelines.swift */; };
 		9195687E1D953269F6721441 /* ChatMediaStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = EB27138D295EB471607D627D /* ChatMediaStore.swift */; };
 		91B8AAADB623A12FF6769755 /* ClaudeHookDetection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EA7D927F6BB2667D37AA963 /* ClaudeHookDetection.swift */; };
 		920EC34AE78BDC6DDD4452F9 /* MochiActivityState.swift in Sources */ = {isa = PBXBuildFile; fileRef = DE18399D1CD69468CCF57966 /* MochiActivityState.swift */; };
@@ -218,6 +222,7 @@
 		A982ED4CF79164347630CCA2 /* ChatHeight.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA7253DA9DE7185F453F8448 /* ChatHeight.swift */; };
 		A9F602EC0D755DD774F99C9F /* HermesAnnounce.swift in Sources */ = {isa = PBXBuildFile; fileRef = 89F4DECD196F6A3277925E93 /* HermesAnnounce.swift */; };
 		AB842EA92A79F4C9F92770FC /* ChatAnswerStyle.swift in Sources */ = {isa = PBXBuildFile; fileRef = F51854768E2E2616FD2ECE4B /* ChatAnswerStyle.swift */; };
+		AC0A986EE9F681A49C5D05B5 /* CmuxTimeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1D3052265DA69B2DF9F0B87 /* CmuxTimeline.swift */; };
 		AD94156F1F9CFF62B35202FB /* ApprovalRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD426E81DF79CA79888059D9 /* ApprovalRelay.swift */; };
 		ADB4EF797FBD6CC90F8D25D3 /* MochiActivityAttributes.swift in Sources */ = {isa = PBXBuildFile; fileRef = 323F242B14A61A7C071EC115 /* MochiActivityAttributes.swift */; };
 		ADBB9C15DDA4044625B325BE /* MochiOutfitDrawing.swift in Sources */ = {isa = PBXBuildFile; fileRef = E84E5D91129352E8A1D32AA4 /* MochiOutfitDrawing.swift */; };
@@ -316,6 +321,7 @@
 		F28275101D83F121E582B1B1 /* LiveActivityRelay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 136626568FF0C3EAB1D08067 /* LiveActivityRelay.swift */; };
 		F5D6F8E2CA65AB16B487DDD0 /* IslandScreenGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9466FDE02C9B3FB4EF01DFF8 /* IslandScreenGeometry.swift */; };
 		F6CA56F362902839EF9A3E2E /* PhoneAssets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 60401D1023D17C3FD30D7113 /* PhoneAssets.xcassets */; };
+		F85C326CFE024707D5E98224 /* CmuxTimelineView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2126CD8DDFB3F1EB187430A /* CmuxTimelineView.swift */; };
 		F9445A71BBF9E4D20224238E /* QuestionPayload.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C6993B34A0FFF8E3D454ADC /* QuestionPayload.swift */; };
 		FA1D79CA40AE911719E71D7F /* AppLanguage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E86C0F4781F9FEE122C4B92 /* AppLanguage.swift */; };
 		FAD78D74C6906D4EC8AA4101 /* UploadSequenceEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FD65943C32E150F1CD65C31 /* UploadSequenceEngine.swift */; };
@@ -510,7 +516,10 @@
 		EBB84A66045EB20CAC93A8A6 /* AskQuestion.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AskQuestion.swift; sourceTree = "<group>"; };
 		EE60A834934474CDAE022FF8 /* SearchAndSpotlight.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchAndSpotlight.swift; sourceTree = "<group>"; };
 		F1064AD8471C51AFF4F12258 /* SharedSessions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedSessions.swift; sourceTree = "<group>"; };
+		F139094AE3618C68A9C99478 /* CmuxTimelines.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CmuxTimelines.swift; sourceTree = "<group>"; };
 		F1BD8F3CAA60CF37640759E1 /* NotchBuddyApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotchBuddyApp.swift; sourceTree = "<group>"; };
+		F1D3052265DA69B2DF9F0B87 /* CmuxTimeline.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CmuxTimeline.swift; sourceTree = "<group>"; };
+		F2126CD8DDFB3F1EB187430A /* CmuxTimelineView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CmuxTimelineView.swift; sourceTree = "<group>"; };
 		F41E2A6611D303C615F292A4 /* ChatMediaSniff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ChatMediaSniff.swift; sourceTree = "<group>"; };
 		F4263B550838CC5614569D13 /* ClaudePlanCardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClaudePlanCardView.swift; sourceTree = "<group>"; };
 		F4A13AEE6E06F46CEC9D908C /* UserIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UserIdentity.swift; sourceTree = "<group>"; };
@@ -572,6 +581,9 @@
 				86F36AF526D64CC29A5D52F0 /* CmuxJump.swift */,
 				6CBB31A611F8D08DF3D68CE7 /* CmuxPromptView.swift */,
 				F767D5651FFD45E956A57D4A /* CmuxRouting.swift */,
+				F1D3052265DA69B2DF9F0B87 /* CmuxTimeline.swift */,
+				F139094AE3618C68A9C99478 /* CmuxTimelines.swift */,
+				F2126CD8DDFB3F1EB187430A /* CmuxTimelineView.swift */,
 				73FA4DF1BE5246CCFFB72E5C /* CodexPlanGauge.swift */,
 				90C92E97D5108CD34C75529F /* Coucou-Bridging-Header.h */,
 				742353570938A62E3C4EFB9F /* CoucouTry.h */,
@@ -992,6 +1004,9 @@
 				6C14B2C7E1BA72D6448EF07C /* CmuxJump.swift in Sources */,
 				236B02FD824BACF0F864A68E /* CmuxPromptView.swift in Sources */,
 				33F5C1E7EE5BCFFAB985B557 /* CmuxRouting.swift in Sources */,
+				33670FEB42399DA375B07BA5 /* CmuxTimeline.swift in Sources */,
+				F85C326CFE024707D5E98224 /* CmuxTimelineView.swift in Sources */,
+				911BA43F386B3418A8CE87E3 /* CmuxTimelines.swift in Sources */,
 				9AD370335A3ECC9C82375F93 /* CodexPlanGauge.swift in Sources */,
 				EE3AB10544113500486A9684 /* ColorHex.swift in Sources */,
 				51A91839392DD6250836F8BF /* CoucouTry.m in Sources */,
@@ -1186,6 +1201,9 @@
 				D4BFC1264F31EA974151B013 /* CmuxJump.swift in Sources */,
 				163D65DD56AFAA9803693CF9 /* CmuxPromptView.swift in Sources */,
 				338D51E52A6CEE7AD4FA21AD /* CmuxRouting.swift in Sources */,
+				AC0A986EE9F681A49C5D05B5 /* CmuxTimeline.swift in Sources */,
+				78934A7CA41110AFE4166A72 /* CmuxTimelineView.swift in Sources */,
+				1BC48CAA95291BD297197139 /* CmuxTimelines.swift in Sources */,
 				EB1D9680D3DB0F0707D4A043 /* CodexPlanGauge.swift in Sources */,
 				9ECEE890D4486B6E83BD5B7F /* ColorHex.swift in Sources */,
 				9813131979C853F4BADA4678 /* CoucouTry.m in Sources */,
