@@ -90,7 +90,7 @@ def reset():
         CONFIG.update({"models_drop": 0, "chat_drop": 0, "chat_stall": 0, "chat_stall_count": 0, "chat_status": 0,
                        "models_stall": 0, "models_stall_count": 0})
         COUNTS.clear()
-        COUNTS.update({"models_hits": 0, "chat_hits": 0})
+        COUNTS.update({"models_hits": 0, "chat_hits": 0, "other_hits": 0})
         LAST["body"] = b""
 
 
@@ -173,6 +173,8 @@ class Handler(BaseHTTPRequestHandler):
                     hold = CONFIG["models_stall"]
                 time.sleep(hold)
         if tail != "/v1/models":
+            with LOCK:
+                COUNTS["other_hits"] += 1
             return self.send_json(404, envelope("not found", "not_found", "not_found"))
         if not self.authed(profile):
             return self.send_json(401, envelope("Invalid API key", "invalid_request_error", "gateway_auth_failed"))
@@ -201,6 +203,8 @@ class Handler(BaseHTTPRequestHandler):
         if profile == "__unknown__":
             return self.send_json(404, envelope("no such profile", "not_found", "profile_not_found"))
         if tail != "/v1/chat/completions":
+            with LOCK:
+                COUNTS["other_hits"] += 1
             return self.send_json(404, envelope("not found", "not_found", "not_found"))
         with LOCK:
             COUNTS["chat_hits"] += 1
@@ -270,7 +274,7 @@ class Handler(BaseHTTPRequestHandler):
                 {"tool": tool, "toolCallId": call_id, "status": "completed"}) + "\n\n")
 
         own_stream = ("steps", "steps2", "steps_off", "approval", "long_label", "status", "cut_in_tool", "think_split", "reuse_id", "burst",
-                      "seq3", "text_tool", "think_open", "think_literal")
+                      "seq3", "text_tool", "think_open", "think_literal", "media")
         try:
             emit(chunk({"role": "assistant"}))
             emit(": keepalive\n\n")
@@ -333,6 +337,11 @@ class Handler(BaseHTTPRequestHandler):
                 emit(tool_running("same", "terminal", "ls", "💻"))
                 emit(tool_completed("same", "terminal"))
                 emit(chunk({"content": "\n\nAnswer."}))
+                emit(chunk({}, "stop"))
+            elif last_user == "media":
+                # The media directives of an agent that hands over a file, cut inside the keyword and inside the path.
+                for part in ("Primeiro audio. 6s.\n\n[[audio", "_as_voice]]\nME", "DIA:/tmp/AI Br", "ain/her-new-photos.ogg\n\nOuve e me fala."):
+                    emit(chunk({"content": part}))
                 emit(chunk({}, "stop"))
             elif last_user == "burst":
                 # One write: the client reads the hundred pairs inside a single refresh window.

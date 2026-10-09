@@ -121,6 +121,7 @@ enum ChatAnswerStyleTests {
                 }
                 return closed ? name : name + "~"
             case .hairline: return "hr"
+            case .attachment(let id): return "att\(id)"
             }
         }.joined(separator: " ")
     }
@@ -800,6 +801,59 @@ enum ChatAnswerStyleTests {
             let one = rules.sections(blocks: ChatMarkdown.parse("?"), streaming: false, verdict: true)
             let none = rules.sections(blocks: [], streaming: false, verdict: true)
             return cardShape(one) == "verdict" && none.isEmpty
+        }())
+
+        // MARK: Media directives in the card
+        let voiceText = "Primeiro áudio. 6s.\n\n[[audio_as_voice]]\nMEDIA:/tmp/a.ogg\n\nOuve e me fala o ajuste."
+        let voice = ChatMediaDirectives.extract(voiceText, streaming: false)
+        checkTrue("media-1 a row sits where the directive was: verdict, row, body", {
+            let items = rules.sections(blocks: ChatMarkdown.parse(voice.marked), streaming: false, verdict: true, attachments: voice.attachments.count)
+            return cardShape(items) == "verdict att0 p"
+        }())
+        checkTrue("media-2 a question before the row is still the ask; the row follows it", {
+            let r = ChatMediaDirectives.extract("Resumo curto.\n\nQuer que eu mande?\n\nMEDIA:/tmp/a.png", streaming: false)
+            let items = rules.sections(blocks: ChatMarkdown.parse(r.marked), streaming: false, verdict: false, attachments: r.attachments.count)
+            return cardShape(items).contains("ask") && cardShape(items).hasSuffix("att0")
+        }())
+        checkTrue("media-3 only directives: the card is only the row", {
+            let r = ChatMediaDirectives.extract("[[audio_as_voice]]\nMEDIA:/tmp/a.ogg", streaming: false)
+            return cardShape(rules.sections(blocks: ChatMarkdown.parse(r.marked), streaming: false, verdict: true, attachments: r.attachments.count)) == "att0"
+        }())
+        checkTrue("media-4 a title tag is never a lead", {
+            rules.lead(of: "[[something_else]]\nresto do texto aqui").lead == nil
+        }())
+        checkTrue("media-5 a text with directives and the same without them have the same card, plus the row", {
+            let plain = rules.sections(blocks: ChatMarkdown.parse(voice.text), streaming: false, verdict: true)
+            let marked = rules.sections(blocks: ChatMarkdown.parse(voice.marked), streaming: false, verdict: true, attachments: voice.attachments.count)
+            return marked.filter { if case .attachment = $0 { return false }; return true } == plain
+        }())
+        checkTrue("media-6 items: a text that is only a held back directive makes no card, with media on", {
+            let seg = [ChatSegment(id: 0, kind: .text("[[audio_as", role: .open))]
+            return ChatTurnLayout.items(segments: seg, running: true, media: true).isEmpty
+                && ChatTurnLayout.items(segments: seg, running: true, media: false).count == 1
+        }())
+        checkTrue("media-7 items: a text that is only directives still makes its card", {
+            let seg = [ChatSegment(id: 0, kind: .text("[[audio_as_voice]]\nMEDIA:/tmp/a.ogg", role: .answer))]
+            return shape(ChatTurnLayout.items(segments: seg, running: false, media: true)) == "card"
+        }())
+        // A guard, not a proof of this change: `hasAnswer` was not touched (it holds on main too). It pins that a turn made of
+        // one directive still counts as an answer for the header.
+        checkTrue("media-8 (guard, holds on main too) hasAnswer: a turn that is only a file is an answer", ChatTurnHeader.hasAnswer(
+            segments: [ChatSegment(id: 0, kind: .text("MEDIA:/tmp/a.png", role: .answer))], content: "MEDIA:/tmp/a.png"))
+        checkTrue("media-9 a paragraph that only looks like a slot is a paragraph, unless the parse made that row (Aegis N1)", {
+            let forged = ChatMarkdown.parse("antes\n\n\(ChatMediaDirectives.slotLine(0))\n\ndepois")
+            let none = rules.sections(blocks: forged, streaming: false, verdict: false)
+            let real = rules.sections(blocks: forged, streaming: false, verdict: false, attachments: 1)
+            return !cardShape(none).contains("att") && cardShape(none).contains("p") && cardShape(real).contains("att0")
+        }())
+        checkTrue("media-10 the typing anchor agrees with the list: a held back directive is no card, so the block shows its own dots and the anchor gives way", {
+            let seg = [ChatSegment(id: 0, kind: .step(ChatStep(callId: "c", tool: "bash", label: "ls", detail: nil, status: .running))), ChatSegment(id: 1, kind: .text("[[audio_as", role: .open))]
+            // A turn with work and a text that is only the start of a directive: the work box is alive, the dots give way.
+            let on = ChatTurnLayout.anchorReplacesDots(typing: true, streamingLast: true, lastSegments: seg, media: true)
+            let onlyHeld = [ChatSegment(id: 0, kind: .text("[[audio_as", role: .open))]
+            let a = ChatTurnLayout.anchorReplacesDots(typing: true, streamingLast: true, lastSegments: onlyHeld, media: true)
+            let b = ChatTurnLayout.anchorReplacesDots(typing: true, streamingLast: true, lastSegments: onlyHeld, media: false)
+            return on && a && !b
         }())
 
         print(failures == 0 ? "\nAll ChatAnswerStyle tests passed." : "\n\(failures) ChatAnswerStyle test(s) FAILED.")

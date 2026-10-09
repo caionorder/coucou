@@ -504,6 +504,23 @@ enum HermesChatTests {
                   !seenText.contains("graph.facebook.com") && !seenText.contains("terminal") && !seenText.contains(HermesChat.approvalNote)
                     && !seenText.contains(HermesChat.interruptedNote))
 
+        print("media directives: the transport keeps the text as the server sent it, and asks for nothing else")
+        await ctl("/_test/reset")
+        let mediaRun = await { () -> String? in
+            try? await HermesChat.streamChat(agent: markAgent, key: "test-key-mark", encodedBody: body("media"), onToken: { _ in })
+        }()
+        let mediaSent = "Primeiro audio. 6s.\n\n[[audio_as_voice]]\nMEDIA:/tmp/AI Brain/her-new-photos.ogg\n\nOuve e me fala."
+        check("16 the stored text is byte for byte the deltas, directives and all", mediaRun ?? "-", mediaSent)
+        let mediaHistory: [String: Any] = ["model": "mark", "stream": true, "messages": [
+            ["role": "user", "content": "media"], ["role": "assistant", "content": mediaRun ?? ""], ["role": "user", "content": "next"]]]
+        let mediaBody = (try? JSONSerialization.data(withJSONObject: mediaHistory)) ?? Data()
+        _ = try? await HermesChat.streamChat(agent: markAgent, key: "test-key-mark", encodedBody: mediaBody) { _ in }
+        let mediaSeen = (try? await URLSession.shared.data(from: URL(string: base + "/_test/last_body")!))?.0 ?? Data()
+        let mediaMsgs = (((try? JSONSerialization.jsonObject(with: mediaSeen)) as? [String: Any])?["messages"] as? [[String: Any]]) ?? []
+        check("16 the next request carries it unchanged", mediaMsgs.count > 1 ? (mediaMsgs[1]["content"] as? String ?? "-") : "-", mediaSent)
+        check("16 no request other than the chat requests reaches the server (a path in an answer is never fetched)", await hits("other_hits"), 0)
+        check("16 ... exactly the two chat requests", await hits("chat_hits"), 2)
+
         // The history the app sends is built by one pure function (ClaudeService calls it): rows never enter it.
         let storedMessages: [[String: Any]] = [
             ["role": "user", "content": [["type": "text", "text": "steps"], ["type": "image_url", "image_url": "x"]]],

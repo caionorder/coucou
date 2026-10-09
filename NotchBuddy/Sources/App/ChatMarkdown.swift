@@ -426,6 +426,22 @@ enum ChatMarkdown {
         return s.allSatisfy { $0 == fence.char }
     }
 
+    /// For each line, whether it is part of a fenced code block (the fence lines included). A fence that never closes
+    /// holds the lines to the end, as `parse` reads it. The same fence rules as `parse`, written once.
+    static func codeLineMask(_ lines: [String]) -> [Bool] {
+        var mask = [Bool](repeating: false, count: lines.count)
+        var i = 0
+        while i < lines.count {
+            guard let fence = openingFence(lines[i]) else { i += 1; continue }
+            mask[i] = true
+            i += 1
+            while i < lines.count && !closes(lines[i], fence: fence) { mask[i] = true; i += 1 }
+            if i < lines.count { mask[i] = true }
+            i += 1
+        }
+        return mask
+    }
+
     // MARK: Rules, quotes, lists
 
     /// 3 or more of the same `-`, `*` or `_`, spaces allowed between them, nothing else.

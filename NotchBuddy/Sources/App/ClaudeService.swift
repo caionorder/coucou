@@ -231,6 +231,7 @@ final class ClaudeService {
         for turn in conversations[id].turns.values { turn.task?.cancel() }
         generations.renew(id)
         conversations.set(id, Conversation())
+        ChatMediaStore.shared.forgetConversation(id.mediaKey)
     }
 
     /// Forgets one conversation for good (its agent was removed) and cancels its running turns.
@@ -238,6 +239,7 @@ final class ClaudeService {
         for turn in conversations[id].turns.values { turn.task?.cancel() }
         generations.drop(id)
         conversations.remove(id)
+        ChatMediaStore.shared.forgetConversation(id.mediaKey)
     }
 
     /// A turn of this conversation has not produced its first text yet.

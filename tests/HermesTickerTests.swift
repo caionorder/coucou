@@ -184,6 +184,20 @@ enum HermesTickerTests {
         gone.rows(g0, ["late"])
         checkTrue("51 the old turn writes nothing after the removal", gone.lines == ["fresh"])
 
+        print("media directives")
+        checkTrue("media-1 the directives leave the ticker: the sentence, then one label", {
+            let t = "Primeiro áudio. 6s.\n\n[[audio_as_voice]]\nMEDIA:/Users/a/.hermes/x/her-new-photos.ogg"
+            let lines = HermesTicker.lines(from: [text(0, t, .answer)])
+            return lines == ["Primeiro áudio. 6s.", "Voice message"]
+        }())
+        checkTrue("media-2 a text that is only a file shows only its label, never a path", {
+            let lines = HermesTicker.lines(from: [text(0, "MEDIA:/Users/a/report.pdf", .answer)])
+            return lines == ["File: report.pdf"]
+        }())
+        checkTrue("media-3 several files make one line", {
+            HermesTicker.lines(from: [text(0, "MEDIA:/a.png\nMEDIA:/b.png", .answer)]) == ["2 files"]
+        }())
+
         if failures > 0 { print("\(failures) failure(s)"); exit(1) }
         print("All HermesTicker tests passed.")
     }

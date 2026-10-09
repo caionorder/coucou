@@ -32,11 +32,18 @@ struct ChatMarkdownView: View, Equatable {
     /// The interim text of the unfolded list is smaller than the one of the live box.
     private var bodySize: CGFloat { style == .folded ? 11.5 : 12.5 }
 
+    @Environment(\.chatMedia) private var media
+
     var body: some View {
-        let blocks = ChatMarkdown.parse(markdown, streaming: streaming)
+        // The directives of an agent that hands over files (`MEDIA:/path`, `[[audio_as_voice]]`) are taken out of the
+        // text at display time: the card draws a row where each one was, everything else shows the text without them.
+        let extraction: ChatMediaExtraction? = media.enabled ? ChatMediaDirectives.extractCached(markdown, streaming: streaming) : nil
+        let isCard: Bool = { if case .card = style { return true }; return false }()
+        let shownText = extraction.map { isCard ? $0.marked : $0.text } ?? markdown
+        let blocks = ChatMarkdown.parse(shownText, streaming: streaming)
         Group {
             if case .card(let verdict) = style {
-                card(blocks, verdict: verdict)
+                card(blocks, verdict: verdict, attachments: extraction?.attachments ?? [])
             } else {
                 VStack(alignment: .leading, spacing: 6) {
                     ForEach(Array(blocks.enumerated()), id: \.offset) { index, block in
@@ -140,13 +147,14 @@ struct ChatMarkdownView: View, Equatable {
 
     /// The answer card: the sections of `ChatAnswerRules` drawn inside one soft container. Each item is an Equatable
     /// view, so while the text streams only the open last item is laid out again.
-    private func card(_ blocks: [MDBlock], verdict: Bool) -> some View {
-        let items = ChatAnswerRules.sections(blocks: blocks, streaming: streaming, verdict: verdict)
+    private func card(_ blocks: [MDBlock], verdict: Bool, attachments: [ChatAttachment]) -> some View {
+        let items = ChatAnswerRules.sections(blocks: blocks, streaming: streaming, verdict: verdict, attachments: attachments.count)
         return VStack(alignment: .leading, spacing: 0) {
             ForEach(Array(items.enumerated()), id: \.offset) { index, item in
                 ChatCardItemView(item: item,
                                  top: ChatCardItemView.gap(before: item, after: index > 0 ? items[index - 1] : nil),
-                                 open: streaming && index == items.count - 1)
+                                 open: streaming && index == items.count - 1,
+                                 attachment: { if case .attachment(let id) = item { return attachments.first { $0.id == id } }; return nil }())
                     .equatable()
             }
         }
@@ -541,9 +549,11 @@ private struct ChatCardItemView: View, Equatable {
     let top: CGFloat
     /// The last item of a text that is still arriving: drawn as plain body, no marks.
     let open: Bool
+    /// The attachment of an `.attachment` item.
+    var attachment: ChatAttachment? = nil
 
     nonisolated static func == (a: ChatCardItemView, b: ChatCardItemView) -> Bool {
-        a.item == b.item && a.top == b.top && a.open == b.open
+        a.item == b.item && a.top == b.top && a.open == b.open && a.attachment == b.attachment
     }
 
     private let body13 = Color(hex: "#C9CDD4")
@@ -555,11 +565,14 @@ private struct ChatCardItemView: View, Equatable {
         guard let previous else { return 0 }
         if case .hairline = previous { return 0 }
         switch item {
+        case .attachment: return 12
         case .hairline, .section, .verdict: return 0
         case .ask: return 12
         case .block(let block, _):
             switch block {
-            case .paragraph: return 10
+            case .paragraph:
+                if case .attachment = previous { return 12 }
+                return 10
             case .heading(let level, _): return level <= 2 ? 16 : 14
             case .listItem, .taskItem:
                 // A heading carries its own space below, a table its padding, a list item its own.
@@ -585,6 +598,8 @@ private struct ChatCardItemView: View, Equatable {
         switch item {
         case .hairline:
             Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1).padding(.vertical, 13)
+        case .attachment:
+            if let attachment { ChatAttachmentRow(attachment: attachment) }
         case .verdict(let text):
             LinkedText(ChatCardText.attributed(text, size: 14.5, marks: !open))
                 .font(.system(size: 14.5)).lineSpacing(5).foregroundColor(bright)
