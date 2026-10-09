@@ -57,6 +57,8 @@ final class HookServer: @unchecked Sendable {
     private var cardGeneration = 0
     /// Set when a card takes the place of a card that was on screen (any build): clicks are ignored for a moment.
     private var cardReplacedAt: TimeInterval? = nil
+    /// When the Hermes card on screen appeared, on the monotonic clock (system uptime).
+    fileprivate var hermesCardArmedAt: TimeInterval? = nil
 
     #if !APPSTORE
     // cmux: per-surface registry (holds the capability token, memory only) and the queue of waiting cards.
@@ -145,6 +147,7 @@ final class HookServer: @unchecked Sendable {
         #if !APPSTORE
         if presentNextCmuxCard() { return }
         #endif
+        if HermesApprovalCenter.shared.presentNextIfFree() { return }
         state.noteMessage = note
         state.view = .note
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
@@ -187,6 +190,7 @@ final class HookServer: @unchecked Sendable {
         #if !APPSTORE
         if presentNextCmuxCard() { return }
         #endif
+        if HermesApprovalCenter.shared.presentNextIfFree() { return }
         if !note.isEmpty {
             state.noteMessage = note
             state.view = .note
@@ -256,6 +260,7 @@ final class HookServer: @unchecked Sendable {
         // Runs from onDisappear: promote the next queued cmux card on the next turn.
         DispatchQueue.main.async { _ = self.presentNextCmuxCard() }
         #endif
+        DispatchQueue.main.async { HermesApprovalCenter.shared.presentNextIfFree() }
     }
 
     /// Called by QuestionView "Reply in terminal" button.
@@ -1089,6 +1094,8 @@ final class HookServer: @unchecked Sendable {
         let cardWasVisible = CardInputLock.cardVisible(approvalFD: pendingApprovalFD, questionFD: pendingQuestionFD,
                                                        approvalShown: state.pendingApproval != nil,
                                                        questionShown: state.pendingQuestion != nil)
+        // A Hermes card on screen waits again, at the head of its line: nothing is sent to Hermes.
+        HermesApprovalCenter.shared.requeueIfShowing()
         var displacedKey: String? = nil
         var cmuxKeyOfRequest: String? = nil
         #if !APPSTORE
@@ -1229,6 +1236,8 @@ final class HookServer: @unchecked Sendable {
             DemoEngine.shared.handleApprovalDecision(decision)
             return
         }
+        // A Hermes request has its own card and its own answers (`sendHermesDecision`): nothing here, the iPhone included.
+        if HermesPills.isTaskId(AppState.shared.pendingApproval?.pillId) { return }
         var cardKey: String? = nil
         if cardReplacedLocked() { return }
         #if !APPSTORE
@@ -1284,6 +1293,7 @@ final class HookServer: @unchecked Sendable {
         #if !APPSTORE
         if presentNextCmuxCard() { return }
         #endif
+        if HermesApprovalCenter.shared.presentNextIfFree() { return }
         state.view = state.tasks.isEmpty ? .empty : .overview
     }
 
@@ -1339,6 +1349,8 @@ final class HookServer: @unchecked Sendable {
         let cardWasVisible = CardInputLock.cardVisible(approvalFD: pendingApprovalFD, questionFD: pendingQuestionFD,
                                                        approvalShown: state.pendingApproval != nil,
                                                        questionShown: state.pendingQuestion != nil)
+        // A Hermes card on screen waits again, at the head of its line: nothing is sent to Hermes.
+        HermesApprovalCenter.shared.requeueIfShowing()
         var displacedKey: String? = nil
         var cmuxKeyOfRequest: String? = nil
         #if !APPSTORE
@@ -5122,3 +5134,83 @@ except Exception:
     pass
 sys.exit(0)
 """
+
+
+// MARK: - Hermes approvals (the card slot; the queue and the rules are in HermesApprovalCenter)
+
+extension HookServer {
+    /// No approval and no question holds the slot. A demo card does not: a real request covers it, as a hook request does.
+    @MainActor var hermesSlotFree: Bool {
+        let s = AppState.shared
+        let demoCard = s.pendingApproval?.sessionId == "demo_session" && pendingApprovalFD < 0
+        return (s.pendingApproval == nil || demoCard) && s.pendingQuestion == nil && pendingApprovalFD < 0 && pendingQuestionFD < 0
+    }
+
+    /// Puts a Hermes request in the card slot: the pill, the sound, the island. No file descriptor, no 115 s timer
+    /// (Hermes waits on its own clock). Every Hermes card arms the input lock, whatever was on screen before it: a click
+    /// aimed at the previous view cannot land on the card.
+    @MainActor
+    func presentHermesCard(request: HermesApprovalRequest, pillId: String, playSound: Bool) {
+        let state = AppState.shared
+        hermesCardArmedAt = CardInputLock.uptime
+        #if !APPSTORE
+        cmuxShownPayload = nil
+        cmuxPromotedAt = nil
+        #endif
+        let id = HermesApproval.cardIdentity(request: request, pillId: pillId)
+        setTaskState(pillId, .approval)
+        // The command itself stays in the center: the shared slot holds ids only.
+        state.pendingApproval = ApprovalInfo(sessionId: id.sessionId, tool: id.tool, command: "", inputKey: id.inputKey, pillId: pillId)
+        state.isPinned = true
+        clearPillBadge(id: pillId)
+        if playSound { SoundEngine.shared.play("approval") }
+        if focusBeforeApproval == nil { focusBeforeApproval = state.focusId }
+        withAnimation(.spring(response: 0.5, dampingFraction: 0.72)) { state.focusId = pillId }
+        expandIfNeeded(to: .approval)
+    }
+
+    /// The Hermes card leaves the slot (answered or withdrawn): the pill goes back to what its turn says.
+    @MainActor
+    func clearHermesCard(pillId: String, agent: String) {
+        let state = AppState.shared
+        guard state.pendingApproval?.pillId == pillId else { return }
+        state.pendingApproval = nil
+        state.isPinned = false
+        state.approvalReadingHeight = nil
+        state.updateTask(id: pillId, state: (state.hermesTurnsRunning[agent] ?? 0) > 0 ? .thinking : .idle)
+        clearPillBadgeUnlessCardHeld(id: pillId)
+        if let prev = focusBeforeApproval {
+            focusBeforeApproval = nil
+            if state.focusId == pillId, state.tasks.contains(where: { $0.id == prev }) {
+                withAnimation(.spring(response: 0.5, dampingFraction: 0.72)) { state.focusId = prev }
+            }
+        }
+    }
+
+    /// The slot is free again: the cmux queue first (as before), then the next Hermes request. True when a card appeared.
+    @MainActor
+    func presentNextAfterHermesCard() -> Bool {
+        #if !APPSTORE
+        let cmuxWaiting = hasQueuedCmuxCards
+        #else
+        let cmuxWaiting = false
+        #endif
+        let next = HermesApproval.nextForFreeSlot(cmuxWaiting: cmuxWaiting, hermesWaiting: HermesApprovalCenter.shared.queue.hasWaiting)
+        #if !APPSTORE
+        if next == .cmux, presentNextCmuxCard() { return true }
+        #endif
+        return next != .none && HermesApprovalCenter.shared.presentNextIfFree()
+    }
+
+    /// A click on a button of the Hermes card of `requestID`. Ignored for a moment after a card replaced another.
+    /// This is the only way in: nothing else (key, timer, iPhone, demo) reaches `HermesApprovalCenter.click`.
+    @MainActor
+    func sendHermesDecision(requestID: String, button: String) {
+        // The Hermes cards have their own lock on the monotonic clock (the center checks it as well); the hook cards keep theirs.
+        if CardInputLock.isLockedKeepingWindow(armedAt: &hermesCardArmedAt, now: CardInputLock.uptime) { return }
+        #if !APPSTORE
+        if cmuxInputLocked() { return }
+        #endif
+        HermesApprovalCenter.shared.click(requestID: requestID, button: button)
+    }
+}

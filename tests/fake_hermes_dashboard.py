@@ -44,6 +44,11 @@ CONFIG
   files_401             answer the next N download requests with 401 whatever the token (the refresh test)
   files_delay           seconds a download waits before it answers (a fetch that is still running when the test acts)
   (files_mode also: realpng = a valid 8x8 PNG, realwav = a valid 0.5 s WAVE; state: files_inflight, files_max_inflight)
+  no_capabilities       client.capabilities answers -32601 (an older server)
+  caps_mode             client.capabilities: ok | no_approval (answers without "approval" in its list)
+                        | frame_first (sends an approval server request BEFORE it answers)
+  respond_mode          approval.respond: ok | zero (answers resolved 0) | error (code 5004) | slow (3 s) | none (never answers)
+  approval_wait         seconds a scenario waits for the owner's answer (default 6)
 
 WebSocket prompt scenarios (the prompt text picks one): hello, error, error-partial, bare-error, close,
 approval, withdrawn, busy, queued, queued-early, queued-noterm, queued-start-first, binary, binary-flood, steered, redirected, early-terminal, early-error, submit-slow,
@@ -51,6 +56,14 @@ silence, flood, flood-big, slow, big, echo-history, ping-wait, foreign, close-em
 (the events have the shapes of the real gateway, tui_gateway/contracts/events.py):
 steps, steps2, steps-noturn, interim-only, interim-final, steps-cut, steps-error, interim-prefix, reuse-id, think-split, burst, seq3, text-tool, think-open, think-literal.
 
+  approve-once, approve-two, approve-timeout, approve-resolved-elsewhere, approve-stale, approve-cancelled-broadcast,
+  approve-close, approve-smart, approve-reading, approve-long, approve-bidi, approve-bad-id, approve-unknown-session,
+  approve-cancel-alive (the request is withdrawn, the turn stays alive), approve-timeout-late (withdrawn after approval_wait),
+  sudo, secret, clarify
+                the approval protocol of tui_gateway (server request frames with request_id and choices, the
+                client.capabilities gate, approval.respond / approval.pending / approval.received, request.cancel and
+                approval.cancelled). A server request is sent only to a socket that sent client.capabilities
+                {server_requests: true}; any other socket gets the approval withdrawn at once, as the real server does.
   queued        the submit answers "queued"; the earlier turn ends (interrupted), then the queued turn runs and answers
   queued-early  the earlier turn's terminal event arrives BEFORE the "queued" answer, then the queued turn runs
   queued-noterm the "queued" answer, and NO terminal event of the earlier turn on this socket: only its delta,
@@ -112,6 +125,7 @@ DEFAULT_CONFIG = {
     "ticket_drop": 0, "ticket_status": 0, "refresh_drop": 0, "ws_drop": 0, "ws_stall": 0, "ws_stall_seconds": 2,
     "profiles_drop": 0, "ticket_delay": 0,
     "files_mode": "ok", "files_size": 1 << 20, "files_401": 0, "files_delay": 0,
+    "no_capabilities": False, "caps_mode": "ok", "respond_mode": "ok", "approval_wait": 6,
 }
 
 
@@ -142,6 +156,8 @@ def reset():
             "ticket_bearers": [], "ws": [], "rpc": [], "interrupts": [], "rejections": [], "pings": 0,
             "closes": 0, "captured_hits": 0, "captured_with_auth": 0, "counter": 0,
             "downloads": [], "files_inflight": 0, "files_max_inflight": 0,
+            "capabilities": [], "responds": [], "received": [], "pending_calls": 0, "approval_refused": 0, "approval_declined": 0,
+            "withdrawn_unadvertised": 0, "open": {},
         })
 
 
@@ -180,6 +196,7 @@ class Conn:
         self.wlock = threading.Lock()
         self.interrupted = threading.Event()
         self.closed = threading.Event()
+        self.advertised = False
 
     def send_frame(self, opcode, payload):
         n = len(payload)
@@ -233,10 +250,198 @@ class Conn:
         return opcode, payload
 
 
+# ── Approval protocol (shapes of tui_gateway/contracts/server_requests.py and events.py) ──────────────────────
+
+class OpenRequest:
+    def __init__(self, frame_id, sid, request_id, command, method="approval"):
+        self.frame_id, self.sid, self.request_id, self.command, self.method = frame_id, sid, request_id, command, method
+        self.event = threading.Event()
+        self.choice = None
+
+
+def ask(conn, sid, method, params):
+    """A server request, sent only to a client that advertised (as the real server). None when it was withdrawn."""
+    if not conn.advertised:
+        with LOCK:
+            STATE["withdrawn_unadvertised"] += 1
+        conn.event("tool.complete", sid, {"tool_id": "w1", "name": "terminal", "args": {},
+                                          "result": "approval was withdrawn before the user answered"})
+        return None
+    frame_id = "srq-" + secrets.token_hex(6)
+    entry = OpenRequest(frame_id, sid, params.get("request_id", ""), params.get("command", ""), method)
+    with LOCK:
+        STATE["open"][frame_id] = entry
+    conn.send_json({"jsonrpc": "2.0", "id": frame_id, "method": method, "params": {"session_id": sid, **params}})
+    return entry
+
+
+def approval_params(request_id, command, choices=("once", "session", "always", "deny"), **extra):
+    p = {"request_id": request_id, "command": command, "description": "recursive delete", "choices": list(choices),
+         "allow_permanent": "always" in choices, "allow_session": "session" in choices,
+         "pattern_key": "recursive delete", "pattern_keys": ["recursive delete"], "tool_name": "terminal"}
+    p.update(extra)
+    return p
+
+
+def settle(entry, choice):
+    """The owner answered (response frame or approval.respond). True when the request was still open."""
+    with LOCK:
+        if STATE["open"].pop(entry.frame_id, None) is None:
+            return False
+    entry.choice = choice
+    entry.event.set()
+    return True
+
+
+def drop(entry):
+    with LOCK:
+        STATE["open"].pop(entry.frame_id, None)
+    entry.event.set()
+
+
+def wait_choice(entry, conn):
+    with LOCK:
+        limit = CONFIG["approval_wait"]
+    deadline = time.time() + limit
+    while time.time() < deadline and not conn.closed.is_set() and not conn.interrupted.is_set():
+        if entry.event.wait(0.05):
+            break
+    return entry.choice
+
+
+def open_for(frame_id=None, request_id=None):
+    with LOCK:
+        for fid, e in STATE["open"].items():
+            if (frame_id is not None and fid == frame_id) or (request_id is not None and e.request_id == request_id):
+                return e
+    return None
+
+
+def finish_with(conn, sid, text):
+    conn.event("message.delta", sid, {"text": text})
+    conn.event("message.complete", sid, {"text": text, "status": "complete"})
+
+
+def approval_scenario(conn, sid, text):
+    """Returns True when `text` was one of the approval scenarios."""
+    marker = APPROVAL_COMMAND_MARKER
+    if text in ("approve-once", "approve-smart", "approve-reading", "approve-long", "approve-bidi", "approve-bad-id",
+                "approve-unknown-session", "approve-timeout", "approve-resolved-elsewhere", "approve-stale",
+                "approve-cancelled-broadcast", "approve-close", "approve-cancel-alive", "approve-timeout-late"):
+        conn.event("message.start", sid)
+        conn.event("tool.start", sid, {"tool_id": "t1", "name": "terminal", "context": "rm"})
+        command = "rm -rf /tmp/x " + marker
+        choices = ("once", "session", "always", "deny")
+        extra = {}
+        request_id = "rq-1"
+        session = sid
+        if text == "approve-smart":
+            choices, extra = ("once", "deny"), {"smart_denied": True}
+        elif text == "approve-reading":
+            command = "\n".join("echo step %d %s" % (i, marker) for i in range(1, 9))
+        elif text == "approve-long":
+            command = "echo first\n" + ("x" * 2600) + marker
+        elif text == "approve-bidi":
+            command = "cat \u202egpj.sh\u202c \u200b" + marker
+        elif text == "approve-bad-id":
+            request_id = "a/b"
+        elif text == "approve-unknown-session":
+            session = "other-session"
+        entry = ask(conn, session, "approval", approval_params(request_id, command, choices, **extra))
+        if entry is None:
+            conn.event("message.complete", sid, {"text": "blocked: not advertised", "status": "complete"})
+            return True
+        if text == "approve-timeout":
+            time.sleep(0.4)
+            conn.event("request.cancel", sid, {"id": entry.frame_id, "method": "approval", "reason": "timeout"})
+            drop(entry)
+            finish_with(conn, sid, "blocked: timeout")
+            return True
+        if text == "approve-cancel-alive":
+            # The server withdraws the request, then the turn stays alive for approval_wait seconds (a click after the cancel).
+            time.sleep(0.4)
+            conn.event("request.cancel", sid, {"id": entry.frame_id, "method": "approval", "reason": "timeout"})
+            drop(entry)
+            with LOCK:
+                alive = CONFIG["approval_wait"]
+            time.sleep(alive)
+            finish_with(conn, sid, "blocked: timeout")
+            return True
+        if text == "approve-timeout-late":
+            # The request stays open for approval_wait seconds (answers may fail meanwhile), then the server withdraws it.
+            with LOCK:
+                late = CONFIG["approval_wait"]
+            time.sleep(late)
+            conn.event("request.cancel", sid, {"id": entry.frame_id, "method": "approval", "reason": "timeout"})
+            drop(entry)
+            finish_with(conn, sid, "blocked: timeout")
+            return True
+        if text == "approve-resolved-elsewhere":
+            time.sleep(0.4)
+            conn.event("request.cancel", sid, {"id": entry.frame_id, "method": "approval", "reason": "resolved"})
+            drop(entry)
+            finish_with(conn, sid, "blocked: resolved elsewhere")
+            return True
+        if text == "approve-stale":
+            time.sleep(0.4)
+            drop(entry)   # no request.cancel: models an answer by another client's response frame
+            time.sleep(1.2)
+            finish_with(conn, sid, "blocked: stale")
+            return True
+        if text == "approve-cancelled-broadcast":
+            time.sleep(0.4)
+            conn.event("approval.cancelled", sid, {"session_id": sid, "stored_session_id": "x", "reason": "interrupt",
+                                                   "cancelled_count": 1, "request_ids": [request_id]})
+            drop(entry)
+            finish_with(conn, sid, "blocked: cancelled")
+            return True
+        if text == "approve-close":
+            time.sleep(0.4)
+            conn.send_frame(0x8, struct.pack(">H", 1011))
+            try:
+                conn.h.connection.shutdown(2)
+            except OSError:
+                pass
+            return True
+        choice = wait_choice(entry, conn)
+        if choice is not None:
+            # The real server may announce that it resolved the request it just took.
+            conn.event("request.cancel", sid, {"id": entry.frame_id, "method": "approval", "reason": "resolved"})
+        if choice is None:
+            finish_with(conn, sid, "no answer")
+        elif choice == "deny":
+            finish_with(conn, sid, "blocked: deny")
+        else:
+            conn.event("tool.complete", sid, {"tool_id": "t1", "name": "terminal", "summary": "done"})
+            finish_with(conn, sid, "ran: " + choice)
+        return True
+    if text == "approve-two":
+        conn.event("message.start", sid)
+        a = ask(conn, sid, "approval", approval_params("rq-a", "echo a " + marker))
+        b = ask(conn, sid, "approval", approval_params("rq-b", "echo b " + marker))
+        if a is None or b is None:
+            conn.event("message.complete", sid, {"text": "blocked: not advertised", "status": "complete"})
+            return True
+        ca, cb = wait_choice(a, conn), wait_choice(b, conn)
+        finish_with(conn, sid, "a:%s b:%s" % (ca, cb))
+        return True
+    if text in ("sudo", "secret", "clarify"):
+        conn.event("message.start", sid)
+        params = {"request_id": "x-1", "prompt": "needs it"} if text != "clarify" else {"questions": [{"question": "which?"}]}
+        entry = ask(conn, sid, text, params)
+        if entry is not None:
+            wait_choice(entry, conn)
+        finish_with(conn, sid, "done " + text)
+        return True
+    return False
+
+
 def scenario(conn, runtime, text, stored):
     """Runs on its own thread after prompt.submit answered 'streaming'."""
     sid = runtime
     try:
+        if approval_scenario(conn, sid, text):
+            return
         if text in ("close", "close-empty"):
             conn.event("message.start", sid)
             if text == "close":
@@ -261,7 +466,8 @@ def scenario(conn, runtime, text, stored):
         if text == "approval":
             conn.send_json({"jsonrpc": "2.0", "id": "srq-" + secrets.token_hex(6), "method": "approval",
                             "params": {"session_id": sid, "request_id": "r1", "command": "rm -rf /tmp/x " + APPROVAL_COMMAND_MARKER,
-                                       "description": "test", "choices": ["once", "session", "always", "deny"]}})
+                                       "description": "recursive delete", "choices": ["once", "session", "always", "deny"],
+                                       "pattern_key": "recursive delete", "pattern_keys": ["recursive delete"]}})
             time.sleep(0.3)
             conn.event("message.delta", sid, {"text": "continued after the approval."})
             conn.event("message.complete", sid, {"text": "continued after the approval.", "status": "complete"})
@@ -540,7 +746,21 @@ def serve_socket(conn):
         # A response to a server request (our approval).
         if "method" not in msg and "error" in msg and isinstance(msg.get("id"), str):
             with LOCK:
-                STATE["rejections"].append(msg["error"].get("code"))
+                code = msg["error"].get("code")
+                STATE["rejections"].append(code)
+                entry = STATE["open"].get(msg["id"])
+                declined = code == 4404
+                if entry is not None and entry.method == "approval":
+                    # -32601 on an open approval withdraws it for everyone; 4404 (not shown by this client) is counted for this
+                    # client only and the request stays open for the others (tui_gateway/server_requests.py::_decline).
+                    STATE["approval_declined" if declined else "approval_refused"] += 1
+            if entry is not None and not declined:
+                drop(entry)
+            continue
+        if "method" not in msg and "result" in msg and isinstance(msg.get("id"), str):
+            entry = open_for(frame_id=msg["id"])
+            if entry is not None:
+                settle(entry, (msg.get("result") or {}).get("choice"))
             continue
         method = msg.get("method")
         rid = msg.get("id")
@@ -613,6 +833,49 @@ def serve_socket(conn):
             reply({"status": status})
             if text not in ("early-terminal", "early-error"):
                 threading.Thread(target=scenario, args=(conn, runtime, text, stored), daemon=True).start()
+        elif method == "client.capabilities":
+            with LOCK:
+                STATE["capabilities"].append(dict(params))
+                old = CONFIG["no_capabilities"]
+            if old:
+                fail(-32601, "method not found")
+            else:
+                conn.advertised = bool(params.get("server_requests"))
+                with LOCK:
+                    caps_mode = CONFIG["caps_mode"]
+                if caps_mode == "frame_first":
+                    ask(conn, "early-session", "approval", approval_params("rq-early", "echo early"))
+                if caps_mode == "no_approval":
+                    reply({"server_requests": ["clarify", "secret", "sudo", "vault.code"], "declines_not_shown": True})
+                else:
+                    reply({"server_requests": ["approval", "clarify", "secret", "sudo", "vault.code"], "declines_not_shown": True})
+        elif method == "approval.respond":
+            with LOCK:
+                mode = CONFIG["respond_mode"]
+                STATE["responds"].append({k: params[k] for k in params})
+            if mode == "none":
+                continue
+            if mode == "slow":
+                time.sleep(3)
+            if mode == "error":
+                fail(5004, "boom")
+            elif not params.get("session_id") or not params.get("request_id") or params.get("choice") not in ("once", "session", "always", "deny"):
+                fail(5004, "bad params")
+            else:
+                entry = open_for(request_id=params["request_id"])
+                resolved = 0
+                if entry is not None and mode != "zero":
+                    resolved = 1 if settle(entry, params["choice"]) else 0
+                reply({"resolved": resolved})
+        elif method == "approval.pending":
+            with LOCK:
+                STATE["pending_calls"] += 1
+                listed = [{"request_id": e.request_id, "command": e.command} for e in STATE["open"].values() if e.sid == params.get("session_id")]
+            reply({"approvals": listed})
+        elif method == "approval.received":
+            with LOCK:
+                STATE["received"].append(params.get("request_id"))
+            reply({"acknowledged": True})
         elif method == "session.interrupt":
             with LOCK:
                 STATE["interrupts"].append(params.get("session_id"))
@@ -786,7 +1049,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.websocket(q)
         if path == "/_test/state":
             with LOCK:
-                snap = {k: v for k, v in STATE.items() if k not in ("codes", "access", "refresh", "tickets", "runtime")}
+                snap = {k: v for k, v in STATE.items() if k not in ("codes", "access", "refresh", "tickets", "runtime", "open")}
+                snap["open_count"] = len(STATE["open"])
                 snap["sessions"] = {k: len(v["prompts"]) for k, v in STATE["sessions"].items()}
                 snap["live_refresh_tokens"] = sum(1 for v in STATE["refresh"].values() if v)
             return self.send_json(200, snap)

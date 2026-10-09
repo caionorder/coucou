@@ -836,6 +836,8 @@ enum HermesChatTests {
             check("no system message", await headerValue(url, "test-key-mark", "X-Test-System", body: String(decoding: body("hi"), as: UTF8.self)) ?? "", "0")
         }
 
+        await approvalTests(base: base)
+
         finish()
     }
 

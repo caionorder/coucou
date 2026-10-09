@@ -367,6 +367,15 @@ struct ApprovalView: View {
     var approval: ApprovalInfo? { state.pendingApproval }
 
     var body: some View {
+        // A Hermes agent has its own card (answers and long commands); every other agent keeps the card below as it is.
+        if HermesPills.isTaskId(approval?.pillId) {
+            HermesApprovalHost(state: state)
+        } else {
+            standardCard
+        }
+    }
+
+    private var standardCard: some View {
         ZStack {
             CardBackground(wash: .amber)
             VStack(alignment: .leading, spacing: 5) {

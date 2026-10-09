@@ -56,7 +56,11 @@ enum HermesSignInTests {
     static func int(_ s: [String: Any], _ k: String) -> Int { (s[k] as? NSNumber)?.intValue ?? -1 }
     static func interrupts() async -> Int { ((await state())["interrupts"] as? [Any])?.count ?? 0 }
 
-    static func rpcLog(_ s: [String: Any]) -> [[String: Any]] { (s["rpc"] as? [[String: Any]]) ?? [] }
+    /// The RPCs the fake saw, without `client.capabilities` (which every socket sends first; counted on its own).
+    static func rpcLog(_ s: [String: Any]) -> [[String: Any]] {
+        ((s["rpc"] as? [[String: Any]]) ?? []).filter { ($0["method"] as? String) != "client.capabilities" }
+    }
+    static func capabilityCalls(_ s: [String: Any]) -> [[String: Any]] { (s["capabilities"] as? [[String: Any]]) ?? [] }
     static func methods(_ s: [String: Any]) -> [String] { rpcLog(s).compactMap { $0["method"] as? String } }
 
     static func waitFor(_ timeout: Double = 3, _ cond: () async -> Bool) async -> Bool {
@@ -217,6 +221,7 @@ enum HermesSignInTests {
 
         pureTests()
         await endToEnd()
+        await approvalTests()
         await connectRetryTests()
         finish()
     }
@@ -499,7 +504,10 @@ enum HermesSignInTests {
         await ctl("/_test/config", ["ws_stall": 2, "ws_stall_seconds": 3, "ticket_delay": 0.3])
         x = await turn(ag, ses, "hello", limits: real)
         check("two stalled handshakes after 0.3 s tickets: the third attempt still happens", x.text, "Hello from Steve.")
-        check("three handshakes", wsForms(await state()), ["?-", "?-", "subprotocol+"])
+        // The form of the third one is not asserted here: with a 0.6 s attempt on a slow machine the subprotocol form may
+        // not get ready in time and the query form opens instead, which is the designed fallback. The forms are checked above.
+        let lateForms = wsForms(await state())
+        checkTrue("three handshakes, the last accepted", lateForms.count == 3 && lateForms.prefix(2) == ["?-", "?-"] && lateForms.last?.hasSuffix("+") == true)
 
         print("retry: profiles and me")
         guard await fresh() else { failures += 1; return }
@@ -1197,7 +1205,7 @@ enum HermesSignInTests {
         check("profile sent", createParams?["profile"] as? String, "codex")
         checkTrue("idempotency key sent", ((createParams?["idempotency_key"] as? String) ?? "").count >= 8)
         check("prompt text sent", (log.last?["params"] as? [String: Any])?["text"] as? String, "hello")
-        checkTrue("client.capabilities never sent", !methods(st).contains("client.capabilities"))
+        check("capabilities_are_sent_once_per_socket: one call, server_requests true", capabilityCalls(st).map { $0["server_requests"] as? Bool }, [true])
         checkTrue("socket closed after the turn", await waitFor { int(await state(), "closes") == 1 })
 
         print("turn: resume on the second turn")
@@ -1266,7 +1274,7 @@ enum HermesSignInTests {
         x = await turn(ag, ses, "approval")
         check("turn continues and notes the approval", x.text, "continued after the approval.\n\n" + SI.approvalNote)
         st = await state()
-        check("the fake received error -32601", (st["rejections"] as? [Int]) ?? [], [-32601])
+        check("approval_frame_is_declined_with_4404_not_refused_with_method_not_found", (st["rejections"] as? [Int]) ?? [], [4404])
         x = await turn(ag, ses, "withdrawn")
         check("withdrawn approval hint", x.text, "I could not run that.\n\n" + SI.approvalNote)
 

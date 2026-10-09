@@ -180,7 +180,9 @@ struct SessionSnapshot: Equatable {
         var result: [String: SessionSnapshot] = [:]
         // Services (Stripe, GitHub…) go through ServicePublisher, with their data.
         for task in tasks where task.source != .n8n && PillCatalog.isSession(task.id) {
-            let hasApproval = approval?.pillId == task.id
+            // A Hermes approval never leaves the Mac, and neither does the fact that the pill waits for one.
+            let isHermesTask = HermesPills.isTaskId(task.id)
+            let hasApproval = approval?.pillId == task.id && !isHermesTask
             let questionText = task.state == .question
                 ? (question?.questions.map(\.question).joined(separator: "\n") ?? "")
                 : ""
@@ -192,7 +194,7 @@ struct SessionSnapshot: Equatable {
                 pillId: task.id,
                 name: PhoneText.english(task.name),
                 color: task.color,
-                state: task.state.rawValue,
+                state: (isHermesTask && task.state == .approval ? BotState.thinking : task.state).rawValue,
                 stepIndex: progress.stepIndex,
                 steps: isHermes ? [] : task.steps.map(PhoneText.english),
                 cwd: task.sessionCwd ?? "",

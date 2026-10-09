@@ -9,7 +9,9 @@ trap 'rm -rf "$TEST_DIR"; [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
 PORT_FILE="$TEST_DIR/port.txt"
 SOURCES=(
     NotchBuddy/Sources/App/ChatTurn.swift
+    NotchBuddy/Sources/App/HermesApproval.swift
     NotchBuddy/Sources/App/HermesChat.swift
+    NotchBuddy/Sources/App/HermesPills.swift
     NotchBuddy/Sources/App/HermesSignIn.swift
     NotchBuddy/Sources/App/HermesSignInNet.swift
     NotchBuddy/Sources/App/LocalChat.swift
@@ -24,7 +26,7 @@ SERVER_PID=$!
 swiftc -swift-version 6 -typecheck "${SOURCES[@]}"
 # ... and without the code the App Store build leaves out (the listener and the browser flow)
 swiftc -swift-version 6 -D APPSTORE -typecheck "${SOURCES[@]}"
-swiftc "${SOURCES[@]}" tests/StallingListener.swift tests/HermesSignInTests.swift -o "$TEST_DIR/hermes-signin-tests"
+swiftc "${SOURCES[@]}" tests/StallingListener.swift tests/HermesSignInApprovalTests.swift tests/HermesSignInTests.swift -o "$TEST_DIR/hermes-signin-tests"
 
 for i in $(seq 1 300); do
     if ! kill -0 "$SERVER_PID" 2>/dev/null; then

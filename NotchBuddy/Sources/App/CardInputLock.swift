@@ -20,4 +20,18 @@ enum CardInputLock {
         guard let at = armedAt else { return false }
         return now >= at && now - at < delay
     }
+
+    // MARK: Hermes cards: a monotonic clock
+
+    /// The clock of the Hermes cards: system uptime. It never steps back (the wall clock does, with a time sync or a change
+    /// of time zone or date), so the lock cannot be undone by moving it. The hook cards of other agents keep the wall clock.
+    static var uptime: TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+    /// Same lock for a clock that may still be moved (a test moves one): a reading before the moment the lock was armed
+    /// starts the delay again from that reading, so a step back never unlocks and never locks for longer than `delay`.
+    static func isLockedKeepingWindow(armedAt: inout TimeInterval?, now: TimeInterval) -> Bool {
+        guard let at = armedAt else { return false }
+        if now < at { armedAt = now; return true }
+        return now - at < delay
+    }
 }

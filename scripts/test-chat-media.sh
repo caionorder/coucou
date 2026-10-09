@@ -27,7 +27,8 @@ swiftc -swift-version 6 -D APPSTORE "${BRIDGE[@]}" -typecheck $APP/ChatMediaPlay
 
 # ── The fetch, against the fake dashboard (127.0.0.1 only; nothing here talks to a real server) ──
 FETCH=(
-    $APP/ChatTurn.swift $APP/HermesChat.swift $APP/HermesSignIn.swift $APP/HermesSignInNet.swift $APP/LocalChat.swift
+    $APP/ChatTurn.swift $APP/HermesApproval.swift $APP/HermesChat.swift $APP/HermesPills.swift $APP/HermesSignIn.swift
+    $APP/HermesSignInNet.swift $APP/LocalChat.swift
     $APP/SafeWebURL.swift $APP/ChatMarkdown.swift $APP/ChatMediaDirectives.swift $APP/ChatMediaSniff.swift
     $APP/ChatMediaFiles.swift $APP/ChatMediaFetch.swift
 )

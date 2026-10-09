@@ -383,6 +383,13 @@ final class LiveActivityRelay {
 
     /// The most urgent session, as the iPhone's Live Activity shows it.
     nonisolated static func leadState(tasks: [AgentTask], approval: ApprovalInfo?) -> MochiActivityState? {
+        // A Hermes approval never leaves the Mac: its pill reads as working, with nothing to answer from the Lock Screen.
+        let approval = approval.flatMap { HermesApproval.reachesPhone(pillId: $0.pillId) ? $0 : nil }
+        let tasks = tasks.map { t -> AgentTask in
+            var t = t
+            if HermesPills.isTaskId(t.id), t.state == .approval { t.state = .thinking }
+            return t
+        }
         let ranked = tasks
             .filter { $0.source != .n8n && PillCatalog.isSession($0.id) }   // same sessions as SessionPublisher
             .map { task -> (AgentTask, Int) in

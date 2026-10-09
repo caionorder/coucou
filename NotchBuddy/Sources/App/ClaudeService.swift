@@ -640,10 +640,12 @@ final class ClaudeService {
                             self.conversations.mutateIfPresent(id) { $0.serverSession = sessionId.isEmpty ? nil : sessionId }
                         }
                     },
-                    onToken: { onTurn($0, nil) }, onSegments: { onTurn(nil, $0) }, onTurn: onTurn)
+                    onToken: { onTurn($0, nil) }, onSegments: { onTurn(nil, $0) }, onTurn: onTurn,
+                    approvals: HermesApprovalCenter.hooks)
             }
             return try await HermesChat.streamChat(agent: agent, key: key, encodedBody: encodedBody,
-                                                   onToken: { onTurn($0, nil) }, onSegments: { onTurn(nil, $0) }, onTurn: onTurn)
+                                                   onToken: { onTurn($0, nil) }, onSegments: { onTurn(nil, $0) }, onTurn: onTurn,
+                                                   approvals: HermesApprovalCenter.hooks)
         }
         conversations.mutateIfPresent(id) { $0.turns[turnId]?.task = task }
         do {
