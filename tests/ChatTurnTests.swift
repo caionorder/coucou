@@ -49,6 +49,24 @@ enum ChatTurnTests {
         let step = ChatStep(callId: "1", tool: "terminal", label: "ls", detail: nil, status: .running)
         checkTrue("a step is equatable", step == ChatStep(callId: "1", tool: "terminal", label: "ls", detail: nil, status: .running))
 
+        print("ChatSegment: the timeline kinds")
+        let editRow = ChatSegment(id: 1, kind: .edit(ChatEdit(callId: "e", tool: "Edita", symbol: "pencil", name: "A.swift", path: "/A.swift",
+                                                              added: 12, removed: 3, isNewFile: false, tooLarge: false, preview: [], diffId: nil)))
+        let momentRow = ChatSegment(id: 2, kind: .moment(ChatMoment(kind: .permission, callId: "k", text: "t", more: 0, outcome: .waiting)))
+        checkTrue("56 isStepRow: an edit is a step row, a moment is not",
+                  editRow.isStepRow && !momentRow.isStepRow && !ChatSegment(id: 3, kind: .note("n")).isStepRow
+                  && ChatSegment(id: 4, kind: .hiddenSteps).isStepRow)
+        if case .edit(let e) = editRow.kind {
+            checkTrue("56b an edit as a step: tool, name, counts, done", e.asStep.tool == "Edita" && e.asStep.label == "A.swift"
+                      && e.asStep.detail == "+12 −3" && e.asStep.status == .done)
+        }
+        checkTrue("56c a moment ranks forward and knows when it waits",
+                  ChatMoment.rank(of: .waiting) < ChatMoment.rank(of: .inTerminal) && ChatMoment.rank(of: .inTerminal) < ChatMoment.rank(of: .handled)
+                  && ChatMoment.rank(of: .handled) < ChatMoment.rank(of: .denied) && ChatMoment.rank(of: .allowed) == ChatMoment.rank(of: .answered("x")))
+        if case .moment(let m) = momentRow.kind {
+            checkTrue("56d staysVisible", m.staysVisible && m.waitsForUser)
+        }
+
         builderCases()
         builderCasesReview()
         builderCasesRound3()
@@ -75,6 +93,8 @@ enum ChatTurnTests {
             case .step(let st): return "step:\(st.callId)|\(st.tool)|\(st.label)|\(st.detail ?? "-")|\(st.status)"
             case .note(let n): return "note:\(n)"
             case .hiddenSteps: return "hidden"
+            case .edit(let e): return "edit:\(e.callId)"
+            case .moment(let m): return "moment:\(m.callId)"
             }
         }
     }

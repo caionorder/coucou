@@ -1750,6 +1750,17 @@
         }
       }
     },
+    "allowed" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "permitido"
+          }
+        }
+      }
+    },
     "Allowed always." : {
       "localizations" : {
         "ar" : {
@@ -1949,6 +1960,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "respondeu"
+          }
+        }
+      }
+    },
+    "answered in the terminal" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "respondido no terminal"
           }
         }
       }
@@ -4916,6 +4938,17 @@
         }
       }
     },
+    "Conversation compacted." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Conversa compactada."
+          }
+        }
+      }
+    },
     "Copied!" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -5171,6 +5204,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "演示模式"
+          }
+        }
+      }
+    },
+    "denied" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "negado"
           }
         }
       }
@@ -7184,6 +7228,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "集成"
+          }
+        }
+      }
+    },
+    "Interrupted." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Interrompido."
           }
         }
       }
@@ -9608,6 +9663,17 @@
         }
       }
     },
+    "Open diff" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abrir diff"
+          }
+        }
+      }
+    },
     "Open Music" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -10517,6 +10583,17 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "退出"
+          }
+        }
+      }
+    },
+    "Rate limit reached." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Limite de uso atingido."
           }
         }
       }
@@ -13355,6 +13432,17 @@
         }
       }
     },
+    "The turn ended with an error." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O turno terminou com erro."
+          }
+        }
+      }
+    },
     "This request was no longer waiting." : {
       "localizations" : {
         "ar" : {
@@ -14146,6 +14234,50 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Aguardando o navegador… (clique para cancelar)"
+          }
+        }
+      }
+    },
+    "waiting for you" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "aguardando você"
+          }
+        }
+      }
+    },
+    "waiting for your answer" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "aguardando sua resposta"
+          }
+        }
+      }
+    },
+    "waiting for your approval" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "aguardando sua aprovação"
+          }
+        }
+      }
+    },
+    "waiting in the terminal" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "aguardando no terminal"
           }
         }
       }

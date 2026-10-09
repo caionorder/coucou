@@ -207,6 +207,7 @@ enum HermesSignInTests {
             case .step(let st): return "step:\(st.tool)|\(st.label)|\(st.detail ?? "-")|\(st.status)"
             case .note(let n): return "note:\(n)"
             case .hiddenSteps: return "hidden"
+            case .edit, .moment: return "timeline"
             }
         }
     }

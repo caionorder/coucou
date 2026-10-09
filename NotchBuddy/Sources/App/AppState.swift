@@ -614,8 +614,9 @@ final class AppState: ObservableObject {
     @Published var cmuxPrompt: CmuxPromptMode? = nil
     /// True only while `IslandWindowController.openCmuxPrompt` switches to the prompt view.
     var cmuxOpeningPrompt = false
-    /// Transcripts of the cmux sessions, keyed by surface key (a pill is a workspace with one or more).
-    @Published var cmuxTranscripts: [String: [ChatMessage]] = [:]
+    /// 0, 1 or 2 and more: how many messages the timeline of the session on screen holds, as far as the height of the
+    /// reply view tells. Written by `CmuxTimelines` only when that changes, so an event of a session redraws nothing here.
+    @Published var cmuxTimelineBucket = 0
     /// The session the user picked in the reply header, per pill id. Memory only, until that session closes.
     @Published var cmuxReplyChoice: [String: String] = [:]
     /// Bumped when the sessions of a workspace change, so the reply header and cards redraw.
@@ -691,7 +692,7 @@ final class AppState: ObservableObject {
     var promptMessageCount: Int {
         #if !APPSTORE
         switch cmuxPrompt {
-        case .reply(let id)?: return cmuxTranscripts[HookServer.shared.cmuxReplyTarget(for: id) ?? id]?.count ?? 0
+        case .reply(let id)?: return CmuxTimelines.shared.messageCount(for: HookServer.shared.cmuxReplyTarget(for: id) ?? id)
         case .newChat?:       return 1
         case nil:             break
         }

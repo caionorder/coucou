@@ -25,7 +25,7 @@ enum HermesTicker {
                 let line = DiffEngine.toOneLine(found.text)
                 if !line.isEmpty { out.append(line) }
                 if let label = ChatMediaDirectives.tickerLabel(for: found.attachments) { out.append(label) }
-            case .note, .hiddenSteps:
+            case .note, .hiddenSteps, .edit, .moment:
                 continue
             }
         }

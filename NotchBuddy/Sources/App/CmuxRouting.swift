@@ -179,7 +179,6 @@ extension CmuxRouting {
     static let busyStaleAfter: TimeInterval = 6 * 3600
     static let launchTimeout: TimeInterval = 90
     static let maxPromptLength = 8000
-    static let maxTranscript = 6
     static let maxRecentFolders = 8
     static let palette = PillLook.palette
     /// Raw values of EyeShape; `pill` means no override.

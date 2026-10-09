@@ -840,6 +840,8 @@ struct DiffCardView: View {
 
 struct DiffLineRowView: View {
     let line: DiffLine
+    /// Space at the sides inside the coloured band: the diff card draws none, the changed lines of a chat turn some.
+    var inset: CGFloat = 0
 
     private var bgColor: Color {
         switch line.kind {
@@ -878,6 +880,7 @@ struct DiffLineRowView: View {
                 .truncationMode(.tail)
                 .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .padding(.horizontal, inset)
         .background(bgColor)
         .frame(maxWidth: .infinity)
     }
