@@ -1313,7 +1313,8 @@ struct PromptView: View {
     @State private var text: String = ""
     /// The conversation the text in the field was loaded for; a send needs it to be the one on screen.
     @State private var textOwner: PromptSlot.Content?
-    @FocusState private var focused: Bool
+    /// Keyboard focus of the chat field (`MultilineField` follows it both ways).
+    @State private var focused = false
     @State private var showModelPicker = false
     /// Follow the newest text unless the user scrolled up.
     @State private var pinned = true
@@ -1442,11 +1443,8 @@ struct PromptView: View {
                 .padding(.horizontal, 10)
 
                 HStack(spacing: 8) {
-                    TextField(state.chatHistory.isEmpty ? String(localized: "Ask me anything…") : String(localized: "Continue…"), text: fieldText)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
-                        .focused($focused)
-                        .onSubmit { sendMessage() }
+                    MultilineField(placeholder: state.chatHistory.isEmpty ? String(localized: "Ask me anything…") : String(localized: "Continue…"),
+                                   text: fieldText, isFocused: $focused, onSubmit: sendMessage)
 
                     #if !APPSTORE
                     // Dictate instead of typing (on-device speech recognition when available)

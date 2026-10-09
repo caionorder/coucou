@@ -78,6 +78,7 @@
 		2CC2E3B688B15BBEB3AE3BCE /* WindowContextCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = E91B733ADC638E14E9BB6EFA /* WindowContextCapture.swift */; };
 		2DEB459FBD0BA3CEAAA5FDE9 /* ClaudeService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A83D5410BD030B243ADDCFF4 /* ClaudeService.swift */; };
 		2F36E3C6C073E968A682AFA4 /* NotionPoller.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE03E03D1804B0B92C5C2DAD /* NotionPoller.swift */; };
+		31603D6CD34CBBC47B2D5150 /* MultilineInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4ECCCCCD3FC9145E106E792C /* MultilineInput.swift */; };
 		33670FEB42399DA375B07BA5 /* CmuxTimeline.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1D3052265DA69B2DF9F0B87 /* CmuxTimeline.swift */; };
 		338D51E52A6CEE7AD4FA21AD /* CmuxRouting.swift in Sources */ = {isa = PBXBuildFile; fileRef = F767D5651FFD45E956A57D4A /* CmuxRouting.swift */; };
 		33F5C1E7EE5BCFFAB985B557 /* CmuxRouting.swift in Sources */ = {isa = PBXBuildFile; fileRef = F767D5651FFD45E956A57D4A /* CmuxRouting.swift */; };
@@ -126,6 +127,7 @@
 		62C4EE3F74DAA59764729E62 /* UploadCanvasView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B241B043223AFBBFB7418A5E /* UploadCanvasView.swift */; };
 		63093DC288B68F7F17249517 /* GitHubActivity.swift in Sources */ = {isa = PBXBuildFile; fileRef = 168A9A73B519018FAB0AA465 /* GitHubActivity.swift */; };
 		6373886EF6ABD40EA199DECF /* ChatTurnViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F352876EFF2529E8A6F753C /* ChatTurnViews.swift */; };
+		63DFBD45191ECC18718F71E3 /* MultilineField.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38101C0FA32901ACFE0D2BA0 /* MultilineField.swift */; };
 		63F9F3AAC881D3EDDDD8AED9 /* UserIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = F4A13AEE6E06F46CEC9D908C /* UserIdentity.swift */; };
 		640D3B3296748445A8F96F6D /* question.wav in Resources */ = {isa = PBXBuildFile; fileRef = A5DC0954D23B69B247578437 /* question.wav */; };
 		651FA3F09608DE5D02D61CCE /* BotCanvasView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A29F4C0B02BE91654D02AA0C /* BotCanvasView.swift */; };
@@ -260,6 +262,7 @@
 		B7ED198C941104866BB3BC57 /* Haptics.swift in Sources */ = {isa = PBXBuildFile; fileRef = F86B99CF65C5E4BC887888C6 /* Haptics.swift */; };
 		BA37CBAE83C2BA32A3773EA4 /* HermesChat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 782AD2764A58AE9CC258C4BB /* HermesChat.swift */; };
 		BA65FC4A40F7227837C26214 /* DesktopMochiLogic.swift in Sources */ = {isa = PBXBuildFile; fileRef = C086E1932F86B9C2B559BE03 /* DesktopMochiLogic.swift */; };
+		BB31A07B2AB0031CEE5AB54F /* MultilineField.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38101C0FA32901ACFE0D2BA0 /* MultilineField.swift */; };
 		BB61FCFF6EE49433DF821FBC /* HermesSignInNet.swift in Sources */ = {isa = PBXBuildFile; fileRef = 480F129573A8C1E0A43E0573 /* HermesSignInNet.swift */; };
 		BC6819C32C715E203254B9C6 /* TurnShare.swift in Sources */ = {isa = PBXBuildFile; fileRef = 29E156CF1C215B8FE713B3A0 /* TurnShare.swift */; };
 		BCB4B7AEA1140868C36F39CC /* SessionStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5108F622EF0C553F053716C2 /* SessionStatus.swift */; };
@@ -327,6 +330,7 @@
 		ED484F8DAC497C77F3E81F0E /* BotEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 66E6F5FC81429871B6F766A8 /* BotEngine.swift */; };
 		ED5D9A334DE08C0EB81DE322 /* AskQuestion.swift in Sources */ = {isa = PBXBuildFile; fileRef = EBB84A66045EB20CAC93A8A6 /* AskQuestion.swift */; };
 		ED62D1B9E6A35B1F85074A2A /* SharedSessions.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1064AD8471C51AFF4F12258 /* SharedSessions.swift */; };
+		EE39A6EE561C98D84DF72182 /* MultilineInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4ECCCCCD3FC9145E106E792C /* MultilineInput.swift */; };
 		EE3AB10544113500486A9684 /* ColorHex.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8ACB4350729C6513824D1ADF /* ColorHex.swift */; };
 		EE52C4E4495EAD12F38B945E /* HermesApprovalSlot.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A2DE186040A02D800F856CA /* HermesApprovalSlot.swift */; };
 		EF9E6418C3F39F6FE88FD812 /* CoucouPhoneApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0D9CEB5655FCA197D6B10A91 /* CoucouPhoneApp.swift */; };
@@ -423,6 +427,7 @@
 		369F5AFDE37A03A1C25EB262 /* Decisions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Decisions.swift; sourceTree = "<group>"; };
 		37147F42613183DBA8896835 /* finish.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; path = finish.wav; sourceTree = "<group>"; };
 		37564F5F041B38C976DF3DEF /* PillColors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PillColors.swift; sourceTree = "<group>"; };
+		38101C0FA32901ACFE0D2BA0 /* MultilineField.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultilineField.swift; sourceTree = "<group>"; };
 		38BEAB5F20A13E5806A42EC9 /* ApprovalCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ApprovalCard.swift; sourceTree = "<group>"; };
 		38FB64E371DF3A5AA7BFA74E /* StepLanguage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StepLanguage.swift; sourceTree = "<group>"; };
 		3A27178AA6007F7B56901750 /* SessionDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionDetailView.swift; sourceTree = "<group>"; };
@@ -434,6 +439,7 @@
 		49E39852175E81C9632A59C9 /* KitPreviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KitPreviewView.swift; sourceTree = "<group>"; };
 		4A09E73F1E58019EF6EA2A62 /* IslandDisplayChoice.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IslandDisplayChoice.swift; sourceTree = "<group>"; };
 		4DC2A07E42245A8CF3BBD2AB /* CoucouAppStore.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CoucouAppStore.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		4ECCCCCD3FC9145E106E792C /* MultilineInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MultilineInput.swift; sourceTree = "<group>"; };
 		4F142FB3952B5F0639383047 /* MusicController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicController.swift; sourceTree = "<group>"; };
 		506824380E9C80B9BC6DCE72 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		5108F622EF0C553F053716C2 /* SessionStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionStatus.swift; sourceTree = "<group>"; };
@@ -644,6 +650,8 @@
 				D710BD7834228045869D0184 /* IslandWindowController.swift */,
 				8790ACE9F73BD74640A0F20C /* LocalChat.swift */,
 				6544ED02D945CF9F00647AD1 /* MacDictation.swift */,
+				38101C0FA32901ACFE0D2BA0 /* MultilineField.swift */,
+				4ECCCCCD3FC9145E106E792C /* MultilineInput.swift */,
 				4F142FB3952B5F0639383047 /* MusicController.swift */,
 				B89DA1A0C21AE3535A1760BB /* N8nPoller.swift */,
 				F1BD8F3CAA60CF37640759E1 /* NotchBuddyApp.swift */,
@@ -1083,6 +1091,8 @@
 				DD2EEF113DB5EAA35CD88312 /* MochiOutfitDrawing.swift in Sources */,
 				72B1AEDB2152BF73659EB598 /* MochiStill.swift in Sources */,
 				25F66E99460D62478899A292 /* MochiWardrobe.swift in Sources */,
+				BB31A07B2AB0031CEE5AB54F /* MultilineField.swift in Sources */,
+				31603D6CD34CBBC47B2D5150 /* MultilineInput.swift in Sources */,
 				5C6D0BC8C546718CAA82BF90 /* MusicController.swift in Sources */,
 				0A267EE2955C7AD8E02A296C /* N8nPoller.swift in Sources */,
 				06BF5FD95E03010CAFDBF2D0 /* NotchBuddyApp.swift in Sources */,
@@ -1290,6 +1300,8 @@
 				ADBB9C15DDA4044625B325BE /* MochiOutfitDrawing.swift in Sources */,
 				78F045A55E6F4EEA5787EEEF /* MochiStill.swift in Sources */,
 				A885B7E6DC43231BECE36E3D /* MochiWardrobe.swift in Sources */,
+				63DFBD45191ECC18718F71E3 /* MultilineField.swift in Sources */,
+				EE39A6EE561C98D84DF72182 /* MultilineInput.swift in Sources */,
 				9C653B8291EFFA414565E8A8 /* MusicController.swift in Sources */,
 				160EDB9D06275E2607DA5151 /* N8nPoller.swift in Sources */,
 				DE05D09A32117582AC93A24A /* NotchBuddyApp.swift in Sources */,
