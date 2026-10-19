@@ -45606,6 +45606,23 @@
         }
       }
     },
+    "voice.error-stalled" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Voice recognition stalled — toggle Voice off/on to reset."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O reconhecimento de voz travou — desligue e ligue a voz para reiniciar."
+          }
+        }
+      }
+    },
     "voice.history-title" : {
       "extractionState" : "manual",
       "localizations" : {
