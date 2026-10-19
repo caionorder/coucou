@@ -76,5 +76,47 @@ enum ElevenVoicePicker {
         guard let v, let id = v["voice_id"] as? String else { return nil }
         return (id, v["name"] as? String ?? id)
     }
+
+    /// The voice saved in Settings if the account still has it; nil means "Automatic"
+    /// (empty/unknown id, or a voice removed from the account).
+    static func stored(_ id: String?, in voices: [[String: Any]]) -> (id: String, name: String)? {
+        guard let id, !id.isEmpty,
+              let v = voices.first(where: { ($0["voice_id"] as? String) == id }) else { return nil }
+        return (id, v["name"] as? String ?? id)
+    }
+
+    /// The chosen voice when it exists in the account, else the automatic pick.
+    static func resolve(stored id: String?, voices: [[String: Any]], gender: String, language: String) -> (id: String, name: String)? {
+        stored(id, in: voices) ?? pick(voices, gender: gender, language: language)
+    }
+
+    /// Short secondary text for the Settings picker: "Nando – calm and Friendly (pt · brazilian · male)".
+    static func displayName(_ v: [String: Any]) -> String {
+        let name = v["name"] as? String ?? (v["voice_id"] as? String ?? "")
+        let l = v["labels"] as? [String: String] ?? [:]
+        let tags = ["language", "accent", "gender"].compactMap { l[$0] }.filter { !$0.isEmpty }
+        return tags.isEmpty ? name : "\(name) (\(tags.joined(separator: " · ")))"
+    }
+}
+
+// MARK: - ElevenExpressiveness
+//
+// How lively the ElevenLabs voice sounds (Settings → Voice). Normal sends no
+// voice_settings, so the voice sounds exactly as before. Calm and Lively send them:
+// stability 0–1 (high = steady and flat, low = more varied), style 0–1 (exaggeration;
+// some models ignore it), similarity_boost 0–1, use_speaker_boost bool.
+enum ElevenExpressiveness: String, CaseIterable {
+    case calm, normal, lively
+
+    static func from(_ raw: String?) -> ElevenExpressiveness { raw.flatMap(Self.init(rawValue:)) ?? .normal }
+
+    /// Body "voice_settings" for the TTS request; nil = send nothing (the voice's own settings).
+    var voiceSettings: [String: Any]? {
+        switch self {
+        case .normal: return nil
+        case .calm:   return ["stability": 0.8, "similarity_boost": 0.75, "style": 0.0, "use_speaker_boost": true]
+        case .lively: return ["stability": 0.3, "similarity_boost": 0.75, "style": 0.5, "use_speaker_boost": true]
+        }
+    }
 }
 #endif

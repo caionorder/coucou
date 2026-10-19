@@ -11,6 +11,8 @@ import Foundation
 // newer accounts don't have them. Coucou lists the voices of the user's account and
 // picks the first English one of the chosen gender (female by default), then caches it.
 // When Coucou answers in Portuguese, a voice labelled Portuguese comes first.
+// Settings can pin one voice of the account (voiceElevenVoiceId; empty = this automatic
+// pick) and set the expressiveness (ElevenExpressiveness → voice_settings in the request).
 
 @MainActor
 final class ElevenLabsTTS {
@@ -24,7 +26,7 @@ final class ElevenLabsTTS {
     }
 
     struct Voice: Equatable { let id: String; let name: String }
-    private var chosen: (gender: String, language: String, voice: Voice)?
+    private var chosen: (gender: String, language: String, voiceId: String, voice: Voice)?
 
     /// Name of the voice in use, for Settings ("Rachel", "Talia – Warm Soft Guide"…).
     var currentVoiceName: String? { chosen?.voice.name }
@@ -46,6 +48,9 @@ final class ElevenLabsTTS {
         req.setValue("audio/mpeg", forHTTPHeaderField: "Accept")
         var body: [String: Any] = ["text": text, "model_id": Self.model]
         if VoiceSettings.lang == .pt { body["language_code"] = "pt" }
+        if let settings = ElevenExpressiveness.from(VoiceSettings.elevenExpressiveness).voiceSettings {
+            body["voice_settings"] = settings
+        }
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
               (resp as? HTTPURLResponse)?.statusCode == 200, !data.isEmpty else {
@@ -55,11 +60,8 @@ final class ElevenLabsTTS {
         return data
     }
 
-    /// The voice for the chosen gender, looked up once in the user's account.
-    func voice(key: String) async -> Voice? {
-        let gender = VoiceSettings.elevenGender
-        let language = VoiceSettings.lang.rawValue
-        if let c = chosen, c.gender == gender, c.language == language { return c.voice }
+    /// Voices of the account (raw API objects), or nil on any failure.
+    func fetchVoices(key: String) async -> [[String: Any]]? {
         var req = URLRequest(url: URL(string: "https://api.elevenlabs.io/v1/voices")!, timeoutInterval: 8)
         req.setValue(key, forHTTPHeaderField: "xi-api-key")
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
@@ -69,9 +71,22 @@ final class ElevenLabsTTS {
             appendAppLog("nb.log", "[Voice] ElevenLabs voice list unavailable")
             return nil
         }
-        guard let v = Self.pick(voices, gender: gender, language: language) else { return nil }
-        chosen = (gender, language, v)
-        return v
+        return voices
+    }
+
+    /// The voice chosen in Settings if the account has it, else the automatic pick for the
+    /// gender; looked up once in the user's account.
+    func voice(key: String) async -> Voice? {
+        let gender = VoiceSettings.elevenGender
+        let language = VoiceSettings.lang.rawValue
+        let voiceId = VoiceSettings.elevenVoiceId
+        if let c = chosen, c.gender == gender, c.language == language, c.voiceId == voiceId { return c.voice }
+        guard let voices = await fetchVoices(key: key),
+              let v = ElevenVoicePicker.resolve(stored: voiceId, voices: voices, gender: gender, language: language)
+        else { return nil }
+        let voice = Voice(id: v.id, name: v.name)
+        chosen = (gender, language, voiceId, voice)
+        return voice
     }
 
     /// First English voice of the gender (a young one first for a man); else any voice of

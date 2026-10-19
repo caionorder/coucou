@@ -1644,6 +1644,9 @@ struct SettingsView: View {
     @AppStorage("voiceListenLanguage") private var listenLanguage: String = "auto"
     @AppStorage("voiceTTSEngine")      private var ttsEngine: String = "system"
     @AppStorage("voiceElevenGender")   private var elevenGender: String = "female"
+    @AppStorage("voiceElevenVoiceId")  private var elevenVoiceId: String = ""
+    @AppStorage("voiceElevenExpressiveness") private var elevenExpressiveness: String = "normal"
+    @State private var elevenVoices: [[String: Any]] = []
     @AppStorage("voicePitchFemale")    private var pitchFemale: Double = VoiceSettings.defaultPitchFemale
     @AppStorage("voicePitchMale")      private var pitchMale: Double = VoiceSettings.defaultPitchMale
     @State private var webKeySaved: Bool = !(KeychainStore.shared.get("anthropic-api-key") ?? "").isEmpty
@@ -1781,6 +1784,40 @@ struct SettingsView: View {
                             elevenKeyDraft = ""
                             elevenKeySaved = !k.isEmpty
                             ElevenLabsTTS.shared.reset()
+                        }
+                    }
+
+                    if elevenKeySaved {
+                        // Voices of the account, fetched when this section shows (no timer).
+                        Picker(String(localized: "voice.eleven-voice"), selection: $elevenVoiceId) {
+                            Text(String(localized: "voice.eleven-voice-auto")).tag("")
+                            ForEach(elevenVoices.compactMap { v in (v["voice_id"] as? String).map { (id: $0, v: v) } },
+                                    id: \.id) { item in
+                                Text(verbatim: ElevenVoicePicker.displayName(item.v)).tag(item.id)
+                            }
+                            // A saved voice that left the account stays selectable, not blank.
+                            if !elevenVoiceId.isEmpty, ElevenVoicePicker.stored(elevenVoiceId, in: elevenVoices) == nil {
+                                Text(verbatim: elevenVoiceId).tag(elevenVoiceId)
+                            }
+                        }
+                        .frame(maxWidth: 360)
+                        .onChange(of: elevenVoiceId) { _, _ in ElevenLabsTTS.shared.reset() }
+                        .task(id: elevenKeySaved) {
+                            guard let key = KeychainStore.shared.get(ElevenLabsTTS.keyName),
+                                  let list = await ElevenLabsTTS.shared.fetchVoices(key: key) else { return }
+                            elevenVoices = list
+                        }
+
+                        HStack(spacing: 8) {
+                            Text(String(localized: "voice.eleven-expressiveness"))
+                            Picker(String(localized: "voice.eleven-expressiveness"), selection: $elevenExpressiveness) {
+                                Text(String(localized: "voice.eleven-calm")).tag("calm")
+                                Text(String(localized: "voice.eleven-normal")).tag("normal")
+                                Text(String(localized: "voice.eleven-lively")).tag("lively")
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.segmented)
+                            .frame(maxWidth: 240)
                         }
                     }
                 }
