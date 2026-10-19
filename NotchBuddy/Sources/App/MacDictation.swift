@@ -37,6 +37,8 @@ final class MacDictation: @unchecked Sendable {
     @ObservationIgnored private var finishing: CheckedContinuation<Void, Never>?
     @ObservationIgnored private var isFinishing = false
     @ObservationIgnored private var tapInstalled = false
+    /// Flow dictation's pill: the microphone's levels by frequency, fed from the same tap.
+    @ObservationIgnored var bands: FlowAudioBands?
 
     /// The text field's content: what was typed, then the words heard so far.
     var text: String { prefix + transcript }
@@ -47,7 +49,9 @@ final class MacDictation: @unchecked Sendable {
         let recognizer: SFSpeechRecognizer
         let request = SFSpeechAudioBufferRecognitionRequest()
         var task: SFSpeechRecognitionTask?
-        var words = ""
+        /// What was heard, kept whole when the recognizer starts over after a pause.
+        var heard = DictationTranscript()
+        var words: String { heard.text }
         /// Mean confidence of the words (Apple fills it in on the final result).
         var confidence: Float = 0
         var finished = false
@@ -65,17 +69,18 @@ final class MacDictation: @unchecked Sendable {
     @MainActor func start(from text: String) async {
         guard !isRecording, await Self.authorized() else { return }
         let built = Self.makeCandidates(language == Self.automatic ? Self.automaticLocales() : [Locale(identifier: language)])
-        guard !built.isEmpty, Self.startEngine(engine, feeding: built.map(\.request)) else { return }
+        guard !built.isEmpty, Self.startEngine(engine, feeding: built.map(\.request), bands: bands) else { return }
         tapInstalled = true
         prefix = text.isEmpty || text.hasSuffix(" ") ? text : text + " "
         transcript = ""
         candidates = built
         lead = 0
         isRecording = true
+        NotificationCenter.default.post(name: .dictationDidStart, object: nil)
         for (index, candidate) in built.enumerated() {
-            candidate.task = Self.recognize(candidate) { [weak self] words, confidence, final, failed in
+            candidate.task = Self.recognize(candidate) { [weak self] words, pieces, confidence, final, failed in
                 Task { @MainActor in
-                    self?.update(index, words: words, confidence: confidence, final: final, failed: failed)
+                    self?.update(index, words: words, pieces: pieces, confidence: confidence, final: final, failed: failed)
                 }
             }
         }
@@ -87,12 +92,13 @@ final class MacDictation: @unchecked Sendable {
         isFinishing = true
         stopEngine()
         candidates.forEach { $0.request.endAudio() }
-        // With several languages, wait a moment for the final results: they carry the confidence.
-        if candidates.count > 1, !candidates.allSatisfy(\.finished) {
+        // Wait a moment for the final results: they carry the last words (and, with several
+        // languages, the confidence that picks one).
+        if !candidates.allSatisfy(\.finished) {
             await withCheckedContinuation { continuation in
                 finishing = continuation
                 Task { @MainActor [weak self] in
-                    try? await Task.sleep(for: .milliseconds(1200))
+                    try? await Task.sleep(for: .milliseconds(1500))
                     self?.resumeFinishing()
                 }
             }
@@ -124,6 +130,7 @@ final class MacDictation: @unchecked Sendable {
         candidates.forEach { $0.request.endAudio(); $0.task?.cancel() }
         candidates = []
         lead = 0
+        NotificationCenter.default.post(name: .dictationDidEnd, object: nil)
         isRecording = false
         isFinishing = false
         resumeFinishing()
@@ -136,10 +143,10 @@ final class MacDictation: @unchecked Sendable {
 
     // MARK: Results
 
-    @MainActor private func update(_ index: Int, words: String?, confidence: Float, final: Bool, failed: Bool) {
+    @MainActor private func update(_ index: Int, words: String?, pieces: [DictationTranscript.Piece], confidence: Float, final: Bool, failed: Bool) {
         guard index < candidates.count else { return }
         let candidate = candidates[index]
-        if let words { candidate.words = words }
+        if let words { candidate.heard.absorb(words, pieces: pieces) }
         if confidence > 0 { candidate.confidence = confidence }
         if final || failed { candidate.finished = true }
 
@@ -176,10 +183,12 @@ final class MacDictation: @unchecked Sendable {
 
     // MARK: Audio and recognizers (off the main actor: they call back on their own threads)
 
-    nonisolated private static func startEngine(_ engine: AVAudioEngine, feeding requests: [SFSpeechAudioBufferRecognitionRequest]) -> Bool {
+    nonisolated private static func startEngine(_ engine: AVAudioEngine, feeding requests: [SFSpeechAudioBufferRecognitionRequest],
+                                                bands: FlowAudioBands? = nil) -> Bool {
         let input = engine.inputNode
         input.installTap(onBus: 0, bufferSize: 1024, format: input.outputFormat(forBus: 0)) { buffer, _ in
             for request in requests { request.append(buffer) }
+            bands?.consume(buffer)
         }
         engine.prepare()
         do { try engine.start() } catch {
@@ -191,13 +200,16 @@ final class MacDictation: @unchecked Sendable {
 
     nonisolated private static func recognize(
         _ candidate: Candidate,
-        report: @escaping @Sendable (String?, Float, Bool, Bool) -> Void
+        report: @escaping @Sendable (String?, [DictationTranscript.Piece], Float, Bool, Bool) -> Void
     ) -> SFSpeechRecognitionTask {
         candidate.recognizer.recognitionTask(with: candidate.request) { result, error in
             let words = result?.bestTranscription.formattedString
             let segments = result?.bestTranscription.segments ?? []
             let confidence = segments.isEmpty ? 0 : segments.map(\.confidence).reduce(0, +) / Float(segments.count)
-            report(words, confidence, result?.isFinal ?? false, error != nil)
+            let pieces = segments.map {
+                DictationTranscript.Piece(start: $0.timestamp, end: $0.timestamp + $0.duration, text: $0.substring)
+            }
+            report(words, pieces, confidence, result?.isFinal ?? false, error != nil)
         }
     }
 
@@ -286,5 +298,13 @@ final class MacDictation: @unchecked Sendable {
         guard speech else { return false }
         return await AVAudioApplication.requestRecordPermission()
     }
+}
+
+// MARK: - Dictation notification names
+// Defined here so both MacDictation and VoiceEngine can reference them without
+// cross-file ordering issues in SourceKit.
+extension Notification.Name {
+    static let dictationDidStart = Notification.Name("notchBuddy.dictationDidStart")
+    static let dictationDidEnd   = Notification.Name("notchBuddy.dictationDidEnd")
 }
 #endif

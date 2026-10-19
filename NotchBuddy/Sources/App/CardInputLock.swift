@@ -16,6 +16,13 @@ enum CardInputLock {
         cardWasVisible ? now : nil
     }
 
+    /// When the lock starts as the approval queue puts another request on the card. nil when no card was shown before
+    /// (the arrival arms itself) or when it is the same request (only its "n waiting" count refreshes).
+    static func headChangeArmedAt(shownId: UUID?, headId: UUID, now: TimeInterval) -> TimeInterval? {
+        guard let shownId, shownId != headId else { return nil }
+        return now
+    }
+
     static func isLocked(armedAt: TimeInterval?, now: TimeInterval) -> Bool {
         guard let at = armedAt else { return false }
         return now >= at && now - at < delay

@@ -3,10 +3,12 @@
 #  - every text the code can show (see scripts/extract-strings.py) is a key of the catalog;
 #  - every such key has a pt-BR value (plain, or one per plural case), unless the catalog marks it
 #    shouldTranslate = false;
-#  - every pt-BR value keeps the format placeholders of its key (%@, %lld, ...);
+#  - every pt-BR value keeps the format placeholders of its reference text: the `en` value when the key has one
+#    (dotted keys such as voice.pill-added, whose key has no placeholder), the key itself otherwise. Flags and
+#    width count as part of a placeholder (%02lld);
 #  - the other 8 languages (ar bn es fr hi id ru zh-Hans, translated upstream): a key has all of them or
-#    none (the fork's own screens are pt-BR only and fall back to English); a key that has them keeps its
-#    placeholders and has an `en` value too (dotted keys such as plan.waiting);
+#    none (the fork's own screens are pt-BR only and fall back to English); a key that has them has an
+#    `en` value too (dotted keys such as plan.waiting) and keeps its placeholders;
 #  - the extractor finds the String(localized:) / SwiftUI keys it is supposed to (sanity check).
 # Needs only python3.
 set -euo pipefail
@@ -31,7 +33,12 @@ def norm(key):
 def placeholders(text):
     """Conversion letters of the placeholders, positional or not, ignoring %%."""
     text = text.replace("%%", "")
-    return sorted(m.group(1) for m in re.finditer(r"%(?:\d+\$)?(?:l{0,2}|h{0,2})([@dDiufsS])", text))
+    return sorted(m.group(1) for m in re.finditer(r"%(?:\d+\$)?[-+ #0]*\d*(?:\.\d+)?(?:l{0,2}|h{0,2})([@dDiufsS])", text))
+
+def reference(cat_key, entry):
+    """Text the placeholders of every translation are compared with: the en value, else the key."""
+    en = units(entry, "en")
+    return en[0]["value"] if en and en[0].get("value") else cat_key
 
 OTHER_LANGS = ["ar", "bn", "es", "fr", "hi", "id", "ru", "zh-Hans"]
 
@@ -83,7 +90,7 @@ for cat_key, where in sorted(used.items()):
         missing_pt.append((cat_key, where))
         continue
     for u in pt_units:
-        if placeholders(u["value"]) != placeholders(cat_key):
+        if placeholders(u["value"]) != placeholders(reference(cat_key, entry)):
             lost_placeholders.append((cat_key, u["value"], where))
             break
 
@@ -98,7 +105,7 @@ for cat_key, entry in strings.items():
 for cat_key, entry in strings.items():
     for u in units(entry, "pt-BR"):
         value = u.get("value")
-        if value and placeholders(value) != placeholders(cat_key) and not any(cat_key == k for k, _, _ in lost_placeholders):
+        if value and placeholders(value) != placeholders(reference(cat_key, entry)) and not any(cat_key == k for k, _, _ in lost_placeholders):
             lost_placeholders.append((cat_key, value, "catalog"))
 
 # the other 8 languages: all or none, placeholders kept, `en` present
@@ -115,7 +122,7 @@ for cat_key, entry in strings.items():
         failures.append("translated key without an en value: %r" % cat_key)
     for lang in present:
         for u in units(entry, lang):
-            if u.get("state") == "translated" and placeholders(u.get("value", "")) != placeholders(cat_key):
+            if u.get("state") == "translated" and placeholders(u.get("value", "")) != placeholders(reference(cat_key, entry)):
                 failures.append("%s value changes the placeholders: %r -> %r" % (lang, cat_key, u.get("value")))
                 break
 

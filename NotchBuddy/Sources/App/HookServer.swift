@@ -38,13 +38,17 @@ final class HookServer: @unchecked Sendable {
     private var serverFD: Int32 = -1
     private let connectionLock = NSLock()
     private var connectionCount = 0
-    private var pendingApprovalFD: Int32 = -1         // held open while user decides
-    private var approvalFDSource: (any DispatchSourceRead)? = nil  // monitors pendingApprovalFD
+    /// Permission requests waiting for a click, oldest first; the head is on the card.
+    /// Each one holds its nb-hook connection open until it is answered or dropped.
+    private var approvals = ApprovalQueue()
+    /// One read source per queued request: it notices the client hanging up, and its
+    /// cancel handler is the only place the request's fd is closed.
+    private var approvalSources: [UUID: any DispatchSourceRead] = [:]
     private var pendingQuestionFD: Int32 = -1         // held open while user answers AskUserQuestion
     private var questionFDSource: (any DispatchSourceRead)? = nil  // monitors pendingQuestionFD
 
     /// True when a real nb-hook connection is holding the approval fd open.
-    @MainActor var hasRealPendingApproval: Bool { pendingApprovalFD >= 0 }
+    @MainActor var hasRealPendingApproval: Bool { pendingApprovalFD >= 0 || !approvals.isEmpty }
     /// True when a real nb-hook connection is holding the question fd open.
     @MainActor var hasRealPendingQuestion: Bool { pendingQuestionFD >= 0 }
     private var questionPillId: String = ""           // pill that owns the pending question
@@ -52,6 +56,10 @@ final class HookServer: @unchecked Sendable {
     private var focusBeforeQuestion: String? = nil    // saved focus to restore after question
     private var activeSessionId: String? = nil        // current Claude Code session
     private var focusBeforeApproval: String? = nil    // saved focus to restore after approval
+    /// The cmux lane of the card slot: a cmux permission card holds its nb-hook connection here, with its
+    /// own source and generation. Every other request waits in `approvals` (above); one lane owns the card at a time.
+    private var pendingApprovalFD: Int32 = -1         // held open while the user decides on a cmux card
+    private var approvalFDSource: (any DispatchSourceRead)? = nil  // monitors pendingApprovalFD
     // Bumped each time a card takes an fd, so a stale timer never dismisses a later card
     // that happens to reuse the same fd number.
     private var cardGeneration = 0
@@ -103,10 +111,15 @@ final class HookServer: @unchecked Sendable {
     /// badge, once. Cleaned wherever a surface is forgotten; bounded by what the registry can hold.
     private var cmuxStopRecord = CmuxStopRecord()
     #endif
+    private var sessions = PillSessionRegistry()      // live sessions behind each pill
+
+    /// The nb-hook connection behind the permission card on screen: the cmux card's, else the head of the queue's.
+    /// -1 when no request holds the card.
+    @MainActor private var liveApprovalFD: Int32 { pendingApprovalFD >= 0 ? pendingApprovalFD : (approvals.head?.fd ?? -1) }
 
     private init() {}
 
-    // MARK: - Approval fd helpers
+    // MARK: - Approval queue helpers
 
     @MainActor
     private func cancelApprovalFDSource() {
@@ -114,8 +127,26 @@ final class HookServer: @unchecked Sendable {
         approvalFDSource = nil
     }
 
-    /// Cancels the approval fd source (which closes the fd via its cancel handler), shows a
-    /// 3-second note, clears approval state, then collapses the island.
+    /// Note shown when a request was answered outside Coucou.
+    @MainActor
+    private func handledNote(pill: String) -> String {
+        switch pill {
+        case "agent_cursor":  return String(localized: "Handled in Cursor.")
+        case "agent_codex":   return String(localized: "Handled in Codex.")
+        case "agent_copilot": return String(localized: "Handled in Copilot CLI.")
+        case "agent_muse":    return String(localized: "Handled in Muse Code.")
+        case "agent_hermes":  return String(localized: "Handled in Hermes.")
+        #if !APPSTORE
+        case let id where CmuxRouting.isCmuxTaskId(id): return String(localized: "Handled in cmux.")
+        #endif
+        default:
+            return claudeHostApp == nil ? String(localized: "Handled in VS Code.")
+                                        : String(localized: "Handled in \(claudeHostName).")
+        }
+    }
+
+    /// Cancels the cmux card's connection (the cancel handler closes the fd), shows a 3-second note,
+    /// clears the card, then lets the next waiting card take the screen or collapses the island.
     @MainActor
     private func dismissApprovalCard(note: String, resolved: Bool = false) {
         var cardKey: String? = nil
@@ -160,12 +191,127 @@ final class HookServer: @unchecked Sendable {
         }
     }
 
+    /// Note shown when a request waited too long and went back to the agent.
+    @MainActor
+    private func waitingNote(pill: String) -> String {
+        switch pill {
+        case "agent_cursor":  return String(localized: "Still waiting in Cursor.")
+        case "agent_codex":   return String(localized: "Still waiting in Codex.")
+        case "agent_copilot": return String(localized: "Still waiting in Copilot CLI.")
+        case "agent_muse":    return String(localized: "Still waiting in Muse Code.")
+        case "agent_hermes":  return String(localized: "Still waiting in Hermes.")
+        #if !APPSTORE
+        case let id where CmuxRouting.isCmuxTaskId(id): return String(localized: "Still waiting in cmux.")
+        #endif
+        default:
+            return claudeHostApp == nil ? String(localized: "Still waiting in VS Code.")
+                                        : String(localized: "Still waiting in \(claudeHostName).")
+        }
+    }
+
+    /// Puts the oldest waiting request on the card. When the card already shows it, only
+    /// its "n waiting" count is refreshed (no sound, no focus change).
+    @MainActor
+    private func showApprovalHead() {
+        let state = AppState.shared
+        guard let head = approvals.head else { return }
+        if let shown = state.pendingApproval, shown.id == head.id {
+            if shown.queueCount != approvals.count { state.pendingApproval?.queueCount = approvals.count }
+            return
+        }
+        // Another request takes the card: a click aimed at the previous one must not answer it.
+        if let at = CardInputLock.headChangeArmedAt(shownId: state.pendingApproval?.id, headId: head.id,
+                                                    now: Date().timeIntervalSinceReferenceDate) {
+            cardReplacedAt = at
+        }
+        state.updateTask(id: head.pillId, state: .approval)
+        state.pendingApproval = ApprovalInfo(sessionId: head.sessionId, tool: head.tool,
+                                              command: head.command, inputKey: head.inputKey,
+                                              pillId: head.pillId, id: head.id,
+                                              queueCount: approvals.count,
+                                              projectName: head.projectName)
+        state.isPinned = true
+        // Approval always forces the island open — the user must be able to respond.
+        // Save the focus once, so it comes back when the last request is gone.
+        if focusBeforeApproval == nil { focusBeforeApproval = state.focusId }
+        withAnimation(.spring(response: 0.5, dampingFraction: 0.72)) { state.focusId = head.pillId }
+        expandIfNeeded(to: .approval)
+    }
+
+    /// Takes one request out of the queue. With `answer`, the decision is written to its
+    /// nb-hook first; without, the connection just closes and the agent asks again itself.
+    /// The cancel handler of its source closes the fd — never close it directly.
+    /// The next request in line then takes the card; when none is left the card closes,
+    /// with `note` for three seconds if one is given.
+    @MainActor
+    private func removeApproval(id: UUID, answer json: String? = nil, note: String? = nil) {
+        guard let entry = approvals.remove(id: id) else { return }
+        let age = Int(Date().timeIntervalSince(entry.received))
+        nbLog("Approval \(entry.tool) closed after \(age) s: \(json.map { _ in "answered from Coucou" } ?? note ?? "dropped")")
+        let source = approvalSources.removeValue(forKey: id)
+        if let json {
+            let fd = entry.fd
+            Task.detached { [weak self] in
+                // Write while the fd is still valid, then cancel → the cancel handler closes it.
+                self?.sendLine(fd: fd, text: json)
+                DispatchQueue.main.async { source?.cancel() }
+            }
+        } else {
+            source?.cancel()
+        }
+
+        let state = AppState.shared
+        if !approvals.hasEntries(forPill: entry.pillId) {
+            setTaskState(entry.pillId, .working)
+            clearPillBadgeUnlessCardHeld(id: entry.pillId)
+        }
+        if approvals.head != nil {
+            showApprovalHead()
+            return
+        }
+        // Last request gone: close the card and give the focus back.
+        state.pendingApproval = nil
+        state.isPinned = false
+        if let prev = focusBeforeApproval {
+            focusBeforeApproval = nil
+            if state.focusId == entry.pillId, state.tasks.contains(where: { $0.id == prev }) {
+                withAnimation(.spring(response: 0.5, dampingFraction: 0.72)) { state.focusId = prev }
+            }
+        }
+        #if !APPSTORE
+        if presentNextCmuxCard() { return }
+        #endif
+        if HermesApprovalCenter.shared.presentNextIfFree() { return }
+        if let note {
+            state.noteMessage = note
+            state.view = .note
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                // A Hermes answer announced meanwhile keeps the island open.
+                if AppState.shared.hermesAnnounceHoldsIsland { return }
+                NotificationCenter.default.post(name: .islandCollapse, object: nil)
+            }
+        } else {
+            state.view = state.tasks.isEmpty ? .empty : .overview
+        }
+    }
+
     // MARK: - Question fd helpers
 
     @MainActor
     private func cancelQuestionFDSource() {
         questionFDSource?.cancel()
         questionFDSource = nil
+    }
+
+    /// The question card is gone: a Claude approval it covered goes back on the card (its fd is still live, so the cmux
+    /// queue and Hermes cannot take the slot). The lock keeps a click aimed at the question from answering it.
+    @MainActor
+    private func reshowApprovalHeadAfterQuestion() -> Bool {
+        guard approvals.head != nil else { return false }
+        cardReplacedAt = CardInputLock.armedAt(cardWasVisible: true, now: Date().timeIntervalSinceReferenceDate)
+        showApprovalHead()
+        expandIfNeeded(to: .approval)
+        return true
     }
 
     @MainActor
@@ -194,6 +340,7 @@ final class HookServer: @unchecked Sendable {
                 withAnimation(.spring(response: 0.5, dampingFraction: 0.72)) { state.focusId = prev }
             }
         }
+        if reshowApprovalHeadAfterQuestion() { return }
         #if !APPSTORE
         if presentNextCmuxCard() { return }
         #endif
@@ -274,11 +421,14 @@ final class HookServer: @unchecked Sendable {
             self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
             DispatchQueue.main.async { source?.cancel() }
         }
-        #if !APPSTORE
-        // Runs from onDisappear: promote the next queued cmux card on the next turn.
-        DispatchQueue.main.async { _ = self.presentNextCmuxCard() }
-        #endif
-        DispatchQueue.main.async { HermesApprovalCenter.shared.presentNextIfFree() }
+        // Runs from onDisappear: the next card (queue head, cmux queue, Hermes) comes on the next turn.
+        DispatchQueue.main.async {
+            if self.reshowApprovalHeadAfterQuestion() { return }
+            #if !APPSTORE
+            _ = self.presentNextCmuxCard()
+            #endif
+            HermesApprovalCenter.shared.presentNextIfFree()
+        }
     }
 
     /// Called by QuestionView "Reply in terminal" button.
@@ -600,6 +750,14 @@ final class HookServer: @unchecked Sendable {
         #else
         let cardPromoted = false
         #endif
+        // Several sessions can share one pill (it is chosen from the client, not from the
+        // session). The registry tells a turn-ending event whether it may touch the pill,
+        // and which session owns the project name shown on it.
+        let display = PillSessionRegistry.Display(
+            session: sessionId,
+            projectName: isExternalAgent ? (validAgent ?? projectName) : projectName,
+            cwd: isExternalAgent ? "" : cwd,
+            hostApp: hostApp, bundleId: bundleId)
         // For sessions that carry no id, derive a unique key from pill + cwd so that
         // concurrent anonymous sessions are tracked independently in RecapStore.
         let recapSessionId = (sessionId == "unknown" || sessionId.isEmpty)
@@ -611,35 +769,37 @@ final class HookServer: @unchecked Sendable {
         if !isExternalAgent { TurnRecorder.shared.record(event: name, payload: payload, pillId: agentId) }
         #endif
 
-        // While a permission request is pending, dismiss when the resolving event arrives,
-        // then continue normal processing. Only skip normal processing when unresolved.
+        #if !APPSTORE
+        let generationBefore = cardGeneration
+        #endif
+        // Waiting permission requests: an event that settles one (its tool finished, or its
+        // turn ended) takes it off the card, then is processed normally.
+        if !approvals.isEmpty {
+            let eventTool = payload["tool_name"] as? String ?? ""
+            let eventKey = Self.approvalInputKey(payload["tool_input"] as? [String: Any] ?? [:])
+            for entry in approvals.resolved(byEvent: name, sessionId: sessionId, pillId: agentId,
+                                            tool: eventTool, inputKey: eventKey) {
+                removeApproval(id: entry.id, note: handledNote(pill: entry.pillId))
+            }
+            // A session still waiting on a decision is held back (its parallel tool calls
+            // would pull the pill out of its approval state). Other sessions go through.
+            if approvals.entries.contains(where: { $0.pillId == agentId && $0.sessionId == sessionId }) {
+                return
+            }
+        }
+        // A cmux card holds the slot: dismiss it when the resolving event arrives, then continue normal
+        // processing. Only skip normal processing when unresolved.
         // A cmux pill holds several sessions: only an event of the session that asked is about the card.
         #if !APPSTORE
         let cmuxPillEvent = CmuxRouting.isCmuxTaskId(agentId)
         #else
         let cmuxPillEvent = false
         #endif
-        if let pending = state.pendingApproval, agentId == pending.pillId,
+        if pendingApprovalFD >= 0, let pending = state.pendingApproval, agentId == pending.pillId,
            pending.sessionId != "demo_session",
            !cmuxPillEvent || sessionId == pending.sessionId {
-            let handledNote: String
-            switch pending.pillId {
-            case "agent_cursor": handledNote = String(localized: "Handled in Cursor.")
-            case "agent_codex":  handledNote = String(localized: "Handled in Codex.")
-            case "agent_copilot": handledNote = String(localized: "Handled in Copilot CLI.")
-            case "agent_muse":    handledNote = String(localized: "Handled in Muse Code.")
-            case "agent_hermes":  handledNote = String(localized: "Handled in Hermes.")
-            #if !APPSTORE
-            case let id where CmuxRouting.isCmuxTaskId(id): handledNote = String(localized: "Handled in cmux.")
-            #endif
-            default:
-                handledNote = claudeHostApp == nil ? String(localized: "Handled in VS Code.")
-                                                   : String(localized: "Handled in \(claudeHostName).")
-            }
+            let dismissNote = handledNote(pill: pending.pillId)
             var resolved = false
-            #if !APPSTORE
-            let generationBefore = cardGeneration
-            #endif
             switch name {
             case "PostToolUse", "PostToolUseFailure":
                 // Only dismiss when this exact tool call finished — same session, tool and input.
@@ -647,30 +807,35 @@ final class HookServer: @unchecked Sendable {
                 if sessionId == pending.sessionId,
                    (payload["tool_name"] as? String ?? "") == pending.tool,
                    Self.approvalInputKey(payload["tool_input"] as? [String: Any] ?? [:]) == pending.inputKey {
-                    dismissApprovalCard(note: handledNote, resolved: true)
+                    dismissApprovalCard(note: dismissNote, resolved: true)
                     resolved = true
                 }
             case "Stop", "StopFailure", "UserPromptSubmit", "SessionEnd", "Interrupt":
                 // Turn ended or session interrupted — the permission is moot.
                 if sessionId == pending.sessionId {
-                    dismissApprovalCard(note: handledNote, resolved: true)
+                    dismissApprovalCard(note: dismissNote, resolved: true)
                     resolved = true
                 }
             default: break
             }
             if !resolved { return }
-            #if !APPSTORE
-            // The dismissal promoted a queued card: the resolving event must not take the view from it.
-            cardPromoted = cardGeneration != generationBefore
-            #endif
             // Approval dismissed — fall through so the resolving event updates state normally.
+        }
+        #if !APPSTORE
+        // A dismissal promoted a queued card: the resolving event must not take the view from it.
+        cardPromoted = cardGeneration != generationBefore
+        #endif
+        // A sibling session's event must not take the pill out of its approval state.
+        defer {
+            if approvals.hasEntries(forPill: agentId) { state.updateTask(id: agentId, state: .approval) }
         }
 
         switch name {
 
         case "SessionStart":
             activeSessionId = sessionId
-            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKey, hostApp: hostApp, bundleId: bundleId) }
+            upsertTask(pill: agentId, display: display, working: false,
+                       externalAgent: isExternalAgent ? validAgent : nil, cmuxKey: cmuxKey)
             if let idx = state.tasks.firstIndex(where: { $0.id == agentId }) { state.tasks[idx].finalLine = nil }
             #if !APPSTORE
             if cmuxTaskId == agentId {
@@ -697,7 +862,8 @@ final class HookServer: @unchecked Sendable {
 
         case "UserPromptSubmit":
             activeSessionId = sessionId
-            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKey, hostApp: hostApp, bundleId: bundleId) }
+            upsertTask(pill: agentId, display: display, working: true,
+                       externalAgent: isExternalAgent ? validAgent : nil, cmuxKey: cmuxKey)
             if let idx = state.tasks.firstIndex(where: { $0.id == agentId }) { state.tasks[idx].finalLine = nil }
             setTaskState(agentId, .thinking, cmuxKey: cmuxKey)
             #if !APPSTORE
@@ -727,7 +893,8 @@ final class HookServer: @unchecked Sendable {
             // AskUserQuestion is handled via the dedicated --ask hook.
             // Skip state/step update here to avoid flickering over the question card.
             guard tool != "AskUserQuestion" else { break }
-            if isExternalAgent { upsertExternalAgent(id: agentId, name: validAgent!) } else { upsertWorkspaceTask(id: agentId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKey, hostApp: hostApp, bundleId: bundleId) }
+            upsertTask(pill: agentId, display: display, working: true,
+                       externalAgent: isExternalAgent ? validAgent : nil, cmuxKey: cmuxKey)
             setTaskState(agentId, .working, cmuxKey: cmuxKey)
             let input = payload["tool_input"] as? [String: Any] ?? [:]
             let parts = stepParts(tool: tool, input: input)
@@ -741,6 +908,7 @@ final class HookServer: @unchecked Sendable {
             nbLog("PreToolUse \(tool)")
 
         case "PostToolUse":
+            if cmuxKey == nil { sessions.note(pill: agentId, display: display, working: true) }
             setTaskState(agentId, .working, cmuxKey: cmuxKey)
             // Live diff for Edit / MultiEdit / Write
             let diffTool = payload["tool_name"] as? String ?? ""
@@ -766,6 +934,7 @@ final class HookServer: @unchecked Sendable {
             #endif
 
         case "PostToolUseFailure":
+            if cmuxKey == nil { sessions.note(pill: agentId, display: display, working: true) }
             setTaskState(agentId, .working, cmuxKey: cmuxKey)
             appendStep(id: agentId, step: stepPrefix(forKey: cmuxKey) + String(localized: "⚠ failed"))
             #if !APPSTORE
@@ -781,6 +950,7 @@ final class HookServer: @unchecked Sendable {
             #endif
 
         case "Notification":
+            if cmuxKey == nil { sessions.note(pill: agentId, display: display, working: false) }
             let message = payload["message"] as? String ?? ""
             let lower = message.lowercased()
             // The kind and whether a badge was set go to the log, never the message.
@@ -820,6 +990,7 @@ final class HookServer: @unchecked Sendable {
 
         case "Stop":
             nbLog("Stop \(isExternalAgent ? agentId : projectName)")
+            let scope = sessions.endTurn(pill: agentId, session: sessionId)
             // A helper that stops while another session of the workspace is mid turn adds a step, nothing else:
             // no sound, no finished view, no badge. The main session is never silent, and a sibling stuck in an
             // old state (error, rate limit) silences nobody. Decided before the state is recorded.
@@ -834,7 +1005,6 @@ final class HookServer: @unchecked Sendable {
             #else
             let silentStop = false
             #endif
-            setTaskState(agentId, .finished, cmuxKey: cmuxKey)
             let rawFinal = (payload["last_assistant_message"] as? String)
                 ?? (payload["message"] as? String) ?? ""
             let finalText = DiffEngine.toOneLine(rawFinal)
@@ -845,16 +1015,22 @@ final class HookServer: @unchecked Sendable {
                 requestCmuxDiscovery()
             }
             #endif
-            if !finalText.isEmpty {
-                appendStep(id: agentId, step: stepPrefix(forKey: cmuxKey) + finalText)
-                if !silentStop, let idx = state.tasks.firstIndex(where: { $0.id == agentId }) {
-                    state.tasks[idx].finalLine = finalText
-                    #if !APPSTORE
-                    cmuxFinalLineKey[agentId] = cmuxKey
-                    #endif
-                }
-            }
+            // The step log is shared, so the conclusion is worth showing either way.
+            if !finalText.isEmpty { appendStep(id: agentId, step: stepPrefix(forKey: cmuxKey) + finalText) }
             RecapStore.shared.stop(sessionId: recapSessionId)
+            // Another session is still mid-turn behind this pill: the finished state, the
+            // sound and the idle reset below would land on its work. Its own Stop comes later.
+            guard scope == .pill else {
+                nbLog("Stop \(sessionId.prefix(8)) — \(sessions.workingCount(pill: agentId)) session(s) still working on \(agentId)")
+                break
+            }
+            setTaskState(agentId, .finished, cmuxKey: cmuxKey)
+            if !finalText.isEmpty, !silentStop, let idx = state.tasks.firstIndex(where: { $0.id == agentId }) {
+                state.tasks[idx].finalLine = finalText
+                #if !APPSTORE
+                cmuxFinalLineKey[agentId] = cmuxKey
+                #endif
+            }
             if !silentStop { SoundEngine.shared.play("finish") }
             #if !APPSTORE
             // The reply view of this session shows the answer in place: no view switch, the draft stays.
@@ -910,6 +1086,8 @@ final class HookServer: @unchecked Sendable {
                     return
                 }
                 #endif
+                // A session (this one or a sibling) may have started a new turn meanwhile.
+                guard self.sessions.workingCount(pill: agentId) == 0 else { return }
                 if isExternalAgent {
                     AppState.shared.removeTask(id: agentId)
                 } else {
@@ -927,7 +1105,16 @@ final class HookServer: @unchecked Sendable {
             #if !APPSTORE
             timeline(.ended(ok: false, note: String(localized: "The turn ended with an error.")), cmuxKey)
             #endif
+            guard sessions.endTurn(pill: agentId, session: sessionId) == .pill else { break }
+            nbLog("StopFailure \(sessionId.prefix(8)) — \(payload.keys.sorted().joined(separator: ", ")): \(Self.stopFailureDetail(payload) ?? "no detail")")
             setTaskState(agentId, .error, cmuxKey: cmuxKey)
+            // The error view shows what went wrong (finalLine), not the last thing said before it.
+            if let idx = state.tasks.firstIndex(where: { $0.id == agentId }) {
+                state.tasks[idx].finalLine = Self.stopFailureDetail(payload)
+                #if !APPSTORE
+                cmuxFinalLineKey[agentId] = cmuxKey
+                #endif
+            }
             SoundEngine.shared.play("error")
             #if !APPSTORE
             let errorInPlace = CmuxRouting.answerStaysInReply(prompt: state.cmuxPrompt, taskId: agentId,
@@ -953,11 +1140,19 @@ final class HookServer: @unchecked Sendable {
             timeline(.ended(ok: false, note: String(localized: "Interrupted.")), cmuxKey)
             #endif
             RecapStore.shared.stop(sessionId: recapSessionId)
+            guard sessions.endTurn(pill: agentId, session: sessionId) == .pill else { break }
             activeSessionId = nil
             setTaskState(agentId, .idle, cmuxKey: cmuxKey)
             clearPillBadgeIfIdle(id: agentId)
 
         case "SessionEnd":
+            // Only the last session behind the pill may take the card and its diffs down.
+            guard sessions.endSession(pill: agentId, session: sessionId) == .pill else {
+                RecapStore.shared.sessionEnd(sessionId: recapSessionId)
+                nbLog("SessionEnd \(sessionId.prefix(8)) — \(sessions.liveCount(pill: agentId)) session(s) left on \(agentId)")
+                applyDisplayOwner(pill: agentId)
+                break
+            }
             activeSessionId = nil
             #if !APPSTORE
             // A cmux pill is a workspace: only the last session that ends takes the pill with it.
@@ -1068,9 +1263,13 @@ final class HookServer: @unchecked Sendable {
 
     @MainActor
     private func processStatusLine(payload: [String: Any]) {
-        if let usage = ClaudePlanGauge.parse(payload: payload) {
-            AppState.shared.claudePlanUsage = usage
-        }
+        guard let usage = ClaudePlanGauge.parse(payload: payload) else { return }
+        // Claude Code calls the status line several times a second: publish (and save to
+        // UserDefaults) only when the numbers change, or every 30 s for "updated … ago".
+        if let cur = AppState.shared.claudePlanUsage,
+           cur.fiveHour == usage.fiveHour, cur.sevenDay == usage.sevenDay,
+           usage.updatedAt.timeIntervalSince(cur.updatedAt) < 30 { return }
+        AppState.shared.claudePlanUsage = usage
     }
 
     // MARK: - Permission request (blocking — Claude Code waits for decision)
@@ -1189,7 +1388,7 @@ final class HookServer: @unchecked Sendable {
         #endif
 
         // Read before a displaced or requeued card leaves the screen.
-        let cardWasVisible = CardInputLock.cardVisible(approvalFD: pendingApprovalFD, questionFD: pendingQuestionFD,
+        let cardWasVisible = CardInputLock.cardVisible(approvalFD: liveApprovalFD, questionFD: pendingQuestionFD,
                                                        approvalShown: state.pendingApproval != nil,
                                                        questionShown: state.pendingQuestion != nil)
         // A Hermes card on screen waits again, at the head of its line: nothing is sent to Hermes.
@@ -1199,7 +1398,7 @@ final class HookServer: @unchecked Sendable {
         #if !APPSTORE
         cmuxKeyOfRequest = cmuxTaskId == nil ? nil : CmuxRouting.surfaceKey(payload: payload)
         if cmuxTaskId != nil {
-            if pendingApprovalFD >= 0 || pendingQuestionFD >= 0 {
+            if liveApprovalFD >= 0 || pendingQuestionFD >= 0 {
                 // A card is on screen: wait in line, the fd stays open and silent.
                 guard cmuxQueue.canAccept(taskId: pillId, surfaceKey: cmuxKeyOfRequest) else {
                     // Queue full: answer like a terminal Coucou does not support. The dialog is open there.
@@ -1224,6 +1423,64 @@ final class HookServer: @unchecked Sendable {
         cmuxShownArrival = arrivedAt ?? Date().timeIntervalSinceReferenceDate
         cmuxPromotedAt = nil   // presentNextCmuxCard sets it again when this card came out of the queue
         #endif
+
+        // Every request but a cmux one queues here: several can wait at once (several sessions or agents),
+        // the card shows the oldest. Past the cap, the newest goes back to its own terminal.
+        if cmuxTaskId == nil {
+            let entry = QueuedApproval(id: UUID(), fd: fd, sessionId: sessionId, pillId: pillId,
+                                       projectName: projectName, cwd: cwd, tool: tool,
+                                       command: command, inputKey: inputKey,
+                                       hostApp: terminalHost?.bundleId, bundleId: bundleId)
+            guard approvals.enqueue(entry) == .accepted else {
+                nbLog("PermissionRequest \(tool): \(ApprovalQueue.maxPending) already waiting, asked in the terminal")
+                Task.detached { [weak self] in
+                    self?.sendLine(fd: fd, text: #"{"permissionDecision":"ask"}"#)
+                    close(fd)
+                }
+                return
+            }
+            // The card changes only when this request takes the head of the line.
+            if approvals.head?.id == entry.id {
+                cardReplacedAt = CardInputLock.armedAt(cardWasVisible: cardWasVisible,
+                                                       now: Date().timeIntervalSinceReferenceDate)
+            }
+            activeSessionId = sessionId
+
+            upsertTask(pill: pillId,
+                       display: PillSessionRegistry.Display(session: sessionId, projectName: projectName,
+                                                            cwd: cwd, hostApp: terminalHost?.bundleId,
+                                                            bundleId: bundleId),
+                       working: true, externalAgent: nil)
+            setTaskState(pillId, .approval)
+            SoundEngine.shared.play("approval")
+
+            // Monitor fd: if the agent closes the connection (answered in its own UI), drop the
+            // request. The cancel handler closes the fd — never close it anywhere else.
+            let entryId = entry.id
+            let capturedPillId = pillId
+            let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
+            source.setEventHandler { [weak self] in
+                guard let self, self.approvals.contains(id: entryId) else { return }
+                self.removeApproval(id: entryId, note: self.handledNote(pill: capturedPillId))
+            }
+            source.setCancelHandler { close(fd) }
+            source.resume()
+            approvalSources[entryId] = source
+
+            // Safety timeout — drop without a decision. nb-hook reads EOF from the cancel
+            // handler's close and exits; the agent asks again itself.
+            // Copilot/Muse use 110s (their relay waits 118s but their hook timeout is 120s, leaving little margin).
+            let waitTimeout: Double = (isCopilotRequest || isMuseRequest) ? 110 : 115
+            DispatchQueue.main.asyncAfter(deadline: .now() + waitTimeout) { [weak self] in
+                guard let self, self.approvals.contains(id: entryId) else { return }
+                self.removeApproval(id: entryId, note: self.waitingNote(pill: capturedPillId))
+            }
+
+            showApprovalHead()
+            return
+        }
+
+        // A cmux request: it owns the card slot with its own connection, source and generation.
         cardReplacedAt = CardInputLock.armedAt(cardWasVisible: cardWasVisible, now: Date().timeIntervalSinceReferenceDate)
 
         if pendingApprovalFD >= 0 {
@@ -1265,28 +1522,15 @@ final class HookServer: @unchecked Sendable {
         let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: .main)
         source.setEventHandler { [weak self] in
             guard let self, self.pendingApprovalFD == fd else { return }
-            let note: String
-            switch capturedPillId {
-            case "agent_cursor": note = String(localized: "Handled in Cursor.")
-            case "agent_codex":  note = String(localized: "Handled in Codex.")
-            case "agent_copilot": note = String(localized: "Handled in Copilot CLI.")
-            case "agent_muse":    note = String(localized: "Handled in Muse Code.")
-            case "agent_hermes":  note = String(localized: "Handled in Hermes.")
-            #if !APPSTORE
-            case let id where CmuxRouting.isCmuxTaskId(id):
-                // A card promoted late was closed by the hook's own timeout: nobody handled it.
-                note = CmuxRouting.isLateCard(arrivedAt: self.cmuxShownArrival,
-                                              now: Date().timeIntervalSinceReferenceDate)
-                    ? String(localized: "Still waiting in cmux.") : String(localized: "Handled in cmux.")
-            #endif
-            default:
-                note = self.claudeHostApp == nil ? String(localized: "Handled in VS Code.")
-                                                 : String(localized: "Handled in \(self.claudeHostName).")
-            }
+            var note = self.handledNote(pill: capturedPillId)
             // A cmux card that reads EOF while still young was answered in the terminal: no dialog is left.
             var answeredInTerminal = false
             #if !APPSTORE
             if CmuxRouting.isCmuxTaskId(capturedPillId) {
+                // A card promoted late was closed by the hook's own timeout: nobody handled it.
+                if CmuxRouting.isLateCard(arrivedAt: self.cmuxShownArrival, now: Date().timeIntervalSinceReferenceDate) {
+                    note = String(localized: "Still waiting in cmux.")
+                }
                 answeredInTerminal = !CmuxRouting.eofLeavesDialogOpen(
                     arrivedAt: self.cmuxShownArrival, now: Date().timeIntervalSinceReferenceDate)
             }
@@ -1304,31 +1548,19 @@ final class HookServer: @unchecked Sendable {
         let captured = fd
         DispatchQueue.main.asyncAfter(deadline: .now() + waitTimeout) { [weak self] in
             guard let self, self.pendingApprovalFD == captured, self.cardGeneration == gen else { return }
-            let note: String
-            switch capturedPillId {
-            case "agent_cursor": note = String(localized: "Still waiting in Cursor.")
-            case "agent_codex":  note = String(localized: "Still waiting in Codex.")
-            case "agent_copilot": note = String(localized: "Still waiting in Copilot CLI.")
-            case "agent_muse":    note = String(localized: "Still waiting in Muse Code.")
-            case "agent_hermes":  note = String(localized: "Still waiting in Hermes.")
-            #if !APPSTORE
-            case let id where CmuxRouting.isCmuxTaskId(id): note = String(localized: "Still waiting in cmux.")
-            #endif
-            default:
-                note = self.claudeHostApp == nil ? String(localized: "Still waiting in VS Code.")
-                                                 : String(localized: "Still waiting in \(self.claudeHostName).")
-            }
-            self.dismissApprovalCard(note: note)
+            self.dismissApprovalCard(note: self.waitingNote(pill: capturedPillId))
         }
     }
 
-    /// Called by ApprovalView buttons. Writes the decision to the waiting nb-hook and cleans up.
+    /// Called by ApprovalView buttons and the iPhone. Writes the decision to the waiting
+    /// nb-hook of request `id` — the one that was on screen. A click that lands after the
+    /// card moved on to another request is ignored, so it can never answer the wrong one.
     @MainActor
-    func sendApprovalDecision(_ decision: String) {
-        // Only intercept a demo card — a real card has a live fd (pendingApprovalFD >= 0).
+    func sendApprovalDecision(_ decision: String, for id: UUID? = nil) {
+        // Only intercept a demo card — a real card has a live connection behind it.
         if DemoEngine.shared.isActive,
            AppState.shared.pendingApproval?.sessionId == "demo_session",
-           pendingApprovalFD < 0 {
+           liveApprovalFD < 0 {
             let s = AppState.shared
             s.pendingApproval = nil
             if DemoGuard.mayChangeView(DemoEngine.shared.realPending) {
@@ -1340,27 +1572,9 @@ final class HookServer: @unchecked Sendable {
         }
         // A Hermes request has its own card and its own answers (`sendHermesDecision`): nothing here, the iPhone included.
         if HermesPills.isTaskId(AppState.shared.pendingApproval?.pillId) { return }
-        var cardKey: String? = nil
         if cardReplacedLocked() { return }
         #if !APPSTORE
         if cmuxInputLocked() { return }
-        cardKey = cmuxShownKey
-        cmuxShownPayload = nil
-        #endif
-        let fd = pendingApprovalFD
-        pendingApprovalFD = -1
-        // Capture source before nulling — we send the decision first, then cancel the source.
-        // The cancel handler closes the fd; never close it directly.
-        let source = approvalFDSource
-        approvalFDSource = nil
-
-        #if !APPSTORE
-        // "ask" hands the request to the terminal (marked below); the other answers settle the row.
-        if decision != "ask", let p = AppState.shared.pendingApproval {
-            timeline(.permission(key: TimelineNames.pairingKey(tool: p.tool, inputKey: p.inputKey), label: p.command,
-                                 outcome: decision == "allow" || decision == "always" ? .allowed : .denied,
-                                 allowedWord: String(localized: "allowed")), cardKey)
-        }
         #endif
         let json: String
         switch decision {
@@ -1370,41 +1584,81 @@ final class HookServer: @unchecked Sendable {
         default:       json = #"{"permissionDecision":"deny"}"#
         }
 
-        if fd >= 0 {
+        // The cmux card holds the slot with its own connection.
+        if pendingApprovalFD >= 0 {
+            if let id, id != AppState.shared.pendingApproval?.id {
+                nbLog("Approval decision for a request no longer on the card, ignored")
+                return
+            }
+            var cardKey: String? = nil
+            #if !APPSTORE
+            cardKey = cmuxShownKey
+            cmuxShownPayload = nil
+            #endif
+            let fd = pendingApprovalFD
+            pendingApprovalFD = -1
+            // Capture source before nulling — we send the decision first, then cancel the source.
+            // The cancel handler closes the fd; never close it directly.
+            let source = approvalFDSource
+            approvalFDSource = nil
+
+            #if !APPSTORE
+            // "ask" hands the request to the terminal (marked below); the other answers settle the row.
+            if decision != "ask", let p = AppState.shared.pendingApproval {
+                timeline(.permission(key: TimelineNames.pairingKey(tool: p.tool, inputKey: p.inputKey), label: p.command,
+                                     outcome: decision == "allow" || decision == "always" ? .allowed : .denied,
+                                     allowedWord: String(localized: "allowed")), cardKey)
+            }
+            #endif
+
             Task.detached { [weak self] in
                 // Write decision while fd is still valid, then cancel source → cancel handler closes fd
                 self?.sendLine(fd: fd, text: json)
                 DispatchQueue.main.async { source?.cancel() }
             }
-        } else {
-            source?.cancel()
+
+            let state = AppState.shared
+            let pillId = state.pendingApproval?.pillId ?? "integration_claude"
+            #if !APPSTORE
+            // "ask" hands the request back to the terminal: its dialog is open there.
+            if decision == "ask", let p = state.pendingApproval {
+                markCmuxDialogOpen(cardKey, tool: p.tool, inputKey: p.inputKey)
+            }
+            #endif
+            state.pendingApproval = nil
+            state.isPinned = false
+            RecapStore.shared.recordDecision(pillId: pillId, decision: decision)
+            setTaskState(pillId, .working, cmuxKey: cardKey)
+            clearPillBadgeUnlessCardHeld(id: pillId)
+            // Restore focus to the pill that was focused before the approval card appeared.
+            if let prev = focusBeforeApproval {
+                focusBeforeApproval = nil
+                if state.focusId == pillId, state.tasks.contains(where: { $0.id == prev }) {
+                    withAnimation(.spring(response: 0.5, dampingFraction: 0.72)) { state.focusId = prev }
+                }
+            }
+            #if !APPSTORE
+            if presentNextCmuxCard() { return }
+            #endif
+            if HermesApprovalCenter.shared.presentNextIfFree() { return }
+            state.view = state.tasks.isEmpty ? .empty : .overview
+            return
         }
 
-        let state = AppState.shared
-        let pillId = state.pendingApproval?.pillId ?? "integration_claude"
-        #if !APPSTORE
-        // "ask" hands the request back to the terminal: its dialog is open there.
-        if decision == "ask", let p = state.pendingApproval {
-            markCmuxDialogOpen(cardKey, tool: p.tool, inputKey: p.inputKey)
+        guard let head = approvals.head else {
+            // A card with nothing behind it any more: just close it.
+            let s = AppState.shared
+            s.pendingApproval = nil
+            s.isPinned = false
+            s.view = s.tasks.isEmpty ? .empty : .overview
+            return
         }
-        #endif
-        state.pendingApproval = nil
-        state.isPinned = false
-        RecapStore.shared.recordDecision(pillId: pillId, decision: decision)
-        setTaskState(pillId, .working, cmuxKey: cardKey)
-        clearPillBadgeUnlessCardHeld(id: pillId)
-        // Restore focus to the pill that was focused before the approval card appeared.
-        if let prev = focusBeforeApproval {
-            focusBeforeApproval = nil
-            if state.focusId == pillId, state.tasks.contains(where: { $0.id == prev }) {
-                withAnimation(.spring(response: 0.5, dampingFraction: 0.72)) { state.focusId = prev }
-            }
+        if let id, id != head.id {
+            nbLog("Approval decision for a request no longer on the card, ignored")
+            return
         }
-        #if !APPSTORE
-        if presentNextCmuxCard() { return }
-        #endif
-        if HermesApprovalCenter.shared.presentNextIfFree() { return }
-        state.view = state.tasks.isEmpty ? .empty : .overview
+        RecapStore.shared.recordDecision(pillId: head.pillId, decision: decision)
+        removeApproval(id: head.id, answer: json)
     }
 
     // MARK: - Question request
@@ -1469,7 +1723,7 @@ final class HookServer: @unchecked Sendable {
         #endif
 
         // Read before a displaced or requeued card leaves the screen.
-        let cardWasVisible = CardInputLock.cardVisible(approvalFD: pendingApprovalFD, questionFD: pendingQuestionFD,
+        let cardWasVisible = CardInputLock.cardVisible(approvalFD: liveApprovalFD, questionFD: pendingQuestionFD,
                                                        approvalShown: state.pendingApproval != nil,
                                                        questionShown: state.pendingQuestion != nil)
         // A Hermes card on screen waits again, at the head of its line: nothing is sent to Hermes.
@@ -1479,7 +1733,7 @@ final class HookServer: @unchecked Sendable {
         #if !APPSTORE
         cmuxKeyOfRequest = cmuxTaskId == nil ? nil : CmuxRouting.surfaceKey(payload: payload)
         if cmuxTaskId != nil {
-            if pendingApprovalFD >= 0 || pendingQuestionFD >= 0 {
+            if liveApprovalFD >= 0 || pendingQuestionFD >= 0 {
                 guard cmuxQueue.canAccept(taskId: pillId, surfaceKey: cmuxKeyOfRequest) else {
                     markCmuxDialogOpen(cmuxKeyOfRequest, tool: "AskUserQuestion", inputKey: nil)
                     Task.detached { [weak self] in
@@ -1527,7 +1781,11 @@ final class HookServer: @unchecked Sendable {
             ? "\(pillId)+\(cwd)"
             : sessionId
 
-        upsertWorkspaceTask(id: pillId, projectName: projectName, cwd: cwd, cmuxKey: cmuxKeyOfRequest, hostApp: terminalHost?.bundleId, bundleId: bundleId)
+        upsertTask(pill: pillId,
+                   display: PillSessionRegistry.Display(session: sessionId, projectName: projectName,
+                                                        cwd: cwd, hostApp: terminalHost?.bundleId,
+                                                        bundleId: bundleId),
+                   working: true, externalAgent: nil, cmuxKey: cmuxKeyOfRequest)
         setTaskState(pillId, .question, cmuxKey: cmuxKeyOfRequest)
         state.pendingQuestion = parsed
         state.isPinned = true
@@ -1577,16 +1835,51 @@ final class HookServer: @unchecked Sendable {
         AppState.shared.tasks.first { $0.id == "integration_claude" }?.hostApp
     }
 
+    /// Records the session an event came from, then refreshes its card.
+    /// `externalAgent` is the validated `coucou_agent` name for a third-party agent pill,
+    /// nil for a workspace pill.
+    @MainActor
+    private func upsertTask(pill: String, display: PillSessionRegistry.Display,
+                            working: Bool, externalAgent: String?, cmuxKey: String? = nil) {
+        // A cmux pill holds its own sessions (one per surface): the registry stays out of it.
+        if cmuxKey == nil { sessions.note(pill: pill, display: display, working: working) }
+        if let externalAgent {
+            upsertExternalAgent(id: pill, name: externalAgent)
+        } else {
+            upsertWorkspaceTask(id: pill, projectName: display.projectName, cwd: display.cwd, cmuxKey: cmuxKey,
+                                hostApp: display.hostApp, bundleId: display.bundleId,
+                                session: display.session)
+        }
+    }
+
+    /// Writes the pill's name, cwd and terminal from the session that owns it: used when
+    /// the owner ends and a sibling session inherits the card.
+    @MainActor
+    private func applyDisplayOwner(pill: String) {
+        guard let owner = sessions.displayOwner(of: pill),
+              let idx = AppState.shared.tasks.firstIndex(where: { $0.id == pill }),
+              !owner.projectName.isEmpty else { return }
+        let state = AppState.shared
+        state.tasks[idx].name = owner.projectName
+        if !owner.cwd.isEmpty { state.tasks[idx].sessionCwd = owner.cwd }
+        if pill == "integration_claude" { state.tasks[idx].hostApp = owner.hostApp }
+        if !owner.bundleId.isEmpty { state.tasks[idx].sessionBundleId = owner.bundleId }
+    }
+
     /// Updates or transiently creates a workspace pill (VS Code or Cursor) task.
     /// If the task already exists (persistent), just updates name/cwd.
     /// If missing (transient), creates it and inserts after the main pill.
+    /// Name, cwd and terminal belong to the session that owns the pill (the oldest one
+    /// still running), so a second session under the same client cannot rename the card,
+    /// or send "Open terminal" elsewhere, out from under the first.
     @MainActor
-    private func upsertWorkspaceTask(id: String, projectName: String, cwd: String = "", cmuxKey: String? = nil, hostApp: String? = nil, bundleId: String = "") {
+    private func upsertWorkspaceTask(id: String, projectName: String, cwd: String = "", cmuxKey: String? = nil, hostApp: String? = nil, bundleId: String = "", session: String = "") {
         #if !APPSTORE
         if CmuxRouting.isCmuxTaskId(id) { upsertCmuxTask(id: id, projectName: projectName, cwd: cwd, key: cmuxKey); return }
         #endif
         let state = AppState.shared
         if let idx = state.tasks.firstIndex(where: { $0.id == id }) {
+            guard sessions.ownsDisplay(pill: id, session: session) else { return }
             state.tasks[idx].name = projectName
             if !cwd.isEmpty { state.tasks[idx].sessionCwd = cwd }
             if id == "integration_claude" { state.tasks[idx].hostApp = hostApp }
@@ -2410,7 +2703,7 @@ final class HookServer: @unchecked Sendable {
     /// Promotes the next waiting card once the screen is free. Returns true when one was shown.
     @MainActor
     private func presentNextCmuxCard() -> Bool {
-        guard pendingApprovalFD < 0, pendingQuestionFD < 0 else { return false }
+        guard liveApprovalFD < 0, pendingQuestionFD < 0 else { return false }
         while true {
             let popped = cmuxQueue.popNext(now: Date().timeIntervalSinceReferenceDate)
             for id in popped.expired {
@@ -5361,8 +5654,8 @@ extension HookServer {
     /// No approval and no question holds the slot. A demo card does not: a real request covers it, as a hook request does.
     @MainActor var hermesSlotFree: Bool {
         let s = AppState.shared
-        let demoCard = s.pendingApproval?.sessionId == "demo_session" && pendingApprovalFD < 0
-        return (s.pendingApproval == nil || demoCard) && s.pendingQuestion == nil && pendingApprovalFD < 0 && pendingQuestionFD < 0
+        let demoCard = s.pendingApproval?.sessionId == "demo_session" && liveApprovalFD < 0
+        return (s.pendingApproval == nil || demoCard) && s.pendingQuestion == nil && liveApprovalFD < 0 && pendingQuestionFD < 0
     }
 
     /// Puts a Hermes request in the card slot: the pill, the sound, the island. No file descriptor, no 115 s timer
@@ -5431,5 +5724,40 @@ extension HookServer {
         if cmuxInputLocked() { return }
         #endif
         HermesApprovalCenter.shared.click(requestID: requestID, button: button)
+    }
+}
+
+extension HookServer {
+    /// What stopped a Claude Code turn, from its StopFailure hook: Claude Code's own message when
+    /// it sends one, else a sentence for the kind of error. nil when nothing says.
+    static func stopFailureDetail(_ payload: [String: Any]) -> String? {
+        for key in ["error_message", "error_details", "message"] {
+            if let text = payload[key] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return DiffEngine.toOneLine(text)
+            }
+        }
+        if let error = payload["error"] as? [String: Any], let text = error["message"] as? String, !text.isEmpty {
+            return DiffEngine.toOneLine(text)
+        }
+        let kind = (payload["error_type"] as? String) ?? (payload["error"] as? String) ?? ""
+        switch kind {
+        case "rate_limit":            return String(localized: "Claude's rate limit is reached. Try again in a moment.")
+        case "overloaded":            return String(localized: "Claude is overloaded. Try again in a moment.")
+        case "authentication_failed", "oauth_org_not_allowed":
+                                      return String(localized: "Claude Code is not signed in, or its key is no longer valid.")
+        case "billing_error":         return String(localized: "Billing problem on the Claude account.")
+        case "server_error":          return String(localized: "Claude's servers had a problem. Try again.")
+        case "max_output_tokens":     return String(localized: "The answer was too long and was cut.")
+        case "model_not_found":       return String(localized: "This model is not available.")
+        default:
+            // Claude Code often sends only `error: "unknown"`: its last message then usually
+            // carries the API's own words ("API Error: 529 Overloaded…").
+            if let last = payload["last_assistant_message"] as? String,
+               last.range(of: "error", options: .caseInsensitive) != nil {
+                return DiffEngine.toOneLine(last)
+            }
+            // A readable error is shown as it is; "unknown" or a bare status code says nothing.
+            return kind.count > 3 && Int(kind) == nil && kind != "unknown" ? kind : nil
+        }
     }
 }
