@@ -33,6 +33,17 @@ enum CardInputLockTests {
         check("demo approval (no fd)", CardInputLock.cardVisible(approvalFD: -1, questionFD: -1, approvalShown: true, questionShown: false))
         check("demo question (no fd)", CardInputLock.cardVisible(approvalFD: -1, questionFD: -1, approvalShown: false, questionShown: true))
 
+        print("CardInputLock.headChangeArmedAt")
+        let a = UUID(), b = UUID()
+        check("queue moves to another request while a card is shown → locked from now",
+              CardInputLock.headChangeArmedAt(shownId: a, headId: b, now: 100) == 100)
+        check("same request refreshed (count only) → not armed",
+              CardInputLock.headChangeArmedAt(shownId: a, headId: a, now: 100) == nil)
+        check("no card shown before → not armed (arrival arms itself)",
+              CardInputLock.headChangeArmedAt(shownId: nil, headId: b, now: 100) == nil)
+        check("head change locks clicks for the delay",
+              CardInputLock.isLocked(armedAt: CardInputLock.headChangeArmedAt(shownId: a, headId: b, now: 100), now: 100.3))
+
         if failures > 0 { print("\(failures) FAILED"); exit(1) }
         print("Card input lock: all cases passed")
     }
