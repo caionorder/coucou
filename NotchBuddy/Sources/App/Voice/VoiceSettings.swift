@@ -74,6 +74,16 @@ enum VoiceSettings {
         get { UserDefaults.standard.string(forKey: "voiceTTSEngine") ?? "system" }
         set { UserDefaults.standard.set(newValue, forKey: "voiceTTSEngine") }
     }
+    /// ElevenLabs voice_id chosen in Settings; empty = Automatic (picked from gender/language).
+    static var elevenVoiceId: String {
+        get { UserDefaults.standard.string(forKey: "voiceElevenVoiceId") ?? "" }
+        set { UserDefaults.standard.set(newValue, forKey: "voiceElevenVoiceId") }
+    }
+    /// ElevenLabs expressiveness: "calm", "normal" (default) or "lively".
+    static var elevenExpressiveness: String {
+        get { UserDefaults.standard.string(forKey: "voiceElevenExpressiveness") ?? "normal" }
+        set { UserDefaults.standard.set(newValue, forKey: "voiceElevenExpressiveness") }
+    }
     /// ElevenLabs voice: "female" (default) or "male".
     static var elevenGender: String {
         get { UserDefaults.standard.string(forKey: "voiceElevenGender") ?? "female" }

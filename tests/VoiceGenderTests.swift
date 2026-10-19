@@ -53,6 +53,30 @@ enum VoiceGenderTests {
         check("pt without Portuguese voice falls back to English", ElevenVoicePicker.pick(noPt, gender: "female", language: "pt")?.id, "rachel")
         check("empty account", ElevenVoicePicker.pick([], gender: "female", language: "pt")?.id, nil)
 
+        // Chosen voice vs automatic pick
+        check("stored voice wins", ElevenVoicePicker.resolve(stored: "deep", voices: account, gender: "female", language: "pt")?.id, "deep")
+        check("empty stored id = automatic", ElevenVoicePicker.resolve(stored: "", voices: account, gender: "female", language: "pt")?.id, "bia")
+        check("nil stored id = automatic", ElevenVoicePicker.resolve(stored: nil, voices: account, gender: "male", language: "pt")?.id, "caio")
+        check("stored voice gone from account = automatic", ElevenVoicePicker.resolve(stored: "removed", voices: account, gender: "female", language: "pt")?.id, "bia")
+        check("stored on empty account", ElevenVoicePicker.resolve(stored: "deep", voices: [], gender: "female", language: "pt")?.id, nil)
+        check("stored() unknown", ElevenVoicePicker.stored("nope", in: account)?.id, nil)
+        check("display name with labels", ElevenVoicePicker.displayName(voice("x", "male", language: "pt", accent: "brazilian")), "x (pt · brazilian · male)")
+        check("display name without labels", ElevenVoicePicker.displayName(["voice_id": "y", "name": "Y"]), "Y")
+
+        // Expressiveness
+        check("normal sends no voice_settings", ElevenExpressiveness.normal.voiceSettings == nil, true)
+        check("unknown raw = normal", ElevenExpressiveness.from("???"), .normal)
+        check("nil raw = normal", ElevenExpressiveness.from(nil), .normal)
+        check("lively raw", ElevenExpressiveness.from("lively"), .lively)
+        let calm = ElevenExpressiveness.calm.voiceSettings, lively = ElevenExpressiveness.lively.voiceSettings
+        check("calm steadier than lively", (calm?["stability"] as? Double ?? 0) > (lively?["stability"] as? Double ?? 1), true)
+        check("lively has more style", (lively?["style"] as? Double ?? 0) > (calm?["style"] as? Double ?? 1), true)
+        check("speaker boost on", (calm?["use_speaker_boost"] as? Bool, lively?["use_speaker_boost"] as? Bool) == (true, true), true)
+        for e in [ElevenExpressiveness.calm, .lively] {
+            let ok = ["stability", "similarity_boost", "style"].allSatisfy { k in (e.voiceSettings?[k] as? Double).map { (0...1).contains($0) } ?? false }
+            check("\(e) values in 0...1", ok, true)
+        }
+
         print("\n\(pass)/\(pass + fail) passed.")
         if fail > 0 { exit(1) }
     }
