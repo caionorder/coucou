@@ -1640,7 +1640,7 @@ struct SettingsView: View {
     #if !APPSTORE
     @State private var voicePermissionsGranted: Bool = false
     @ObservedObject private var voiceEngine = VoiceEngine.shared
-    @AppStorage("voiceLanguage")       private var voiceLanguage: String = "en"
+    @AppStorage("voiceLanguage")       private var voiceLanguage: String = VoiceSettings.language
     @AppStorage("voiceListenLanguage") private var listenLanguage: String = "auto"
     @AppStorage("voiceTTSEngine")      private var ttsEngine: String = "system"
     @AppStorage("voiceElevenGender")   private var elevenGender: String = "female"
@@ -1651,10 +1651,14 @@ struct SettingsView: View {
     @State private var elevenKeySaved: Bool = KeychainStore.shared.get(ElevenLabsTTS.keyName) != nil
 
     private func speakVoiceSample() {
-        let en = voiceLanguage != "fr"
-        VoiceSpeaker.shared.speak(en ? "Hi, I'm Coucou. Say OK Coucou whenever you need me."
-                                     : "Salut, c'est Coucou. Dis OK Coucou quand tu as besoin de moi.",
-                                  locale: Locale(identifier: en ? "en-US" : "fr-FR"))
+        let lang = VoiceLang(code: voiceLanguage)
+        let text: String
+        switch lang {
+        case .en: text = "Hi, I'm Coucou. Say OK Coucou whenever you need me."
+        case .fr: text = "Salut, c'est Coucou. Dis OK Coucou quand tu as besoin de moi."
+        case .pt: text = "Oi, eu sou o Coucou. Diz OK Coucou quando precisar de mim."
+        }
+        VoiceSpeaker.shared.speak(text, locale: lang.locale)
     }
 
     @ViewBuilder private var voiceSection: some View {
@@ -1727,10 +1731,11 @@ struct SettingsView: View {
                         Text(String(localized: "voice.lang-auto")).tag("auto")
                         Text(verbatim: "Français").tag("fr")
                         Text(verbatim: "English").tag("en")
+                        Text(verbatim: "Português").tag("pt")
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
-                    .frame(maxWidth: 260)
+                    .frame(maxWidth: 350)
                 }
                 HStack(spacing: 10) {
                     Text(String(localized: "voice.language"))
@@ -1738,10 +1743,11 @@ struct SettingsView: View {
                     Picker(String(localized: "voice.language"), selection: $voiceLanguage) {
                         Text(verbatim: "Français").tag("fr")
                         Text(verbatim: "English").tag("en")
+                        Text(verbatim: "Português").tag("pt")
                     }
                     .labelsHidden()
                     .pickerStyle(.segmented)
-                    .frame(maxWidth: 180)
+                    .frame(maxWidth: 270)
                     .onChange(of: voiceLanguage) { _, _ in
                         // Chosen by hand: Coucou no longer offers to switch.
                         VoiceSettings.languageOfferDone = true
@@ -1798,7 +1804,7 @@ struct SettingsView: View {
                                })
                         .frame(maxWidth: 180)
                     }
-                    let current = VoiceSpeaker.macVoiceName(for: Locale(identifier: voiceLanguage == "fr" ? "fr-FR" : "en-US"),
+                    let current = VoiceSpeaker.macVoiceName(for: VoiceLang(code: voiceLanguage).locale,
                                                             gender: elevenGender)
                     Text(String(format: String(localized: "voice.mac-voice-current %@"), current))
                         .font(.system(size: 11))
