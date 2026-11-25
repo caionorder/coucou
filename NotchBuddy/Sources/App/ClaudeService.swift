@@ -67,6 +67,7 @@ final class KeychainStore: @unchecked Sendable {
         "deepseek-api-key",
         "qwen-api-key",
         "moonshot-api-key",
+        "ollama-api-key", "lmstudio-api-key",
         "resend-api-key", "resend-from",
         "n8n-url", "n8n-api-key",
         "vercel-token",
@@ -524,17 +525,19 @@ final class ClaudeService {
 
         // Auth header
         let authHeader: String
-        let cloudKey: String?   // the provider's own key, sent when streaming too
+        let bearerKey: String?  // the key behind the bearer token (cloud key, or the local server's optional key), sent when streaming too
         if provider.isLocal {
-            authHeader = "Bearer ollama"
-            cloudKey = nil
+            // The optional key of the local server (oMLX…); none = the placeholder Ollama and LM Studio accept.
+            let localKey = LocalChat.cleanKey(KeychainStore.shared.get(provider.localKeychainKey))
+            authHeader = LocalChat.localAuthorization(apiKey: localKey)
+            bearerKey = localKey
         } else {
             guard let key = KeychainStore.shared.get(provider.keychainKey), !key.isEmpty else {
                 await showError(String(localized: "\(provider.displayName) API key missing. Configure it in Settings."), state: state)
                 return
             }
             authHeader = "Bearer \(key)"
-            cloudKey = key
+            bearerKey = key
         }
 
         // Build messages
@@ -586,7 +589,8 @@ final class ClaudeService {
                     baseURL: baseURL,
                     encodedBody: encodedBody,
                     model: modelCopy,
-                    apiKey: cloudKey
+                    apiKey: bearerKey,
+                    isLocal: provider.isLocal
                 ) { [state, msgId] visible in
                     if !visible.isEmpty, state.stateOverride == .thinking {
                         state.stateOverride = nil   // hide typing dots on first visible text
@@ -622,6 +626,8 @@ final class ClaudeService {
                     msg = String(localized: "\(m) isn't installed. Pick another model above the chat box.")
                 case .serverError(let s):
                     msg = s
+                case .unauthorized:
+                    msg = e.localizedDescription
                 }
                 await showError(msg, state: state)
             } catch {

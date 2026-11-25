@@ -444,7 +444,7 @@ final class AppState: ObservableObject {
             return
         }
         #endif
-        // Local providers: fetch from server URL (no API key needed)
+        // Local providers: fetch from server URL (the API key is optional)
         if provider.isLocal {
             let baseURL = provider == .ollama ? ollamaServerURL : lmstudioServerURL
             let normalised = LocalChat.normaliseURL(baseURL)
@@ -457,7 +457,9 @@ final class AppState: ObservableObject {
             loadingProviderModels.insert(provider)
             providerModelFetchError.removeValue(forKey: provider)
             Task {
-                let result = await LocalChat.fetchModelsResult(baseURL: normalised)
+                let result = await LocalChat.fetchModelsResult(
+                    baseURL: normalised,
+                    apiKey: KeychainStore.shared.get(provider.localKeychainKey))
                 loadingProviderModels.remove(provider)
                 switch result {
                 case .success(let models) where models.isEmpty:
@@ -472,6 +474,8 @@ final class AppState: ObservableObject {
                         if provider == .ollama { ollamaChatModel = first }
                         else                   { lmstudioChatModel = first }
                     }
+                case .failure(.unauthorized):
+                    providerModelFetchError[provider] = LocalChatError.unauthorized.localizedDescription
                 case .failure:
                     providerModelFetchError[provider] = String(localized: "Cannot reach \(normalised). Is the server running?")
                 }

@@ -95,6 +95,8 @@ struct SettingsView: View {
     @State private var moonshotKey: String = KeychainStore.shared.get("moonshot-api-key") ?? ""
     @State private var ollamaURL:    String = AppState.shared.ollamaServerURL
     @State private var lmstudioURL:  String = AppState.shared.lmstudioServerURL
+    @State private var ollamaKey:    String = ""
+    @State private var lmstudioKey:  String = ""
     @State private var connectingOllama:    Bool = false
     @State private var connectingLMStudio:  Bool = false
     // Hermes agent setup form (the key field is never pre-filled from the Keychain)
@@ -1436,6 +1438,8 @@ struct SettingsView: View {
                 if state.ollamaServerURL.isEmpty {
                     TextField("http://127.0.0.1:11434", text: $ollamaURL)
                         .textFieldStyle(.roundedBorder)
+                    SecureField("API key (optional)", text: $ollamaKey)
+                        .textFieldStyle(.roundedBorder)
                     Button(connectingOllama ? String(localized: "chat.connecting") : String(localized: "chat.connect")) {
                         Task { await connectLocal(provider: .ollama) }
                     }
@@ -1448,6 +1452,8 @@ struct SettingsView: View {
                     Button(String(localized: "chat.disconnect")) {
                         state.ollamaServerURL = ""
                         ollamaURL = ""
+                        ollamaKey = ""
+                        KeychainStore.shared.remove(ChatProvider.ollama.localKeychainKey)
                         state.fetchedProviderModels[.ollama] = nil
                         state.providerModelFetchError[.ollama] = nil
                         if state.chatProvider == .ollama { state.chatProvider = .anthropic }
@@ -1471,6 +1477,8 @@ struct SettingsView: View {
                 if state.lmstudioServerURL.isEmpty {
                     TextField("http://127.0.0.1:1234", text: $lmstudioURL)
                         .textFieldStyle(.roundedBorder)
+                    SecureField("API key (optional)", text: $lmstudioKey)
+                        .textFieldStyle(.roundedBorder)
                     Button(connectingLMStudio ? String(localized: "chat.connecting") : String(localized: "chat.connect")) {
                         Task { await connectLocal(provider: .lmstudio) }
                     }
@@ -1483,6 +1491,8 @@ struct SettingsView: View {
                     Button(String(localized: "chat.disconnect")) {
                         state.lmstudioServerURL = ""
                         lmstudioURL = ""
+                        lmstudioKey = ""
+                        KeychainStore.shared.remove(ChatProvider.lmstudio.localKeychainKey)
                         state.fetchedProviderModels[.lmstudio] = nil
                         state.providerModelFetchError[.lmstudio] = nil
                         if state.chatProvider == .lmstudio { state.chatProvider = .anthropic }
@@ -2193,13 +2203,22 @@ struct SettingsView: View {
         }
         if provider == .ollama { connectingOllama = true } else { connectingLMStudio = true }
         statusMessage = ""
-        let result = await LocalChat.fetchModelsResult(baseURL: normalised)
+        let typedKey = LocalChat.cleanKey(provider == .ollama ? ollamaKey : lmstudioKey)
+        let result = await LocalChat.fetchModelsResult(baseURL: normalised, apiKey: typedKey)
         if provider == .ollama { connectingOllama = false } else { connectingLMStudio = false }
         let name = provider == .ollama ? "Ollama" : "LM Studio"
         switch result {
         case .success(let models) where models.isEmpty:
             statusMessage = String(format: String(localized: "status.local.no-models %@"), name)
         case .success(let models):
+            // The key is kept only once the server accepted it; none typed = none stored.
+            if let typedKey {
+                KeychainStore.shared.set(provider.localKeychainKey, value: typedKey)
+            } else {
+                KeychainStore.shared.remove(provider.localKeychainKey)
+            }
+            // Saved: the typed key no longer needs to sit in the view's memory.
+            if provider == .ollama { ollamaKey = "" } else { lmstudioKey = "" }
             if provider == .ollama {
                 state.ollamaServerURL = normalised
                 ollamaURL = normalised
@@ -2212,6 +2231,8 @@ struct SettingsView: View {
                 state.providerModelFetchError[.lmstudio] = nil
             }
             statusMessage = String(localized: "status.local.connected \(models.count)")
+        case .failure(.unauthorized):
+            statusMessage = String(format: String(localized: "status.local.unauthorized %@"), name)
         case .failure:
             statusMessage = String(format: String(localized: "status.local.unreachable %1$@ %2$@"), name, normalised)
         }
