@@ -25079,6 +25079,107 @@
         }
       }
     },
+    "API key (optional)" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "مفتاح API (اختياري)"
+          }
+        },
+        "bn" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API কী (ঐচ্ছিক)"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API-Schlüssel (optional)"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API key (optional)"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Clave de API (opcional)"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Clé API (facultative)"
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API कुंजी (वैकल्पिक)"
+          }
+        },
+        "id" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kunci API (opsional)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "APIキー（任意）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API 키(선택)"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Chave de API (opcional)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ключ API (необязательно)"
+          }
+        },
+        "th" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "คีย์ API (ไม่บังคับ)"
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API anahtarı (isteğe bağlı)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API 密钥（可选）"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "API 金鑰（選填）"
+          }
+        }
+      }
+    },
     "API key  (cal_live_…)" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -88272,6 +88373,107 @@
         }
       }
     },
+    "status.local.unauthorized %@" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ يحتاج إلى مفتاح API صالح. أدخله أعلاه ثم اتصل مجددًا."
+          }
+        },
+        "bn" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ এর একটি বৈধ API কী দরকার। উপরে লিখে আবার সংযোগ করুন।"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ braucht einen gültigen API-Schlüssel. Gib ihn oben ein und verbinde dich erneut."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ needs a valid API key. Enter it above and connect again."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ necesita una clave de API válida. Introdúcela arriba y conecta de nuevo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ demande une clé API valide. Saisissez-la ci-dessus et reconnectez-vous."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ को एक मान्य API कुंजी चाहिए। इसे ऊपर दर्ज करें और फिर से कनेक्ट करें।"
+          }
+        },
+        "id" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ memerlukan kunci API yang valid. Masukkan di atas lalu sambungkan lagi."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ には有効なAPIキーが必要です。上に入力して、もう一度接続してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@에 유효한 API 키가 필요해요. 위에 입력하고 다시 연결하세요."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ precisa de uma chave de API válida. Digite acima e conecte de novo."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ требуется действительный ключ API. Введите его выше и подключитесь снова."
+          }
+        },
+        "th" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ ต้องใช้คีย์ API ที่ถูกต้อง ใส่คีย์ด้านบนแล้วเชื่อมต่ออีกครั้ง"
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ geçerli bir API anahtarı istiyor. Yukarıya girin ve yeniden bağlanın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 需要有效的 API 密钥。请在上方输入后重新连接。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 需要有效的 API 金鑰。請在上方輸入後重新連線。"
+          }
+        }
+      }
+    },
     "status.local.url-invalid" : {
       "localizations" : {
         "ar" : {
@@ -104607,6 +104809,107 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "無法連上 %@，伺服器有在執行嗎？"
+          }
+        }
+      }
+    },
+    "The server refused the API key. In Settings → Chat, disconnect and reconnect with the key." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "رفض الخادم مفتاح API. في الإعدادات ← الدردشة، افصل الاتصال ثم أعد الاتصال بالمفتاح."
+          }
+        },
+        "bn" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "সার্ভার API কী প্রত্যাখ্যান করেছে। সেটিংস → চ্যাটে সংযোগ বিচ্ছিন্ন করে কী দিয়ে আবার সংযোগ করুন।"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der Server hat den API-Schlüssel abgelehnt. Trenne die Verbindung unter Einstellungen → Chat und verbinde dich erneut mit dem Schlüssel."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The server refused the API key. In Settings → Chat, disconnect and reconnect with the key."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "El servidor rechazó la clave de API. En Configuración → Chat, desconecta y vuelve a conectar con la clave."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le serveur a refusé la clé API. Dans Réglages → Chat, déconnectez-vous puis reconnectez-vous avec la clé."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "सर्वर ने API कुंजी अस्वीकार कर दी। सेटिंग्स → चैट में डिस्कनेक्ट करें और कुंजी के साथ फिर से कनेक्ट करें।"
+          }
+        },
+        "id" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Server menolak kunci API. Di Pengaturan → Chat, putuskan lalu sambungkan lagi dengan kuncinya."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "サーバーがAPIキーを拒否しました。設定 → チャットで接続を解除し、キーを入力して再接続してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "서버가 API 키를 거부했어요. 설정 → 채팅에서 연결을 해제한 뒤 키를 입력해 다시 연결하세요."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O servidor recusou a chave de API. Em Ajustes → Chat, desconecte e conecte de novo com a chave."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сервер отклонил ключ API. В Настройки → Чат отключитесь и подключитесь снова с этим ключом."
+          }
+        },
+        "th" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "เซิร์ฟเวอร์ปฏิเสธคีย์ API ที่ การตั้งค่า → แชท ให้ยกเลิกการเชื่อมต่อแล้วเชื่อมต่อใหม่พร้อมคีย์"
+          }
+        },
+        "tr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sunucu API anahtarını reddetti. Ayarlar → Sohbet bölümünde bağlantıyı kesip anahtarla yeniden bağlanın."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "服务器拒绝了 API 密钥。请在“设置 → 聊天”中断开连接，然后带上密钥重新连接。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "伺服器拒絕了 API 金鑰。請在「設定 → 聊天」中中斷連線，再帶著金鑰重新連線。"
           }
         }
       }

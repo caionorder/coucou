@@ -9,12 +9,15 @@ enum LocalChatError: Error {
     case modelNotFound(String)
     /// The server replied with an error message.
     case serverError(String)
+    /// The server answered 401 or 403: it needs an API key, or refused the one given.
+    case unauthorized
 
     var localizedDescription: String {
         switch self {
         case .serverUnreachable(let url): return String(localized: "Cannot reach \(url). Is the server running?")
         case .modelNotFound(let model):   return String(localized: "Model '\(model)' is not installed.")
         case .serverError(let msg):       return msg
+        case .unauthorized:               return String(localized: "The server refused the API key. In Settings → Chat, disconnect and reconnect with the key.")
         }
     }
 }
@@ -73,19 +76,43 @@ enum LocalChat {
         return cleaned
     }
 
+    // MARK: API key (optional for a local server)
+
+    /// A key typed by the user: trimmed, nil when empty (no key).
+    static func cleanKey(_ raw: String?) -> String? {
+        guard let key = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else { return nil }
+        return key
+    }
+
+    /// The bearer token for a local server: its key, or the `ollama` placeholder Ollama and LM Studio accept.
+    static func localAuthorization(apiKey: String?) -> String {
+        "Bearer \(cleanKey(apiKey) ?? "ollama")"
+    }
+
+    /// 401 and 403 mean the server wants a key (or another one), not that it is unreachable.
+    static func authError(status: Int) -> LocalChatError? {
+        status == 401 || status == 403 ? .unauthorized : nil
+    }
+
     // MARK: Model list
 
     /// Fetches models, returning `.success([])` when the server responds but has no chat models,
     /// vs `.failure(.serverUnreachable)` when the server is not reachable.
-    static func fetchModelsResult(baseURL: String) async -> Result<[(id: String, label: String)], LocalChatError> {
+    static func fetchModelsResult(baseURL: String, apiKey: String? = nil) async -> Result<[(id: String, label: String)], LocalChatError> {
         guard let url = URL(string: "\(baseURL)/v1/models") else {
             return .failure(.serverUnreachable(baseURL))
         }
         var req = URLRequest(url: url, timeoutInterval: 5)
-        req.setValue("Bearer ollama", forHTTPHeaderField: "Authorization")
+        req.setValue(localAuthorization(apiKey: apiKey), forHTTPHeaderField: "Authorization")
         do {
             let (data, response) = try await URLSession.shared.data(for: req)
-            guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+            guard let http = response as? HTTPURLResponse else {
+                return .failure(.serverUnreachable(baseURL))
+            }
+            if let authErr = authError(status: http.statusCode) {
+                return .failure(authErr)
+            }
+            guard http.statusCode == 200,
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let items = json["data"] as? [[String: Any]] else {
                 return .failure(.serverUnreachable(baseURL))
@@ -105,8 +132,8 @@ enum LocalChat {
 
     /// Fetches models from a local OpenAI-compatible server (`GET /v1/models`).
     /// Filters out embedding and non-chat models (nomic-embed, bge, clip, rerank…).
-    static func fetchModels(baseURL: String) async -> [(id: String, label: String)] {
-        if case .success(let models) = await fetchModelsResult(baseURL: baseURL) { return models }
+    static func fetchModels(baseURL: String, apiKey: String? = nil) async -> [(id: String, label: String)] {
+        if case .success(let models) = await fetchModelsResult(baseURL: baseURL, apiKey: apiKey) { return models }
         return []
     }
 
@@ -129,6 +156,7 @@ enum LocalChat {
         model: String,
         messages: [[String: Any]],
         apiKey: String? = nil,
+        isLocal: Bool = false,
         onToken: @MainActor @escaping (String) -> Void
     ) async throws -> String {
         let body: [String: Any] = [
@@ -138,7 +166,7 @@ enum LocalChat {
             "max_tokens": 4096,
         ]
         let bodyData = (try? JSONSerialization.data(withJSONObject: body)) ?? Data()
-        return try await streamChat(baseURL: baseURL, encodedBody: bodyData, model: model, apiKey: apiKey, onToken: onToken)
+        return try await streamChat(baseURL: baseURL, encodedBody: bodyData, model: model, apiKey: apiKey, isLocal: isLocal, onToken: onToken)
     }
 
     /// Where a streamed chat goes and the bearer token it carries.
@@ -146,7 +174,12 @@ enum LocalChat {
     /// already ends with its version (`https://api.deepseek.com/v1`), so only
     /// `/chat/completions` is added, and the key is the bearer token. A local
     /// server (Ollama, LM Studio) passes nil: `/v1` is added, with `Bearer ollama`.
-    static func streamEndpoint(baseURL: String, apiKey: String?) -> (url: String, authorization: String) {
+    /// A local server that wants a key (oMLX…) passes `isLocal: true` with its key:
+    /// the path keeps `/v1` and the key is the bearer token.
+    static func streamEndpoint(baseURL: String, apiKey: String?, isLocal: Bool = false) -> (url: String, authorization: String) {
+        if isLocal {
+            return ("\(baseURL)/v1/chat/completions", localAuthorization(apiKey: apiKey))
+        }
         if let key = apiKey, !key.isEmpty {
             return ("\(baseURL)/chat/completions", "Bearer \(key)")
         }
@@ -154,15 +187,17 @@ enum LocalChat {
     }
 
     /// - Parameters:
-    ///   - apiKey: A cloud provider's key from the Keychain; nil for a local server.
+    ///   - apiKey: A cloud provider's key from the Keychain; for a local server, its optional key.
+    ///   - isLocal: True for Ollama, LM Studio and the like (path keeps `/v1`, 401/403 → `.unauthorized`).
     static func streamChat(
         baseURL: String,
         encodedBody: Data,
         model: String,
         apiKey: String? = nil,
+        isLocal: Bool = false,
         onToken: @MainActor @escaping (String) -> Void
     ) async throws -> String {
-        let endpoint = streamEndpoint(baseURL: baseURL, apiKey: apiKey)
+        let endpoint = streamEndpoint(baseURL: baseURL, apiKey: apiKey, isLocal: isLocal)
         guard let url = URL(string: endpoint.url) else {
             throw LocalChatError.serverUnreachable(baseURL)
         }
@@ -182,6 +217,10 @@ enum LocalChat {
         }
 
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+
+        if isLocal, let authErr = authError(status: status) {
+            throw authErr
+        }
 
         if status == 404 {
             throw LocalChatError.modelNotFound(model)

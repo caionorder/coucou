@@ -194,6 +194,15 @@ enum ChatProvider: String, CaseIterable, Codable {
         self == .ollama || self == .lmstudio
     }
 
+    /// Keychain item of the optional API key of a local server (empty for the other providers).
+    var localKeychainKey: String {
+        switch self {
+        case .ollama:   "ollama-api-key"
+        case .lmstudio: "lmstudio-api-key"
+        default:        ""
+        }
+    }
+
     var pillID: String {
         switch self {
         case .anthropic: "ai_anthropic"
